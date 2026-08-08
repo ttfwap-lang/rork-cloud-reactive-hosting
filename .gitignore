@@ -2,3 +2,7 @@ node_modules
 .env
 .expo
 .rork
+
+# Cloudflare Functions
+functions/node_modules
+!functions/package.json

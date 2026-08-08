@@ -1,0 +1,15 @@
+{
+  "$schema": "https://rork.com/schema/rork.json",
+  "apps": [
+    {
+      "name": "ReplyFlow Cloud",
+      "path": "web",
+      "framework": "web"
+    },
+    {
+      "name": "Functions",
+      "path": "functions",
+      "framework": "cloudflare"
+    }
+  ]
+}
