@@ -2,6 +2,17 @@ import { useEffect, useState } from "react";
 import { AlertTriangle, PauseCircle, Power, Radio, WifiOff } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+  AlertDialogTrigger,
+} from "@/components/ui/alert-dialog";
 import { cn } from "@/lib/utils";
 import { useEngine } from "@/lib/engine-store";
 import type { LinkState } from "@/lib/api";
@@ -95,15 +106,37 @@ export function StatusStrip() {
             {killed ? "Resume" : "Halt"}
           </Button>
 
-          <Button
-            size="sm"
-            variant="ghost"
-            className="h-8 gap-1.5 rounded-full text-xs text-destructive hover:bg-destructive/10 hover:text-destructive"
-            onClick={() => disconnect()}
-          >
-            {status === "offline" ? <WifiOff className="h-3.5 w-3.5" /> : <Radio className="h-3.5 w-3.5" />}
-            <span className="hidden sm:inline">Disconnect</span>
-          </Button>
+          <AlertDialog>
+            <AlertDialogTrigger asChild>
+              <Button
+                size="sm"
+                variant="ghost"
+                disabled={status === "offline"}
+                className="h-8 gap-1.5 rounded-full text-xs text-destructive hover:bg-destructive/10 hover:text-destructive"
+              >
+                {status === "offline" ? <WifiOff className="h-3.5 w-3.5" /> : <Radio className="h-3.5 w-3.5" />}
+                <span className="hidden sm:inline">Disconnect</span>
+              </Button>
+            </AlertDialogTrigger>
+            <AlertDialogContent className="border-white/[0.08] bg-card">
+              <AlertDialogHeader>
+                <AlertDialogTitle>Drop the Telegram link?</AlertDialogTitle>
+                <AlertDialogDescription>
+                  The webhook is removed and nothing is received or sent until you reconnect. Your
+                  workflows, logs and queued replies are kept. To pause without unlinking, use Halt.
+                </AlertDialogDescription>
+              </AlertDialogHeader>
+              <AlertDialogFooter>
+                <AlertDialogCancel className="rounded-xl">Keep connected</AlertDialogCancel>
+                <AlertDialogAction
+                  className="rounded-xl bg-destructive text-destructive-foreground hover:bg-destructive/90"
+                  onClick={() => disconnect()}
+                >
+                  Disconnect now
+                </AlertDialogAction>
+              </AlertDialogFooter>
+            </AlertDialogContent>
+          </AlertDialog>
         </div>
       </div>
     </div>

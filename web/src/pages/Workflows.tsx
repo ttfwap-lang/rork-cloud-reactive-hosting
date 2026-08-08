@@ -1,5 +1,5 @@
-import { useState } from "react";
-import { ArrowDown, GitBranch, Plus, RotateCw, Trash2, X } from "lucide-react";
+import { useMemo, useState } from "react";
+import { ArrowDown, GitBranch, Plus, RotateCw, Timer, Trash2, X } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -45,8 +45,28 @@ function blankWorkflow(): Workflow {
 export default function Workflows() {
   const { snapshot, saveWorkflow, deleteWorkflow } = useEngine();
   const [draft, setDraft] = useState<Workflow | null>(null);
+  const [saving, setSaving] = useState<boolean>(false);
 
   const workflows = snapshot?.workflows ?? [];
+
+  // A step with no trigger or no reply can never fire, so it is blocked here
+  // rather than being saved as a silently dead workflow.
+  const problem = useMemo<string | null>(() => {
+    if (!draft) return null;
+    if (draft.name.trim().length === 0) return "Give the workflow a name.";
+    for (const [index, step] of draft.steps.entries()) {
+      if (step.trigger.trim().length === 0) return `Step ${index + 1} needs a trigger.`;
+      if (step.reply.trim().length === 0) return `Step ${index + 1} needs a reply.`;
+      if (step.mode === "regex") {
+        try {
+          new RegExp(step.trigger);
+        } catch {
+          return `Step ${index + 1} has an invalid pattern.`;
+        }
+      }
+    }
+    return null;
+  }, [draft]);
 
   const patchStep = (index: number, patch: Partial<WorkflowStep>): void => {
     setDraft((current) => {
@@ -99,7 +119,9 @@ export default function Workflows() {
                 </button>
                 <Switch
                   checked={workflow.enabled}
-                  onCheckedChange={(checked) => saveWorkflow({ ...workflow, enabled: checked })}
+                  onCheckedChange={(checked) => {
+                    saveWorkflow({ ...workflow, enabled: checked }).catch(() => undefined);
+                  }}
                 />
                 <button
                   className="rounded-lg p-2 text-muted-foreground transition-colors hover:bg-destructive/10 hover:text-destructive"
@@ -227,6 +249,23 @@ export default function Workflows() {
                         />
                         case sensitive
                       </label>
+                      <label className="flex items-center gap-1.5 text-[11px] text-muted-foreground">
+                        <Timer className="h-3 w-3" />
+                        wait
+                        <Input
+                          type="number"
+                          value={Math.round(step.timeoutMs / 60_000)}
+                          step={1}
+                          min={1}
+                          onChange={(event) =>
+                            patchStep(index, {
+                              timeoutMs: Math.max(1, Number(event.target.value) || 1) * 60_000,
+                            })
+                          }
+                          className="h-7 w-14 rounded-lg bg-background/60 px-2 font-mono text-[11px]"
+                        />
+                        min
+                      </label>
                       <label className="ml-auto flex items-center gap-1.5 text-[11px] text-muted-foreground">
                         <RotateCw className="h-3 w-3" />
                         loop to
@@ -256,14 +295,22 @@ export default function Workflows() {
                 <Plus className="h-3.5 w-3.5" /> Add step
               </Button>
 
+              {problem ? (
+                <p className="text-center text-[11px] text-amber-400">{problem}</p>
+              ) : null}
+
               <Button
                 className="h-11 w-full rounded-xl font-semibold"
-                disabled={draft.name.trim().length === 0}
+                disabled={problem !== null || saving}
                 onClick={() => {
-                  saveWorkflow(draft).then(() => setDraft(null));
+                  setSaving(true);
+                  saveWorkflow(draft)
+                    .then(() => setDraft(null))
+                    .catch(() => undefined)
+                    .finally(() => setSaving(false));
                 }}
               >
-                Save workflow
+                {saving ? "Saving…" : "Save workflow"}
               </Button>
             </div>
           ) : null}

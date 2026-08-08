@@ -71,8 +71,6 @@ type EventLevel = "info" | "success" | "warn" | "error";
  * keeps everything alive with zero inbound traffic.
  */
 export class AutomationEngine extends DurableObject<Env> {
-  private sockets = new Set<WebSocket>();
-
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
     const sql = this.ctx.storage.sql;
@@ -195,20 +193,31 @@ export class AutomationEngine extends DurableObject<Env> {
       try {
         ws.send(text);
       } catch {
-        this.sockets.delete(ws);
+        try {
+          ws.close(1011, "send failed");
+        } catch {
+          /* peer already gone */
+        }
       }
     }
   }
 
   // ------------------------------------------------------------------ auth
 
+  /** Length-and-content comparison that does not short-circuit on first mismatch. */
+  private safeEqual(a: string, b: string): boolean {
+    if (a.length !== b.length) return false;
+    let diff = 0;
+    for (let i = 0; i < a.length; i += 1) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+    return diff === 0;
+  }
+
   private tokenValid(request: Request): boolean {
     const token = this.kvGet<string | null>("token", null);
     if (!token) return false;
     const header = request.headers.get("Authorization") ?? "";
-    const url = new URL(request.url);
-    const query = url.searchParams.get("token");
-    return header === `Bearer ${token}` || query === token;
+    const query = new URL(request.url).searchParams.get("token") ?? "";
+    return this.safeEqual(header, `Bearer ${token}`) || this.safeEqual(query, token);
   }
 
   private async hash(input: string): Promise<string> {
@@ -263,7 +272,7 @@ export class AutomationEngine extends DurableObject<Env> {
       case "/link/disconnect":
         return this.handleDisconnect();
       case "/logs":
-        return Response.json({ events: this.readEvents(url) });
+        return Response.json({ events: this.readEvents(Number(url.searchParams.get("limit") ?? 200)) });
       case "/job/retry":
         return this.handleRetry(request);
       case "/simulate":
@@ -281,13 +290,24 @@ export class AutomationEngine extends DurableObject<Env> {
     }
   }
 
-  override webSocketClose(ws: WebSocket): void {
-    this.sockets.delete(ws);
+  override webSocketClose(): void {
+    /* hibernation-managed: the runtime owns socket teardown */
+  }
+
+  override webSocketError(): void {
+    /* hibernation-managed: the runtime owns socket teardown */
   }
 
   // ----------------------------------------------------------------- auth
 
   private async handleAuth(request: Request): Promise<Response> {
+    const now = Date.now();
+    const guard = this.kvGet<{ fails: number; lockedUntil: number }>("authGuard", { fails: 0, lockedUntil: 0 });
+    if (guard.lockedUntil > now) {
+      const seconds = Math.ceil((guard.lockedUntil - now) / 1000);
+      return Response.json({ error: `Too many attempts. Try again in ${seconds}s.` }, { status: 429 });
+    }
+
     const body = (await request.json().catch(() => ({}))) as { passcode?: string };
     const passcode = (body.passcode ?? "").trim();
     if (passcode.length < 6) {
@@ -305,11 +325,15 @@ export class AutomationEngine extends DurableObject<Env> {
       return Response.json({ token, claimed: true });
     }
 
-    if (stored !== digest) {
+    if (!this.safeEqual(stored, digest)) {
+      const fails = guard.fails + 1;
+      const lockedUntil = fails >= 5 ? now + 60_000 : 0;
+      this.kvPut("authGuard", { fails: lockedUntil > 0 ? 0 : fails, lockedUntil });
       this.log("warn", "console.denied", "Rejected sign-in attempt with a bad passcode.");
       return Response.json({ error: "Incorrect passcode." }, { status: 403 });
     }
 
+    this.kvPut("authGuard", { fails: 0, lockedUntil: 0 });
     let token = this.kvGet<string | null>("token", null);
     if (!token) {
       token = crypto.randomUUID().replace(/-/g, "");
@@ -321,8 +345,8 @@ export class AutomationEngine extends DurableObject<Env> {
 
   // ------------------------------------------------------------- snapshot
 
-  private readEvents(url: URL): unknown[] {
-    const limit = Math.min(Number(url.searchParams.get("limit") ?? 200), 1000);
+  private readEvents(requested: number): unknown[] {
+    const limit = Number.isFinite(requested) ? Math.max(1, Math.min(Math.floor(requested), 1000)) : 200;
     return this.ctx.storage.sql
       .exec<{
         ts: number; level: string; type: string;
@@ -340,6 +364,7 @@ export class AutomationEngine extends DurableObject<Env> {
   }
 
   private async snapshot(): Promise<unknown> {
+    const workflows = this.workflows();
     const dayAgo = Date.now() - 86_400_000;
     const sentToday = this.ctx.storage.sql
       .exec<{ n: number }>("SELECT COUNT(*) AS n FROM sends WHERE ts > ?", dayAgo)
@@ -366,13 +391,13 @@ export class AutomationEngine extends DurableObject<Env> {
     return {
       link: this.link(),
       settings: this.settings(),
-      workflows: this.workflows(),
-      events: this.readEvents(new URL("https://x/?limit=150")),
+      workflows,
+      events: this.readEvents(150),
       jobs,
       stats: {
         sentToday,
         activeConversations: active,
-        workflowCount: this.workflows().length,
+        workflowCount: workflows.length,
         webhookPath: this.kvGet<string | null>("webhookSecret", null),
       },
     };
@@ -381,28 +406,82 @@ export class AutomationEngine extends DurableObject<Env> {
   // ------------------------------------------------------------- settings
 
   private async handleSettings(request: Request): Promise<Response> {
+    const previous = this.settings();
     const patch = (await request.json().catch(() => ({}))) as Partial<Settings>;
-    const next: Settings = { ...this.settings(), ...patch };
-    next.minGapMs = Math.max(0, Math.min(next.minGapMs, 600_000));
-    next.perMinuteCap = Math.max(1, Math.min(next.perMinuteCap, 60));
-    next.dedupeWindowMs = Math.max(0, Math.min(next.dedupeWindowMs, 3_600_000));
+    const next: Settings = { ...previous, ...patch };
+    next.killSwitch = Boolean(next.killSwitch);
+    next.autoPauseOnFlood = Boolean(next.autoPauseOnFlood);
+    next.minGapMs = Math.max(0, Math.min(Number(next.minGapMs) || 0, 600_000));
+    next.perMinuteCap = Math.max(1, Math.min(Number(next.perMinuteCap) || 1, 60));
+    next.dedupeWindowMs = Math.max(0, Math.min(Number(next.dedupeWindowMs) || 0, 3_600_000));
     this.kvPut("settings", next);
-    this.log(
-      next.killSwitch ? "warn" : "info",
-      "settings.update",
-      next.killSwitch ? "Global kill switch engaged — all sending halted." : "Safety settings updated.",
-    );
+
+    if (next.killSwitch !== previous.killSwitch) {
+      this.log(
+        next.killSwitch ? "warn" : "success",
+        "settings.kill",
+        next.killSwitch
+          ? "Global kill switch engaged — all sending halted."
+          : "Kill switch released — sending resumed.",
+      );
+    } else {
+      this.log("info", "settings.update", "Safety settings updated.");
+    }
     this.broadcast({ kind: "settings", settings: next });
     return Response.json({ settings: next });
   }
 
   // ------------------------------------------------------------ workflows
 
+  /** Normalise and hard-validate a step so a malformed one can never wedge the engine. */
+  private sanitizeStep(raw: Partial<WorkflowStep>, index: number): WorkflowStep | { error: string } {
+    const modes: TriggerMode[] = ["exact", "contains", "starts", "regex"];
+    const trigger = String(raw.trigger ?? "").slice(0, 400).trim();
+    const reply = String(raw.reply ?? "").slice(0, 4096).trim();
+    if (trigger.length === 0) return { error: `Step ${index + 1} needs a trigger.` };
+    if (reply.length === 0) return { error: `Step ${index + 1} needs a reply.` };
+
+    const mode: TriggerMode = modes.includes(raw.mode as TriggerMode) ? (raw.mode as TriggerMode) : "contains";
+    if (mode === "regex") {
+      try {
+        new RegExp(trigger);
+      } catch {
+        return { error: `Step ${index + 1} has an invalid pattern.` };
+      }
+    }
+
+    const loop = typeof raw.loopTo === "number" && raw.loopTo >= 0 ? Math.floor(raw.loopTo) : null;
+    return {
+      id: typeof raw.id === "string" && raw.id.length > 0 ? raw.id.slice(0, 64) : crypto.randomUUID(),
+      trigger,
+      mode,
+      caseSensitive: Boolean(raw.caseSensitive),
+      reply,
+      delayMs: Math.max(0, Math.min(Number(raw.delayMs) || 0, 300_000)),
+      timeoutMs: Math.max(10_000, Math.min(Number(raw.timeoutMs) || 300_000, 86_400_000)),
+      loopTo: loop,
+    };
+  }
+
   private async handleWorkflow(request: Request): Promise<Response> {
     const wf = (await request.json().catch(() => null)) as Workflow | null;
     if (!wf || typeof wf.name !== "string" || !Array.isArray(wf.steps)) {
       return Response.json({ error: "Invalid workflow payload." }, { status: 400 });
     }
+    if (wf.name.trim().length === 0) {
+      return Response.json({ error: "Give the workflow a name." }, { status: 400 });
+    }
+    if (wf.steps.length === 0) {
+      return Response.json({ error: "A workflow needs at least one step." }, { status: 400 });
+    }
+
+    const steps: WorkflowStep[] = [];
+    for (const [index, raw] of wf.steps.slice(0, 40).entries()) {
+      const result = this.sanitizeStep(raw, index);
+      if ("error" in result) return Response.json({ error: result.error }, { status: 400 });
+      steps.push(result);
+    }
+
     const now = Date.now();
     const id = wf.id && wf.id.length > 0 ? wf.id : crypto.randomUUID();
     const existing = this.ctx.storage.sql
@@ -416,14 +495,14 @@ export class AutomationEngine extends DurableObject<Env> {
          name = excluded.name, target = excluded.target, enabled = excluded.enabled,
          steps = excluded.steps, updated_at = excluded.updated_at`,
       id,
-      wf.name.slice(0, 80),
-      (wf.target ?? "").slice(0, 80),
+      wf.name.trim().slice(0, 80),
+      (wf.target ?? "").trim().slice(0, 80),
       wf.enabled ? 1 : 0,
-      JSON.stringify(wf.steps.slice(0, 40)),
+      JSON.stringify(steps),
       existing?.created_at ?? now,
       now,
     );
-    this.log("info", "workflow.save", `Workflow "${wf.name}" saved with ${wf.steps.length} step(s).`, id);
+    this.log("info", "workflow.save", `Workflow "${wf.name.trim()}" saved with ${steps.length} step(s).`, id);
     this.broadcast({ kind: "workflows", workflows: this.workflows() });
     return Response.json({ workflows: this.workflows() });
   }
@@ -473,16 +552,34 @@ export class AutomationEngine extends DurableObject<Env> {
     this.kvPut("botToken", token);
 
     const origin = this.kvGet<string | null>("publicOrigin", null);
-    if (origin) {
-      await fetch(`https://api.telegram.org/bot${token}/setWebhook`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          url: `${origin}/tg/${secret}`,
-          allowed_updates: ["message"],
-          drop_pending_updates: true,
-        }),
-      }).catch(() => null);
+    if (!origin) {
+      const detail = "Could not determine this engine's public address.";
+      this.setLink({ status: "error", detail });
+      this.log("error", "link.error", detail);
+      this.broadcast({ kind: "link", link: this.link() });
+      return Response.json({ error: detail }, { status: 500 });
+    }
+
+    // A silent webhook failure would leave the console claiming "online" while
+    // nothing ever arrives, so the result is checked rather than fire-and-forget.
+    const hook = await fetch(`https://api.telegram.org/bot${token}/setWebhook`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        url: `${origin}/tg/${secret}`,
+        allowed_updates: ["message"],
+        drop_pending_updates: true,
+      }),
+    })
+      .then((r) => r.json() as Promise<{ ok: boolean; description?: string }>)
+      .catch(() => null);
+
+    if (!hook?.ok) {
+      const detail = hook?.description ?? "Telegram would not accept the webhook address.";
+      this.setLink({ status: "error", detail });
+      this.log("error", "link.error", `Webhook registration failed: ${detail}`);
+      this.broadcast({ kind: "link", link: this.link() });
+      return Response.json({ error: detail }, { status: 400 });
     }
 
     const identity = me.result?.username ? `@${me.result.username}` : "connected";
@@ -533,8 +630,11 @@ export class AutomationEngine extends DurableObject<Env> {
 
   private async handleSimulate(request: Request): Promise<Response> {
     const body = (await request.json().catch(() => ({}))) as { chatKey?: string; from?: string; text?: string };
-    if (!body.text) return Response.json({ error: "Missing text." }, { status: 400 });
-    await this.ingest(body.chatKey ?? "sim-console", body.from ?? "simulator", body.text);
+    const text = (body.text ?? "").trim();
+    if (text.length === 0) return Response.json({ error: "Missing text." }, { status: 400 });
+    // Pacing can hold a reply for up to a minute; that must not hold the HTTP
+    // response open, so the run continues on the engine's own clock.
+    this.ctx.waitUntil(this.ingest(body.chatKey ?? "sim-console", body.from ?? "simulator", text));
     return Response.json({ ok: true });
   }
 
@@ -543,7 +643,7 @@ export class AutomationEngine extends DurableObject<Env> {
   private matches(step: WorkflowStep, text: string): boolean {
     const haystack = step.caseSensitive ? text : text.toLowerCase();
     const needle = step.caseSensitive ? step.trigger : step.trigger.toLowerCase();
-    if (needle.length === 0) return false;
+    if (needle.length === 0 || needle.length > 400) return false;
     switch (step.mode) {
       case "exact":
         return haystack.trim() === needle.trim();
@@ -637,26 +737,18 @@ export class AutomationEngine extends DurableObject<Env> {
     );
     this.log("info", "match.hit", `Matched "${workflow.name}" step ${stepIndex + 1} (${step.mode}).`, workflow.id, chatKey);
 
-    const windowStart = now - 60_000;
-    this.ctx.storage.sql.exec("DELETE FROM sends WHERE ts < ?", now - 86_400_000 * 2);
-    const recent = this.ctx.storage.sql
-      .exec<{ n: number }>("SELECT COUNT(*) AS n FROM sends WHERE ts > ?", windowStart)
-      .toArray()[0]?.n ?? 0;
-    if (recent >= settings.perMinuteCap) {
-      this.queueJob(workflow.id, chatKey, "Per-minute send cap reached", { text: step.reply });
-      this.log("warn", "limit.cap", `Per-minute cap (${settings.perMinuteCap}) hit — reply queued for retry.`, workflow.id, chatKey);
+    const slot = this.reserveSlot(settings, step.delayMs);
+    if ("blocked" in slot) {
+      this.queueJob(workflow.id, chatKey, slot.blocked, { text: step.reply });
+      this.log("warn", "limit.cap", `${slot.blocked} — reply held in the retry queue.`, workflow.id, chatKey);
+      this.broadcast({ kind: "refresh" });
       return;
     }
 
-    const lastSend = this.ctx.storage.sql
-      .exec<{ ts: number }>("SELECT ts FROM sends ORDER BY id DESC LIMIT 1")
-      .toArray()[0];
-    const gap = lastSend ? now - lastSend.ts : Number.MAX_SAFE_INTEGER;
-    const waitForGap = gap < settings.minGapMs ? settings.minGapMs - gap : 0;
-    const delay = Math.min(step.delayMs + waitForGap, 30_000);
-    if (delay > 0) await new Promise((resolve) => setTimeout(resolve, delay));
+    const wait = Math.min(Math.max(0, slot.at - Date.now()), 60_000);
+    if (wait > 0) await new Promise((resolve) => setTimeout(resolve, wait));
 
-    const ok = await this.send(chatKey, step.reply, workflow.id);
+    const ok = await this.send(chatKey, step.reply, workflow.id, slot.id);
     if (!ok) return;
 
     const nextIndex = step.loopTo !== null && step.loopTo >= 0 ? step.loopTo : stepIndex + 1;
@@ -681,11 +773,53 @@ export class AutomationEngine extends DurableObject<Env> {
     await this.ensureWatchdog();
   }
 
-  private async send(chatKey: string, text: string, workflowId: string): Promise<boolean> {
+  /**
+   * Claim the next permitted send time and persist the claim immediately. Writing
+   * the reservation *before* the pacing await is what stops two messages arriving
+   * together from both passing the gap check and bursting past the limits.
+   */
+  private reserveSlot(settings: Settings, delayMs: number): { id: number; at: number } | { blocked: string } {
+    const sql = this.ctx.storage.sql;
+    const now = Date.now();
+    sql.exec("DELETE FROM sends WHERE ts < ?", now - 172_800_000);
+
+    const recent = sql
+      .exec<{ n: number }>("SELECT COUNT(*) AS n FROM sends WHERE ts > ?", now - 60_000)
+      .toArray()[0]?.n ?? 0;
+    if (recent >= settings.perMinuteCap) {
+      return { blocked: `Per-minute send cap (${settings.perMinuteCap}) reached` };
+    }
+
+    const last = sql.exec<{ ts: number }>("SELECT ts FROM sends ORDER BY ts DESC LIMIT 1").toArray()[0];
+    const earliest = now + Math.max(0, Math.min(delayMs, 300_000));
+    const at = Math.max(earliest, (last?.ts ?? 0) + settings.minGapMs);
+
+    sql.exec("INSERT INTO sends (ts) VALUES (?)", at);
+    const id = sql.exec<{ id: number }>("SELECT last_insert_rowid() AS id").toArray()[0]?.id ?? 0;
+    return { id, at };
+  }
+
+  private releaseSlot(slotId: number): void {
+    this.ctx.storage.sql.exec("DELETE FROM sends WHERE id = ?", slotId);
+  }
+
+  private async send(chatKey: string, text: string, workflowId: string, slotId: number): Promise<boolean> {
+    const link = this.link();
     const token = this.kvGet<string | null>("botToken", null);
-    if (!token) {
-      this.queueJob(workflowId, chatKey, "No Telegram link configured", { text });
-      this.log("error", "send.fail", "Reply not sent — no Telegram link is configured.", workflowId, chatKey);
+
+    // Re-checked at the moment of sending: the operator may have hit Halt or
+    // Disconnect while this reply was waiting out its pacing delay.
+    if (this.settings().killSwitch) {
+      this.releaseSlot(slotId);
+      this.log("warn", "skip.kill", "Reply dropped — kill switch engaged while it was waiting.", workflowId, chatKey);
+      return false;
+    }
+
+    if (!token || link.mode === "none" || link.status === "offline") {
+      this.releaseSlot(slotId);
+      this.queueJob(workflowId, chatKey, "Telegram link is disconnected", { text });
+      this.log("error", "send.fail", "Reply not sent — the Telegram link is disconnected. Held for replay.", workflowId, chatKey);
+      this.broadcast({ kind: "refresh" });
       return false;
     }
 
@@ -706,13 +840,13 @@ export class AutomationEngine extends DurableObject<Env> {
         this.broadcast({ kind: "link", link: this.link() });
       }
       const reason = res?.description ?? "Telegram send failed";
+      this.releaseSlot(slotId);
       this.queueJob(workflowId, chatKey, reason, { text });
       this.log("error", "send.fail", `Send failed: ${reason}`, workflowId, chatKey);
       this.broadcast({ kind: "refresh" });
       return false;
     }
 
-    this.ctx.storage.sql.exec("INSERT INTO sends (ts) VALUES (?)", Date.now());
     this.setLink({ lastEventAt: Date.now() });
     this.log("success", "send.ok", `Reply delivered (${text.length} chars).`, workflowId, chatKey);
     this.broadcast({ kind: "refresh" });
@@ -737,15 +871,27 @@ export class AutomationEngine extends DurableObject<Env> {
     const { id } = (await request.json().catch(() => ({}))) as { id?: string };
     if (!id) return Response.json({ error: "Missing id." }, { status: 400 });
     const job = this.ctx.storage.sql
-      .exec<{ id: string; workflow_id: string | null; chat_key: string; payload: string; attempts: number }>(
+      .exec<{
+        id: string; workflow_id: string | null; chat_key: string;
+        payload: string; attempts: number; status: string;
+      }>(
         "SELECT * FROM failed_jobs WHERE id = ?",
         id,
       )
       .toArray()[0];
     if (!job) return Response.json({ error: "Job not found." }, { status: 404 });
+    if (job.status === "resolved") {
+      return Response.json({ error: "That job was already replayed." }, { status: 409 });
+    }
+
+    // Replays go through the same pacing gate as live traffic.
+    const slot = this.reserveSlot(this.settings(), 0);
+    if ("blocked" in slot) return Response.json({ error: slot.blocked }, { status: 429 });
+    const wait = Math.min(Math.max(0, slot.at - Date.now()), 60_000);
+    if (wait > 0) await new Promise((resolve) => setTimeout(resolve, wait));
 
     const payload = JSON.parse(job.payload) as { text?: string };
-    const ok = await this.send(job.chat_key, payload.text ?? "", job.workflow_id ?? "");
+    const ok = await this.send(job.chat_key, payload.text ?? "", job.workflow_id ?? "", slot.id);
     this.ctx.storage.sql.exec(
       "UPDATE failed_jobs SET attempts = ?, status = ? WHERE id = ?",
       job.attempts + 1,

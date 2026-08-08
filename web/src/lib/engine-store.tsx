@@ -1,4 +1,4 @@
-import { createContext, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 
@@ -46,7 +46,8 @@ export function EngineProvider({ children }: { children: ReactNode }) {
     queryKey: QUERY_KEY,
     queryFn: () => api.state(),
     enabled: authed,
-    refetchInterval: 20_000,
+    // The WebSocket is the primary channel; this is only a safety net.
+    refetchInterval: 60_000,
     retry: 1,
   });
 
@@ -83,7 +84,7 @@ export function EngineProvider({ children }: { children: ReactNode }) {
             const incoming = payload.event;
             setLiveEvents((prev) => [incoming, ...prev].slice(0, 200));
           }
-          if (payload.kind === "refresh" || payload.kind === "link" || payload.kind === "heartbeat") {
+          if (payload.kind !== "pong") {
             queryClient.invalidateQueries({ queryKey: QUERY_KEY });
           }
         } catch {
@@ -101,9 +102,9 @@ export function EngineProvider({ children }: { children: ReactNode }) {
     };
   }, [authed, queryClient]);
 
-  const invalidate = (): void => {
+  const invalidate = useCallback((): void => {
     queryClient.invalidateQueries({ queryKey: QUERY_KEY });
-  };
+  }, [queryClient]);
 
   const settingsMutation = useMutation({
     mutationFn: (patch: Partial<Settings>) => api.saveSettings(patch),
@@ -159,55 +160,73 @@ export function EngineProvider({ children }: { children: ReactNode }) {
     onError: (err: Error) => toast.error(err.message),
   });
 
+  // react-query keeps `mutate`/`mutateAsync` referentially stable, so pulling them
+  // out here lets the context value memo actually hold between renders.
+  const settingsMutate = settingsMutation.mutate;
+  const workflowMutateAsync = workflowMutation.mutateAsync;
+  const deleteMutate = deleteMutation.mutate;
+  const connectMutateAsync = connectMutation.mutateAsync;
+  const disconnectMutate = disconnectMutation.mutate;
+  const retryMutate = retryMutation.mutate;
+  const simulateMutateAsync = simulateMutation.mutateAsync;
+
+  const signIn = useCallback(
+    async (passcode: string): Promise<void> => {
+      const result = await api.authenticate(passcode);
+      setToken(result.token);
+      setAuthed(true);
+      invalidate();
+      toast.success(result.claimed ? "Console claimed — you are the owner" : "Welcome back");
+    },
+    [invalidate],
+  );
+
+  const signOut = useCallback((): void => {
+    setToken(null);
+    setAuthed(false);
+    setLiveEvents([]);
+  }, []);
+
   const value = useMemo<EngineContextValue>(
     () => ({
       authed,
-      signIn: async (passcode: string) => {
-        const result = await api.authenticate(passcode);
-        setToken(result.token);
-        setAuthed(true);
-        queryClient.invalidateQueries({ queryKey: QUERY_KEY });
-        toast.success(result.claimed ? "Console claimed — you are the owner" : "Welcome back");
-      },
-      signOut: () => {
-        setToken(null);
-        setAuthed(false);
-        setLiveEvents([]);
-      },
+      signIn,
+      signOut,
       snapshot: query.data,
       isLoading: query.isLoading,
       error: (query.error as Error | null) ?? null,
       liveEvents,
       streamOnline,
-      saveSettings: (patch) => settingsMutation.mutate(patch),
+      saveSettings: (patch) => settingsMutate(patch),
       saveWorkflow: async (workflow) => {
-        await workflowMutation.mutateAsync(workflow);
+        await workflowMutateAsync(workflow);
       },
-      deleteWorkflow: (id) => deleteMutation.mutate(id),
+      deleteWorkflow: (id) => deleteMutate(id),
       connect: async (botToken) => {
-        await connectMutation.mutateAsync(botToken);
+        await connectMutateAsync(botToken);
       },
-      disconnect: () => disconnectMutation.mutate(),
-      retryJob: (id) => retryMutation.mutate(id),
+      disconnect: () => disconnectMutate(),
+      retryJob: (id) => retryMutate(id),
       simulate: async (input) => {
-        await simulateMutation.mutateAsync(input);
+        await simulateMutateAsync(input);
       },
     }),
     [
       authed,
+      signIn,
+      signOut,
       query.data,
       query.isLoading,
       query.error,
       liveEvents,
       streamOnline,
-      queryClient,
-      settingsMutation,
-      workflowMutation,
-      deleteMutation,
-      connectMutation,
-      disconnectMutation,
-      retryMutation,
-      simulateMutation,
+      settingsMutate,
+      workflowMutateAsync,
+      deleteMutate,
+      connectMutateAsync,
+      disconnectMutate,
+      retryMutate,
+      simulateMutateAsync,
     ],
   );
 
