@@ -56,7 +56,7 @@ export function Gate() {
           {error ? <p className="text-xs text-destructive">{error}</p> : null}
           <Button
             type="submit"
-            disabled={busy || passcode.length < 6}
+            disabled={busy || passcode.length < 8}
             className="h-11 w-full gap-2 rounded-xl text-sm font-semibold"
           >
             {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <ShieldCheck className="h-4 w-4" />}
@@ -65,7 +65,7 @@ export function Gate() {
         </form>
 
         <p className="mt-5 font-mono text-[11px] leading-relaxed text-muted-foreground">
-          Minimum 6 characters. Stored only as a hash inside your own cloud engine.
+          Minimum 8 characters. Protected with a salted, deliberately slow hash inside your cloud engine.
         </p>
       </div>
     </div>

@@ -1,0 +1,27 @@
+{
+  "name": "replyflow/personal-connector",
+  "description": "Isolated personal-account Telegram data plane for ReplyFlow Cloud",
+  "type": "project",
+  "license": "proprietary",
+  "require": {
+    "php": ">=8.3",
+    "ext-curl": "*",
+    "ext-json": "*",
+    "ext-mbstring": "*",
+    "ext-openssl": "*",
+    "ext-sodium": "*",
+    "danog/madelineproto": "8.4.18"
+  },
+  "autoload": {
+    "psr-4": {
+      "ReplyFlow\\": "src/"
+    }
+  },
+  "config": {
+    "allow-plugins": {
+      "php-http/discovery": true
+    },
+    "optimize-autoloader": true,
+    "sort-packages": true
+  }
+}

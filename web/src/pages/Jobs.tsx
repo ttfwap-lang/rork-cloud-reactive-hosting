@@ -1,63 +1,11 @@
-import { CheckCircle2, RotateCcw } from "lucide-react";
+import { Ban, CheckCircle2, EyeOff, RotateCcw, ShieldAlert } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import { useEngine } from "@/lib/engine-store";
 
 export default function Jobs() {
-  const { snapshot, retryJob } = useEngine();
+  const { snapshot, retryJob, updateJob } = useEngine();
   const jobs = snapshot?.jobs ?? [];
-
-  return (
-    <div className="mx-auto w-full max-w-4xl space-y-4">
-      <header>
-        <h1 className="text-xl font-semibold tracking-tight">Failed jobs</h1>
-        <p className="mt-1 text-sm text-muted-foreground">
-          Replies that could not be delivered are held here instead of being dropped.
-        </p>
-      </header>
-
-      {jobs.length === 0 ? (
-        <div className="panel px-4 py-14 text-center">
-          <CheckCircle2 className="mx-auto h-6 w-6 text-primary" />
-          <p className="mt-3 text-sm font-medium">Queue is clean</p>
-          <p className="mt-1 text-xs text-muted-foreground">Every reply has gone through.</p>
-        </div>
-      ) : (
-        <div className="space-y-2.5">
-          {jobs.map((job, index) => (
-            <div
-              key={job.id}
-              className="panel animate-row-in flex flex-wrap items-center gap-3 p-4"
-              style={{ animationDelay: `${Math.min(index, 8) * 30}ms` }}
-            >
-              <span
-                className={cn(
-                  "h-2 w-2 shrink-0 rounded-full",
-                  job.status === "resolved" ? "bg-primary" : "bg-destructive",
-                )}
-              />
-              <div className="min-w-0 flex-1">
-                <p className="truncate text-sm font-medium">{job.reason}</p>
-                <p className="mt-0.5 font-mono text-[10px] text-muted-foreground">
-                  chat:{job.chatKey} · {new Date(job.ts).toLocaleString()} · {job.attempts} attempt
-                  {job.attempts === 1 ? "" : "s"}
-                </p>
-              </div>
-              <Button
-                size="sm"
-                variant="secondary"
-                className="h-8 shrink-0 gap-1.5 rounded-full text-xs"
-                disabled={job.status === "resolved"}
-                onClick={() => retryJob(job.id)}
-              >
-                <RotateCcw className="h-3.5 w-3.5" />
-                {job.status === "resolved" ? "Replayed" : "Replay"}
-              </Button>
-            </div>
-          ))}
-        </div>
-      )}
-    </div>
-  );
+  return <div className="mx-auto w-full max-w-4xl space-y-4"><header><h1 className="text-xl font-semibold tracking-tight">Failed actions</h1><p className="mt-1 text-sm text-muted-foreground">Typed, redacted failures with retry eligibility and explicit cancellation.</p></header>{jobs.length === 0 ? <div className="panel px-4 py-14 text-center"><CheckCircle2 className="mx-auto h-6 w-6 text-primary" /><p className="mt-3 text-sm font-medium">Queue is clean</p><p className="mt-1 text-xs text-muted-foreground">Every attempted action has a terminal outcome.</p></div> : <div className="space-y-2.5">{jobs.map((job, index) => <div key={job.id} className="panel animate-row-in p-4" style={{ animationDelay: `${Math.min(index, 8) * 30}ms` }}><div className="flex flex-wrap items-center gap-3"><span className={cn("h-2 w-2 shrink-0 rounded-full", job.status === "resolved" ? "bg-primary" : job.status === "pending" ? "bg-destructive" : "bg-muted-foreground")} /><div className="min-w-0 flex-1"><div className="flex flex-wrap items-center gap-2"><p className="truncate text-sm font-medium">{job.reason}</p><span className={cn("rounded-full px-2 py-0.5 font-mono text-[9px] uppercase", job.category === "account_risk" ? "bg-destructive/10 text-destructive" : job.retryable ? "bg-amber-400/10 text-amber-300" : "bg-secondary text-muted-foreground")}>{job.category.replace(/_/g, " ")}</span></div><p className="mt-0.5 font-mono text-[10px] text-muted-foreground">chat:{job.chatKey} · {new Date(job.ts).toLocaleString()} · {job.attempts} attempt{job.attempts === 1 ? "" : "s"}</p></div>{job.status === "pending" ? <div className="flex gap-1"><Button size="sm" variant="secondary" className="h-8 gap-1.5 rounded-full text-xs" disabled={!job.retryable} onClick={() => retryJob(job.id)}>{job.retryable ? <RotateCcw className="h-3.5 w-3.5" /> : <ShieldAlert className="h-3.5 w-3.5" />}{job.retryable ? "Retry" : "Review only"}</Button><Button size="sm" variant="ghost" className="h-8 rounded-full text-xs" onClick={() => updateJob(job.id, "cancelled")}><Ban className="mr-1 h-3.5 w-3.5" />Cancel</Button></div> : <Button size="sm" variant="ghost" className="h-8 rounded-full text-xs text-muted-foreground" onClick={() => updateJob(job.id, "dismissed")}><EyeOff className="mr-1 h-3.5 w-3.5" />Dismiss</Button>}</div></div>)}</div>}</div>;
 }

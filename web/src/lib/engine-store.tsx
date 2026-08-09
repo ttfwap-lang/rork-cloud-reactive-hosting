@@ -7,10 +7,14 @@ import {
   getToken,
   setToken,
   streamUrl,
+  type ConversationAnalysis,
   type EngineEvent,
+  type PersonalStartInput,
   type Settings,
   type Snapshot,
   type Workflow,
+  type WorkflowActionType,
+  type WorkflowStep,
 } from "./api";
 
 type EngineContextValue = {
@@ -25,14 +29,20 @@ type EngineContextValue = {
   saveSettings: (patch: Partial<Settings>) => void;
   saveWorkflow: (workflow: Partial<Workflow>) => Promise<void>;
   deleteWorkflow: (id: string) => void;
-  connect: (botToken: string) => Promise<void>;
+  connectBot: (botToken: string) => Promise<void>;
+  startPersonal: (input: PersonalStartInput) => Promise<void>;
+  submitPersonal: (kind: "code" | "password", value: string) => Promise<void>;
+  reconnect: () => Promise<void>;
   disconnect: () => void;
+  forgetConnection: () => Promise<void>;
   retryJob: (id: string) => void;
-  simulate: (input: { chatKey?: string; from?: string; text: string }) => Promise<void>;
+  updateJob: (id: string, status: "cancelled" | "dismissed") => void;
+  simulate: (input: { chatKey?: string; sender?: string; text: string }) => Promise<void>;
+  previewWorkflow: (step: Partial<WorkflowStep>, text: string) => Promise<{ matched: boolean; captures: string[]; actionType: WorkflowActionType; output: string; note: string }>;
+  analyzeConversation: (input: { images: string[]; ownerSide: "left" | "right"; localeHint?: string }) => Promise<ConversationAnalysis>;
 };
 
 const EngineContext = createContext<EngineContextValue | null>(null);
-
 const QUERY_KEY = ["engine-state"] as const;
 
 export function EngineProvider({ children }: { children: ReactNode }) {
@@ -46,7 +56,6 @@ export function EngineProvider({ children }: { children: ReactNode }) {
     queryKey: QUERY_KEY,
     queryFn: () => api.state(),
     enabled: authed,
-    // The WebSocket is the primary channel; this is only a safety net.
     refetchInterval: 60_000,
     retry: 1,
   });
@@ -59,41 +68,38 @@ export function EngineProvider({ children }: { children: ReactNode }) {
     }
   }, [query.error]);
 
-  // Live push channel — the engine emits events the moment they happen.
   useEffect(() => {
     if (!authed) return;
     let cancelled = false;
     let retryHandle: ReturnType<typeof setTimeout> | null = null;
 
-    const open = (): void => {
-      const url = streamUrl();
-      if (!url || cancelled) return;
-      const socket = new WebSocket(url);
-      socketRef.current = socket;
-
-      socket.onopen = () => setStreamOnline(true);
-      socket.onclose = () => {
+    const open = async (): Promise<void> => {
+      if (cancelled) return;
+      try {
+        const { ticket } = await api.streamTicket();
+        if (cancelled) return;
+        const socket = new WebSocket(streamUrl(ticket));
+        socketRef.current = socket;
+        socket.onopen = () => setStreamOnline(true);
+        socket.onclose = () => {
+          setStreamOnline(false);
+          if (!cancelled) retryHandle = setTimeout(() => void open(), 4000);
+        };
+        socket.onerror = () => socket.close();
+        socket.onmessage = (message: MessageEvent<string>) => {
+          try {
+            const payload = JSON.parse(message.data) as { kind: string; event?: EngineEvent };
+            if (payload.kind === "event" && payload.event) setLiveEvents((previous) => [payload.event as EngineEvent, ...previous].slice(0, 200));
+            if (payload.kind !== "pong") queryClient.invalidateQueries({ queryKey: QUERY_KEY });
+          } catch { /* ignore malformed frames */ }
+        };
+      } catch {
         setStreamOnline(false);
-        if (!cancelled) retryHandle = setTimeout(open, 4000);
-      };
-      socket.onerror = () => socket.close();
-      socket.onmessage = (message: MessageEvent<string>) => {
-        try {
-          const payload = JSON.parse(message.data) as { kind: string; event?: EngineEvent };
-          if (payload.kind === "event" && payload.event) {
-            const incoming = payload.event;
-            setLiveEvents((prev) => [incoming, ...prev].slice(0, 200));
-          }
-          if (payload.kind !== "pong") {
-            queryClient.invalidateQueries({ queryKey: QUERY_KEY });
-          }
-        } catch {
-          /* ignore malformed frames */
-        }
-      };
+        if (!cancelled) retryHandle = setTimeout(() => void open(), 5000);
+      }
     };
 
-    open();
+    void open();
     return () => {
       cancelled = true;
       if (retryHandle) clearTimeout(retryHandle);
@@ -106,80 +112,63 @@ export function EngineProvider({ children }: { children: ReactNode }) {
     queryClient.invalidateQueries({ queryKey: QUERY_KEY });
   }, [queryClient]);
 
-  const settingsMutation = useMutation({
-    mutationFn: (patch: Partial<Settings>) => api.saveSettings(patch),
-    onSuccess: () => invalidate(),
-    onError: (err: Error) => toast.error(err.message),
-  });
-
+  const settingsMutation = useMutation({ mutationFn: api.saveSettings, onSuccess: invalidate, onError: (error: Error) => toast.error(error.message) });
   const workflowMutation = useMutation({
-    mutationFn: (workflow: Partial<Workflow>) => api.saveWorkflow(workflow),
-    onSuccess: () => {
-      invalidate();
-      toast.success("Workflow saved");
-    },
-    onError: (err: Error) => toast.error(err.message),
+    mutationFn: api.saveWorkflow,
+    onSuccess: () => { invalidate(); toast.success("Workflow saved"); },
+    onError: (error: Error) => toast.error(error.message),
   });
-
   const deleteMutation = useMutation({
-    mutationFn: (id: string) => api.deleteWorkflow(id),
-    onSuccess: () => {
-      invalidate();
-      toast.success("Workflow deleted");
-    },
-    onError: (err: Error) => toast.error(err.message),
+    mutationFn: api.deleteWorkflow,
+    onSuccess: () => { invalidate(); toast.success("Workflow deleted"); },
+    onError: (error: Error) => toast.error(error.message),
   });
-
-  const connectMutation = useMutation({
-    mutationFn: (botToken: string) => api.connect(botToken),
-    onSuccess: () => {
-      invalidate();
-      toast.success("Telegram link is live");
-    },
-    onError: (err: Error) => toast.error(err.message),
+  const botMutation = useMutation({
+    mutationFn: api.connectBot,
+    onSuccess: () => { invalidate(); toast.success("Bot link is live"); },
+    onError: (error: Error) => toast.error(error.message),
   });
-
+  const personalMutation = useMutation({
+    mutationFn: api.startPersonal,
+    onSuccess: () => invalidate(),
+    onError: (error: Error) => toast.error(error.message),
+  });
+  const submitPersonalMutation = useMutation({
+    mutationFn: ({ kind, value }: { kind: "code" | "password"; value: string }) => api.submitPersonal(kind, value),
+    onSuccess: () => invalidate(),
+    onError: (error: Error) => toast.error(error.message),
+  });
+  const reconnectMutation = useMutation({
+    mutationFn: api.reconnect,
+    onSuccess: () => { invalidate(); toast.success("Reconnect requested"); },
+    onError: (error: Error) => toast.error(error.message),
+  });
   const disconnectMutation = useMutation({
-    mutationFn: () => api.disconnect(),
-    onSuccess: () => {
-      invalidate();
-      toast("Link dropped", { description: "Automation is no longer connected." });
-    },
-    onError: (err: Error) => toast.error(err.message),
+    mutationFn: api.disconnect,
+    onSuccess: () => { invalidate(); toast("Link disconnected", { description: "Workflows and logs were kept." }); },
+    onError: (error: Error) => toast.error(error.message),
   });
-
-  const retryMutation = useMutation({
-    mutationFn: (id: string) => api.retryJob(id),
-    onSuccess: () => invalidate(),
-    onError: (err: Error) => toast.error(err.message),
+  const forgetMutation = useMutation({
+    mutationFn: api.forgetConnection,
+    onSuccess: () => { invalidate(); toast.success("Credentials and session removed"); },
+    onError: (error: Error) => toast.error(error.message),
   });
-
-  const simulateMutation = useMutation({
-    mutationFn: (input: { chatKey?: string; from?: string; text: string }) => api.simulate(input),
-    onSuccess: () => invalidate(),
-    onError: (err: Error) => toast.error(err.message),
+  const retryMutation = useMutation({ mutationFn: api.retryJob, onSuccess: invalidate, onError: (error: Error) => toast.error(error.message) });
+  const jobMutation = useMutation({
+    mutationFn: ({ id, status }: { id: string; status: "cancelled" | "dismissed" }) => api.updateJob(id, status),
+    onSuccess: invalidate,
+    onError: (error: Error) => toast.error(error.message),
   });
+  const simulateMutation = useMutation({ mutationFn: api.simulate, onSuccess: invalidate, onError: (error: Error) => toast.error(error.message) });
+  const analysisMutation = useMutation({ mutationFn: api.analyzeConversation, onError: (error: Error) => toast.error(error.message) });
 
-  // react-query keeps `mutate`/`mutateAsync` referentially stable, so pulling them
-  // out here lets the context value memo actually hold between renders.
-  const settingsMutate = settingsMutation.mutate;
-  const workflowMutateAsync = workflowMutation.mutateAsync;
-  const deleteMutate = deleteMutation.mutate;
-  const connectMutateAsync = connectMutation.mutateAsync;
-  const disconnectMutate = disconnectMutation.mutate;
-  const retryMutate = retryMutation.mutate;
-  const simulateMutateAsync = simulateMutation.mutateAsync;
-
-  const signIn = useCallback(
-    async (passcode: string): Promise<void> => {
-      const result = await api.authenticate(passcode);
-      setToken(result.token);
-      setAuthed(true);
-      invalidate();
-      toast.success(result.claimed ? "Console claimed — you are the owner" : "Welcome back");
-    },
-    [invalidate],
-  );
+  const signIn = useCallback(async (passcode: string): Promise<void> => {
+    const result = await api.authenticate(passcode);
+    setToken(result.token);
+    setAuthed(true);
+    invalidate();
+    toast.success(result.claimed ? "Console claimed — you are the owner" : "Welcome back");
+  }, [invalidate]);
 
   const signOut = useCallback((): void => {
     setToken(null);
@@ -187,48 +176,34 @@ export function EngineProvider({ children }: { children: ReactNode }) {
     setLiveEvents([]);
   }, []);
 
-  const value = useMemo<EngineContextValue>(
-    () => ({
-      authed,
-      signIn,
-      signOut,
-      snapshot: query.data,
-      isLoading: query.isLoading,
-      error: (query.error as Error | null) ?? null,
-      liveEvents,
-      streamOnline,
-      saveSettings: (patch) => settingsMutate(patch),
-      saveWorkflow: async (workflow) => {
-        await workflowMutateAsync(workflow);
-      },
-      deleteWorkflow: (id) => deleteMutate(id),
-      connect: async (botToken) => {
-        await connectMutateAsync(botToken);
-      },
-      disconnect: () => disconnectMutate(),
-      retryJob: (id) => retryMutate(id),
-      simulate: async (input) => {
-        await simulateMutateAsync(input);
-      },
-    }),
-    [
-      authed,
-      signIn,
-      signOut,
-      query.data,
-      query.isLoading,
-      query.error,
-      liveEvents,
-      streamOnline,
-      settingsMutate,
-      workflowMutateAsync,
-      deleteMutate,
-      connectMutateAsync,
-      disconnectMutate,
-      retryMutate,
-      simulateMutateAsync,
-    ],
-  );
+  const value = useMemo<EngineContextValue>(() => ({
+    authed,
+    signIn,
+    signOut,
+    snapshot: query.data,
+    isLoading: query.isLoading,
+    error: (query.error as Error | null) ?? null,
+    liveEvents,
+    streamOnline,
+    saveSettings: (patch) => settingsMutation.mutate(patch),
+    saveWorkflow: async (workflow) => { await workflowMutation.mutateAsync(workflow); },
+    deleteWorkflow: (id) => deleteMutation.mutate(id),
+    connectBot: async (botToken) => { await botMutation.mutateAsync(botToken); },
+    startPersonal: async (input) => { await personalMutation.mutateAsync(input); },
+    submitPersonal: async (kind, inputValue) => { await submitPersonalMutation.mutateAsync({ kind, value: inputValue }); },
+    reconnect: async () => { await reconnectMutation.mutateAsync(); },
+    disconnect: () => disconnectMutation.mutate(),
+    forgetConnection: async () => { await forgetMutation.mutateAsync(); },
+    retryJob: (id) => retryMutation.mutate(id),
+    updateJob: (id, status) => jobMutation.mutate({ id, status }),
+    simulate: async (input) => { await simulateMutation.mutateAsync(input); },
+    previewWorkflow: async (step, text) => api.previewWorkflow(step, text),
+    analyzeConversation: async (input) => (await analysisMutation.mutateAsync(input)).analysis,
+  }), [
+    authed, signIn, signOut, query.data, query.isLoading, query.error, liveEvents, streamOnline,
+    settingsMutation, workflowMutation, deleteMutation, botMutation, personalMutation, submitPersonalMutation,
+    reconnectMutation, disconnectMutation, forgetMutation, retryMutation, jobMutation, simulateMutation, analysisMutation,
+  ]);
 
   return <EngineContext.Provider value={value}>{children}</EngineContext.Provider>;
 }
