@@ -9,6 +9,7 @@ import {
   streamUrl,
   type ConversationAnalysis,
   type EngineEvent,
+  type FlowImportPreview,
   type PersonalStartInput,
   type Settings,
   type Snapshot,
@@ -29,6 +30,7 @@ type EngineContextValue = {
   saveSettings: (patch: Partial<Settings>) => void;
   saveWorkflow: (workflow: Partial<Workflow>) => Promise<void>;
   deleteWorkflow: (id: string) => void;
+  importFlow: (flow: unknown, commit: boolean) => Promise<{ id?: string; name: string; preview: FlowImportPreview[]; note?: string }>;
   connectBot: (botToken: string) => Promise<void>;
   startPersonal: (input: PersonalStartInput) => Promise<void>;
   submitPersonal: (kind: "code" | "password", value: string) => Promise<void>;
@@ -153,6 +155,11 @@ export function EngineProvider({ children }: { children: ReactNode }) {
     onSuccess: () => { invalidate(); toast.success("Credentials and session removed"); },
     onError: (error: Error) => toast.error(error.message),
   });
+  const importMutation = useMutation({
+    mutationFn: ({ flow, commit }: { flow: unknown; commit: boolean }) => api.importFlow(flow, commit),
+    onSuccess: (_result, variables) => { if (variables.commit) { invalidate(); toast.success("Flow imported as a disabled draft"); } },
+    onError: (error: Error) => toast.error(error.message),
+  });
   const retryMutation = useMutation({ mutationFn: api.retryJob, onSuccess: invalidate, onError: (error: Error) => toast.error(error.message) });
   const jobMutation = useMutation({
     mutationFn: ({ id, status }: { id: string; status: "cancelled" | "dismissed" }) => api.updateJob(id, status),
@@ -188,6 +195,7 @@ export function EngineProvider({ children }: { children: ReactNode }) {
     saveSettings: (patch) => settingsMutation.mutate(patch),
     saveWorkflow: async (workflow) => { await workflowMutation.mutateAsync(workflow); },
     deleteWorkflow: (id) => deleteMutation.mutate(id),
+    importFlow: async (flow, commit) => importMutation.mutateAsync({ flow, commit }),
     connectBot: async (botToken) => { await botMutation.mutateAsync(botToken); },
     startPersonal: async (input) => { await personalMutation.mutateAsync(input); },
     submitPersonal: async (kind, inputValue) => { await submitPersonalMutation.mutateAsync({ kind, value: inputValue }); },
@@ -201,7 +209,7 @@ export function EngineProvider({ children }: { children: ReactNode }) {
     analyzeConversation: async (input) => (await analysisMutation.mutateAsync(input)).analysis,
   }), [
     authed, signIn, signOut, query.data, query.isLoading, query.error, liveEvents, streamOnline,
-    settingsMutation, workflowMutation, deleteMutation, botMutation, personalMutation, submitPersonalMutation,
+    settingsMutation, workflowMutation, deleteMutation, importMutation, botMutation, personalMutation, submitPersonalMutation,
     reconnectMutation, disconnectMutation, forgetMutation, retryMutation, jobMutation, simulateMutation, analysisMutation,
   ]);
 

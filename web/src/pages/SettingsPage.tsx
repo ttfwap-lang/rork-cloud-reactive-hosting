@@ -1,5 +1,5 @@
 import { useEffect, useState, type ReactNode } from "react";
-import { AlertOctagon, BellRing, Clock3, Save, ShieldCheck } from "lucide-react";
+import { AlertOctagon, BellRing, Clock3, Save, ShieldCheck, Zap } from "lucide-react";
 import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
@@ -17,6 +17,7 @@ export default function SettingsPage() {
   const { snapshot, saveSettings } = useEngine();
   const [draft, setDraft] = useState<Settings | null>(null);
   useEffect(() => { if (snapshot?.settings) setDraft(snapshot.settings); }, [snapshot?.settings]);
+  const pinnedName = snapshot?.workflows.find((workflow) => workflow.pinned)?.name;
   if (!draft) return null;
   const patch = (next: Partial<Settings>): void => setDraft((current) => current ? { ...current, ...next } : current);
   const commit = (): void => { saveSettings(draft); toast.success("Safety policy saved"); };
@@ -25,10 +26,19 @@ export default function SettingsPage() {
     <div className="mx-auto w-full max-w-3xl space-y-4">
       <header className="flex items-end justify-between gap-3"><div><h1 className="text-xl font-semibold tracking-tight">Safety & operations</h1><p className="mt-1 text-sm text-muted-foreground">Conservative limits apply to bot and personal-account actions.</p></div><Button size="sm" className="rounded-full" onClick={commit}><Save className="mr-1.5 h-3.5 w-3.5" />Save</Button></header>
 
+      {pinnedName ? (
+        <section className="panel flex gap-3 border-accent/20 bg-accent/[0.04] p-4">
+          <Zap className="mt-0.5 h-4 w-4 shrink-0 text-accent" />
+          <p className="text-[13px] leading-relaxed text-muted-foreground">
+            Everything below applies to your normal workflows only. <span className="font-medium text-foreground">{pinnedName}</span> is hardwired: it ignores the gap, caps, cooldown, duplicate window, quiet hours and allowlist, and keeps running even when automation is switched off. The emergency kill switch is the only control that stops it.
+          </p>
+        </section>
+      ) : null}
+
       <section className="panel overflow-hidden">
         <div className="border-b border-white/[0.06] px-4 py-3"><div className="flex items-center gap-2"><ShieldCheck className="h-4 w-4 text-primary" /><p className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">Global controls</p></div></div>
-        <Row title="Automation enabled" hint="One-click pause for every workflow while keeping Telegram connected."><Switch checked={draft.automationEnabled} onCheckedChange={(checked) => patch({ automationEnabled: checked })} /></Row>
-        <Row title="Emergency kill switch" hint="Last-resort stop checked again immediately before every action."><Switch checked={draft.killSwitch} onCheckedChange={(checked) => patch({ killSwitch: checked })} /></Row>
+        <Row title="Automation enabled" hint={pinnedName ? "One-click pause for every normal workflow while keeping Telegram connected. The hardwired flow keeps running." : "One-click pause for every workflow while keeping Telegram connected."}><Switch checked={draft.automationEnabled} onCheckedChange={(checked) => patch({ automationEnabled: checked })} /></Row>
+        <Row title="Emergency kill switch" hint="Last-resort stop checked again immediately before every action, including the hardwired flow."><Switch checked={draft.killSwitch} onCheckedChange={(checked) => patch({ killSwitch: checked })} /></Row>
         <Row title="Dry-run mode" hint="Match and advance workflows, but never contact Telegram."><Switch checked={draft.dryRun} onCheckedChange={(checked) => patch({ dryRun: checked })} /></Row>
         <Row title="Auto-pause on Telegram slow-down" hint="Pause and recover automatically after rate limits; quarantine account-risk warnings."><Switch checked={draft.autoPauseOnFlood} onCheckedChange={(checked) => patch({ autoPauseOnFlood: checked })} /></Row>
       </section>

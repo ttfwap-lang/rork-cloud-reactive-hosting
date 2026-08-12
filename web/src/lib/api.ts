@@ -60,8 +60,33 @@ export type Workflow = {
   steps: WorkflowStep[];
   cooldownMs: number;
   maxRunsPerChat: number;
+  /** Permanent flow: cannot be deleted and is restored automatically. */
+  pinned: boolean;
+  /** Ignores pacing, caps, cooldowns, dedupe and timeouts. Only the emergency stop applies. */
+  bypassLimits: boolean;
   createdAt: number;
   updatedAt: number;
+};
+
+export type HardwiredState = {
+  id: string;
+  present: boolean;
+  stepCount: number;
+  replies: number;
+  lastBot: string | null;
+  lastChatKey: string | null;
+  lastStep: number | null;
+  lastAt: number | null;
+  activeRuns: Array<{ chatKey: string; stepIndex: number }>;
+};
+
+export type FlowImportPreview = {
+  index: number;
+  trigger: string;
+  mode: TriggerMode;
+  actionType: WorkflowActionType;
+  output: string;
+  delayMs: number;
 };
 
 export type Settings = {
@@ -154,7 +179,8 @@ export type ConversationAnalysis = {
 
 export type Snapshot = {
   link: LinkState;
-  connector: { configured: boolean; deployment: string };
+  hardwired: HardwiredState;
+  connector: { configured: boolean; deployment: string; credentialsPreset: boolean };
   ai: { enabled: boolean; model: string };
   settings: Settings;
   workflows: Workflow[];
@@ -191,8 +217,8 @@ async function call<T>(path: string, body?: unknown): Promise<T> {
 }
 
 export type PersonalStartInput = {
-  apiId: string;
-  apiHash: string;
+  apiId?: string;
+  apiHash?: string;
   method: "qr" | "phone";
   phone?: string;
   riskAccepted: boolean;
@@ -205,6 +231,8 @@ export const api = {
   saveSettings: (patch: Partial<Settings>) => call<{ settings: Settings }>("/settings", patch),
   saveWorkflow: (workflow: Partial<Workflow>) => call<{ workflows: Workflow[] }>("/workflow", workflow),
   deleteWorkflow: (id: string) => call<{ workflows: Workflow[] }>("/workflow/delete", { id }),
+  importFlow: (flow: unknown, commit: boolean) =>
+    call<{ id?: string; name: string; preview: FlowImportPreview[]; note?: string }>("/workflow/import", { flow, commit }),
   connectBot: (botToken: string) => call<{ link: LinkState }>("/link/connect", { mode: "bot", botToken }),
   startPersonal: (input: PersonalStartInput) => call<{ link: LinkState }>("/link/personal/start", input),
   submitPersonal: (kind: "code" | "password", value: string) => call<{ link: LinkState }>("/link/personal/submit", { kind, value }),

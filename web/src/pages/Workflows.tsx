@@ -1,6 +1,7 @@
-import { useMemo, useState } from "react";
+import { useMemo, useRef, useState } from "react";
 import { Link } from "react-router-dom";
-import { ArrowDown, Bot, Braces, GitBranch, ImagePlus, Plus, RotateCw, Sparkles, Timer, Trash2, X } from "lucide-react";
+import { ArrowDown, Bot, Braces, FileJson, GitBranch, ImagePlus, Infinity as InfinityIcon, Pin, Plus, RotateCw, Sparkles, Timer, Trash2, X, Zap } from "lucide-react";
+import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -10,9 +11,14 @@ import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/u
 import { cn } from "@/lib/utils";
 import { useEngine } from "@/lib/engine-store";
 import type {
-  ConditionField, ConditionOperator, TriggerMode, Workflow, WorkflowActionType,
-  WorkflowCondition, WorkflowStatus, WorkflowStep,
+  ConditionField, ConditionOperator, FlowImportPreview, HardwiredState, TriggerMode, Workflow,
+  WorkflowActionType, WorkflowCondition, WorkflowStatus, WorkflowStep,
 } from "@/lib/api";
+
+const REMOVED_LIMITS = [
+  "No step timeout", "No run limit", "No cooldown", "No per-chat spacing",
+  "No per-minute cap", "No daily cap", "No quiet hours", "No duplicate suppression",
+];
 
 const MODES: Array<{ id: TriggerMode; label: string }> = [
   { id: "exact", label: "exactly" }, { id: "contains", label: "contains" },
@@ -50,8 +56,52 @@ export function blankStep(): WorkflowStep {
 export function blankWorkflow(): Workflow {
   return {
     version: 2, id: "", name: "", target: "", targets: [], enabled: false, status: "draft",
-    steps: [blankStep()], cooldownMs: 0, maxRunsPerChat: 0, createdAt: Date.now(), updatedAt: Date.now(),
+    steps: [blankStep()], cooldownMs: 0, maxRunsPerChat: 0, pinned: false, bypassLimits: false,
+    createdAt: Date.now(), updatedAt: Date.now(),
   };
+}
+
+function stepSummary(step: WorkflowStep): string {
+  if (step.actionType === "sendText") return step.reply.split("\n").join(" · ");
+  if (step.actionType === "pressButton") return `press “${step.buttonTarget}”`;
+  if (step.actionType === "react") return `react ${step.reaction}`;
+  return step.actionType;
+}
+
+function HardwiredCard({ workflow, hardwired, onEdit }: { workflow: Workflow; hardwired: HardwiredState | undefined; onEdit: () => void }) {
+  const activeSteps = useMemo<Set<number>>(() => new Set((hardwired?.activeRuns ?? []).map((run) => run.stepIndex)), [hardwired?.activeRuns]);
+  const running = activeSteps.size > 0;
+  return (
+    <div className="panel relative overflow-hidden p-4 ring-1 ring-accent/30">
+      <div className="absolute inset-y-0 left-0 w-1 bg-accent" />
+      <div className="flex flex-wrap items-center gap-2.5 pl-2">
+        <span className={cn("h-2 w-2 rounded-full", running ? "animate-signal bg-accent" : "bg-accent/40")} />
+        <button className="min-w-0 text-left" onClick={onEdit}><p className="truncate text-sm font-semibold">{workflow.name}</p></button>
+        <span className="inline-flex items-center gap-1 rounded-full bg-accent/10 px-2 py-0.5 font-mono text-[9px] uppercase text-accent ring-1 ring-accent/25"><Pin className="h-2.5 w-2.5" />permanent</span>
+        <span className="inline-flex items-center gap-1 rounded-full bg-primary/10 px-2 py-0.5 font-mono text-[9px] uppercase text-primary ring-1 ring-primary/25"><Zap className="h-2.5 w-2.5" />always on</span>
+        <div className="ml-auto text-right"><p className="font-mono text-lg font-semibold tabular-nums leading-none">{hardwired?.replies ?? 0}</p><p className="text-[10px] text-muted-foreground">replies sent</p></div>
+      </div>
+
+      <div className="mt-3 space-y-1 pl-2">
+        {workflow.steps.map((step, index) => (
+          <div key={step.id} className={cn("flex items-start gap-2 rounded-lg px-2 py-1.5 transition-colors", activeSteps.has(index) ? "bg-accent/10 ring-1 ring-accent/20" : "bg-secondary/25")}>
+            <span className={cn("mt-px grid h-4 w-4 shrink-0 place-items-center rounded font-mono text-[9px]", activeSteps.has(index) ? "bg-accent/20 text-accent" : "bg-background/60 text-muted-foreground")}>{index + 1}</span>
+            <span className="min-w-0 flex-1 truncate font-mono text-[10px] text-muted-foreground">{index === 0 ? `on “${step.trigger}”` : "on bot reply"} → {stepSummary(step)}</span>
+          </div>
+        ))}
+      </div>
+
+      <div className="mt-3 flex flex-wrap gap-1 pl-2">
+        {REMOVED_LIMITS.map((limit) => <span key={limit} className="rounded-md bg-background/50 px-1.5 py-1 font-mono text-[9px] text-muted-foreground">{limit}</span>)}
+      </div>
+      <p className="mt-2.5 pl-2 text-[11px] leading-relaxed text-muted-foreground">
+        <InfinityIcon className="mr-1 inline h-3 w-3 text-accent" />
+        Fires the instant {workflow.targets.length ? workflow.targets.join(", ") : "the target bot"} replies. The emergency stop is its only brake.
+        {hardwired?.lastBot ? ` Last answered ${hardwired.lastBot} at step ${hardwired.lastStep ?? 1}.` : ""}
+      </p>
+      {workflow.targets.length === 0 ? <p className="mt-2 pl-2 text-[11px] text-amber-400">Open it to set your test bot as the allowed sender, otherwise it answers any chat that says “joefortune”.</p> : null}
+    </div>
+  );
 }
 
 function statusTone(status: WorkflowStatus): string {
@@ -62,10 +112,29 @@ function statusTone(status: WorkflowStatus): string {
 }
 
 export default function Workflows() {
-  const { snapshot, saveWorkflow, deleteWorkflow } = useEngine();
+  const { snapshot, saveWorkflow, deleteWorkflow, importFlow } = useEngine();
   const [draft, setDraft] = useState<Workflow | null>(null);
   const [saving, setSaving] = useState<boolean>(false);
+  const [pendingFlow, setPendingFlow] = useState<{ flow: unknown; name: string; preview: FlowImportPreview[] } | null>(null);
+  const [importing, setImporting] = useState<boolean>(false);
+  const fileRef = useRef<HTMLInputElement | null>(null);
   const workflows = snapshot?.workflows ?? [];
+  const pinned = useMemo<Workflow | undefined>(() => workflows.find((workflow) => workflow.pinned), [workflows]);
+  const others = useMemo<Workflow[]>(() => workflows.filter((workflow) => !workflow.pinned), [workflows]);
+
+  const onFile = async (file: File | undefined): Promise<void> => {
+    if (!file) return;
+    if (file.size > 512_000) { toast.error("That flow file is too large."); return; }
+    try {
+      const flow: unknown = JSON.parse(await file.text());
+      const result = await importFlow(flow, false);
+      setPendingFlow({ flow, name: result.name, preview: result.preview });
+    } catch (error) {
+      toast.error(error instanceof SyntaxError ? "That file is not valid JSON." : error instanceof Error ? error.message : "Import failed.");
+    } finally {
+      if (fileRef.current) fileRef.current.value = "";
+    }
+  };
 
   const problem = useMemo<string | null>(() => {
     if (!draft) return null;
@@ -100,7 +169,9 @@ export default function Workflows() {
     <div className="mx-auto w-full max-w-5xl space-y-4">
       <header className="flex flex-wrap items-end justify-between gap-3">
         <div><h1 className="text-xl font-semibold tracking-tight">Workflow studio</h1><p className="mt-1 text-sm text-muted-foreground">Build capture-aware, filtered conversation flows with guarded personal-account actions.</p></div>
-        <div className="flex gap-2">
+        <div className="flex flex-wrap gap-2">
+          <input ref={fileRef} type="file" accept="application/json,.json" className="hidden" onChange={(event) => { void onFile(event.target.files?.[0]); }} />
+          <Button variant="secondary" className="h-9 gap-1.5 rounded-full" onClick={() => fileRef.current?.click()}><FileJson className="h-4 w-4" />Import flow file</Button>
           <Button asChild variant="secondary" className="h-9 gap-1.5 rounded-full"><Link to="/import"><ImagePlus className="h-4 w-4" />Create from conversation</Link></Button>
           <Button className="h-9 gap-1.5 rounded-full" onClick={() => setDraft(blankWorkflow())}><Plus className="h-4 w-4" />New workflow</Button>
         </div>
@@ -112,11 +183,13 @@ export default function Workflows() {
         <div className="panel p-4"><Bot className="h-4 w-4 text-amber-300" /><p className="mt-2 text-xs font-semibold">Personal actions</p><p className="mt-1 text-[11px] text-muted-foreground">Press buttons, react and mark read through the isolated connector.</p></div>
       </div>
 
-      {workflows.length === 0 ? (
-        <div className="panel px-4 py-14 text-center"><GitBranch className="mx-auto h-6 w-6 text-muted-foreground" /><p className="mt-3 text-sm font-medium">No workflows yet</p><p className="mt-1 text-xs text-muted-foreground">Start manually or turn screenshots into a disabled, reviewable draft.</p></div>
+      {pinned ? <HardwiredCard workflow={pinned} hardwired={snapshot?.hardwired} onEdit={() => setDraft(structuredClone(pinned))} /> : null}
+
+      {others.length === 0 ? (
+        <div className="panel px-4 py-14 text-center"><GitBranch className="mx-auto h-6 w-6 text-muted-foreground" /><p className="mt-3 text-sm font-medium">No other workflows yet</p><p className="mt-1 text-xs text-muted-foreground">Import a flow file, start manually, or turn screenshots into a disabled draft.</p></div>
       ) : (
         <div className="space-y-2.5">
-          {workflows.map((workflow, index) => (
+          {others.map((workflow, index) => (
             <div key={workflow.id} className="panel animate-row-in p-4" style={{ animationDelay: `${Math.min(index, 8) * 30}ms` }}>
               <div className="flex items-center gap-3">
                 <button className="min-w-0 flex-1 text-left" onClick={() => setDraft(structuredClone(workflow))}>
@@ -124,22 +197,56 @@ export default function Workflows() {
                   <p className="mt-1 font-mono text-[10px] text-muted-foreground">{workflow.steps.length} step{workflow.steps.length === 1 ? "" : "s"} · {workflow.targets.length ? workflow.targets.join(", ") : "any allowed sender"} · v{workflow.version}</p>
                 </button>
                 <Switch checked={workflow.status === "enabled"} onCheckedChange={(checked) => { void saveWorkflow({ ...workflow, status: checked ? "enabled" : "paused", enabled: checked }); }} />
-                <button className="rounded-lg p-2 text-muted-foreground transition-colors hover:bg-destructive/10 hover:text-destructive" onClick={() => deleteWorkflow(workflow.id)} aria-label="Delete workflow"><Trash2 className="h-4 w-4" /></button>
+                <button className="rounded-lg p-2 text-muted-foreground transition-colors hover:bg-destructive/10 hover:text-destructive" onClick={() => deleteWorkflow(workflow.id)} aria-label={`Delete ${workflow.name}`}><Trash2 className="h-4 w-4" /></button>
               </div>
             </div>
           ))}
         </div>
       )}
 
+      <Dialog open={pendingFlow !== null} onOpenChange={(open) => !open && setPendingFlow(null)}>
+        <DialogContent className="max-h-[88vh] max-w-2xl overflow-y-auto border-white/[0.08] bg-card">
+          <DialogHeader><DialogTitle className="text-base">Import “{pendingFlow?.name}”</DialogTitle></DialogHeader>
+          {pendingFlow ? (
+            <div className="space-y-3">
+              <p className="text-[11px] text-muted-foreground">Preview only — nothing has been sent to Telegram. It will be saved switched off so you can review it first.</p>
+              <div className="space-y-1.5">
+                {pendingFlow.preview.map((step) => (
+                  <div key={step.index} className="rounded-xl bg-secondary/35 p-3">
+                    <div className="flex items-center gap-2">
+                      <span className="grid h-5 w-5 place-items-center rounded-md bg-primary/15 font-mono text-[10px] text-primary">{step.index}</span>
+                      <span className="font-mono text-[10px] text-muted-foreground">{step.mode} “{step.trigger}”</span>
+                      <span className="ml-auto rounded-full bg-accent/10 px-2 py-0.5 font-mono text-[9px] uppercase text-accent">{step.actionType}</span>
+                    </div>
+                    {step.output ? <pre className="mt-2 whitespace-pre-wrap break-words font-mono text-[11px] leading-relaxed text-foreground/90">{step.output}</pre> : null}
+                  </div>
+                ))}
+              </div>
+              <Button className="h-11 w-full rounded-xl font-semibold" disabled={importing} onClick={() => {
+                setImporting(true);
+                importFlow(pendingFlow.flow, true).then(() => setPendingFlow(null)).catch(() => undefined).finally(() => setImporting(false));
+              }}>{importing ? "Saving…" : "Save as disabled draft"}</Button>
+            </div>
+          ) : null}
+        </DialogContent>
+      </Dialog>
+
       <Dialog open={draft !== null} onOpenChange={(open) => !open && setDraft(null)}>
         <DialogContent className="max-h-[92vh] max-w-3xl overflow-y-auto border-white/[0.08] bg-card">
-          <DialogHeader><DialogTitle className="text-base">{draft?.id ? "Edit workflow" : "New workflow"}</DialogTitle></DialogHeader>
+          <DialogHeader><DialogTitle className="text-base">{draft?.pinned ? "Hardwired flow" : draft?.id ? "Edit workflow" : "New workflow"}</DialogTitle></DialogHeader>
           {draft ? (
             <div className="space-y-5">
               <div className="grid gap-3 sm:grid-cols-2">
                 <div><label className="mb-1.5 block text-xs font-medium text-muted-foreground">Workflow name</label><Input value={draft.name} placeholder="Onboarding concierge" onChange={(event) => setDraft({ ...draft, name: event.target.value })} className="h-10 rounded-xl bg-input/60" /></div>
                 <div><label className="mb-1.5 block text-xs font-medium text-muted-foreground">Allowed senders or chats</label><Input value={draft.targets.join(", ")} placeholder="@somebot, @customer, -100…" onChange={(event) => setDraft({ ...draft, targets: event.target.value.split(",").map((value) => value.trim()).filter(Boolean), target: event.target.value.split(",")[0]?.trim() ?? "" })} className="h-10 rounded-xl bg-input/60 font-mono text-xs" /></div>
               </div>
+
+              {draft.pinned ? (
+                <div className="rounded-xl border border-accent/20 bg-accent/[0.05] p-3 text-[11px] leading-relaxed text-muted-foreground">
+                  <Pin className="mr-1.5 inline h-3.5 w-3.5 text-accent" />
+                  This flow is permanent: it cannot be deleted, it ignores every pacing setting and cap, and it keeps running even when global automation is off. Only the emergency stop halts it. Set the allowed sender above to keep it pointed at your test bot.
+                </div>
+              ) : null}
 
               <div className="flex flex-wrap items-center gap-2 rounded-2xl bg-secondary/35 p-3">
                 <span className="mr-1 text-[11px] font-medium text-muted-foreground">State</span>

@@ -29,13 +29,20 @@ export default function Connection() {
 
   const link = snapshot?.link;
   const connector = snapshot?.connector;
+  const presetCredentials = connector?.credentialsPreset ?? false;
   const isPersonalFlow = link?.mode === "personal" && ["awaiting_qr", "awaiting_code", "awaiting_password", "connecting"].includes(link.status);
 
   const beginPersonal = async (event: FormEvent): Promise<void> => {
     event.preventDefault();
     setBusy(true);
     try {
-      await startPersonal({ apiId: apiId.trim(), apiHash: apiHash.trim(), method: loginMethod, phone: loginMethod === "phone" ? phone.trim() : undefined, riskAccepted });
+      await startPersonal({
+        apiId: presetCredentials ? undefined : apiId.trim(),
+        apiHash: presetCredentials ? undefined : apiHash.trim(),
+        method: loginMethod,
+        phone: loginMethod === "phone" ? phone.trim() : undefined,
+        riskAccepted,
+      });
       setApiHash("");
     } finally { setBusy(false); }
   };
@@ -122,14 +129,21 @@ export default function Connection() {
             </div>
           ) : (
             <form onSubmit={beginPersonal} className="space-y-4 p-5">
-              <div className="grid gap-3 sm:grid-cols-2">
-                <div><label className="mb-1.5 block text-xs font-medium text-muted-foreground">Telegram API ID</label><Input inputMode="numeric" value={apiId} onChange={(event) => setApiId(event.target.value.replace(/\D/g, ""))} placeholder="12345678" className="h-11 rounded-xl bg-input/60 font-mono" /></div>
-                <div><label className="mb-1.5 block text-xs font-medium text-muted-foreground">Telegram API hash</label><Input type="password" value={apiHash} onChange={(event) => setApiHash(event.target.value)} placeholder="32-character hash" className="h-11 rounded-xl bg-input/60 font-mono" /></div>
-              </div>
+              {presetCredentials ? (
+                <div className="flex items-center gap-3 rounded-xl border border-primary/20 bg-primary/[0.05] p-3">
+                  <CheckCircle2 className="h-4 w-4 shrink-0 text-primary" />
+                  <p className="text-[11px] leading-relaxed text-muted-foreground">Your Telegram app ID and hash are stored as server-only secrets. They go straight to the isolated connector and are never sent to this browser.</p>
+                </div>
+              ) : (
+                <div className="grid gap-3 sm:grid-cols-2">
+                  <div><label className="mb-1.5 block text-xs font-medium text-muted-foreground">Telegram API ID</label><Input inputMode="numeric" value={apiId} onChange={(event) => setApiId(event.target.value.replace(/\D/g, ""))} placeholder="12345678" className="h-11 rounded-xl bg-input/60 font-mono" /></div>
+                  <div><label className="mb-1.5 block text-xs font-medium text-muted-foreground">Telegram API hash</label><Input type="password" value={apiHash} onChange={(event) => setApiHash(event.target.value)} placeholder="32-character hash" className="h-11 rounded-xl bg-input/60 font-mono" /></div>
+                </div>
+              )}
               <div className="flex items-center justify-between rounded-xl bg-secondary/40 px-3 py-2.5"><div><p className="text-xs font-medium">Use phone-code fallback</p><p className="text-[10px] text-muted-foreground">QR is recommended and selected by default.</p></div><Switch checked={loginMethod === "phone"} onCheckedChange={(checked) => setLoginMethod(checked ? "phone" : "qr")} /></div>
               {loginMethod === "phone" ? <div><label className="mb-1.5 block text-xs font-medium text-muted-foreground">Phone number</label><div className="relative"><Phone className="absolute left-3 top-3.5 h-4 w-4 text-muted-foreground" /><Input value={phone} onChange={(event) => setPhone(event.target.value)} placeholder="+1 555 123 4567" className="h-11 rounded-xl bg-input/60 pl-10" /></div></div> : null}
               <label className="flex items-start gap-3 rounded-xl border border-amber-400/20 bg-amber-400/[0.04] p-3 text-xs leading-relaxed text-muted-foreground"><Checkbox checked={riskAccepted} onCheckedChange={(checked) => setRiskAccepted(checked === true)} className="mt-0.5" /><span>I understand Telegram monitors API-client activity and may restrict or ban accounts. I will only automate consent-based existing conversations and accept the MadelineProto AGPL notice.</span></label>
-              <Button type="submit" disabled={busy || !connector?.configured || apiId.length < 4 || apiHash.length !== 32 || !riskAccepted || (loginMethod === "phone" && !phone.trim())} className="h-11 w-full gap-2 rounded-xl font-semibold">{busy ? <Loader2 className="h-4 w-4 animate-spin" /> : loginMethod === "qr" ? <QrCode className="h-4 w-4" /> : <Phone className="h-4 w-4" />}{loginMethod === "qr" ? "Generate secure QR" : "Send login code"}</Button>
+              <Button type="submit" disabled={busy || !connector?.configured || (!presetCredentials && (apiId.length < 4 || apiHash.length !== 32)) || !riskAccepted || (loginMethod === "phone" && !phone.trim())} className="h-11 w-full gap-2 rounded-xl font-semibold">{busy ? <Loader2 className="h-4 w-4 animate-spin" /> : loginMethod === "qr" ? <QrCode className="h-4 w-4" /> : <Phone className="h-4 w-4" />}{loginMethod === "qr" ? "Generate secure QR" : "Send login code"}</Button>
               <p className="text-center text-[10px] text-muted-foreground">One-time codes and two-step passwords are never persisted or returned after use.</p>
             </form>
           )}

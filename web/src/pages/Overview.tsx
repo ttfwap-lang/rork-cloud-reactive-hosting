@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Link } from "react-router-dom";
-import { ArrowUpRight, Bot, CirclePause, GitBranch, MessagesSquare, Radio, ShieldCheck, Timer, UserRound } from "lucide-react";
+import { ArrowUpRight, Bot, CirclePause, GitBranch, MessagesSquare, OctagonX, Pin, Radio, ShieldCheck, Timer, UserRound, Zap } from "lucide-react";
 
 import { Switch } from "@/components/ui/switch";
 import { cn } from "@/lib/utils";
@@ -42,6 +42,10 @@ export default function Overview() {
   const settings = snapshot?.settings;
   const enabled = snapshot?.workflows.filter((workflow) => workflow.status === "enabled").length ?? 0;
   const automationOn = settings?.automationEnabled ?? false;
+  const killed = settings?.killSwitch ?? false;
+  const hardwired = snapshot?.hardwired;
+  const pinnedFlow = snapshot?.workflows.find((workflow) => workflow.pinned);
+  const running = (hardwired?.activeRuns.length ?? 0) > 0;
 
   return (
     <div className="mx-auto w-full max-w-5xl space-y-5">
@@ -55,6 +59,38 @@ export default function Overview() {
           <div className="flex items-center gap-3 rounded-full bg-background/50 px-4 py-2"><span className="text-xs font-semibold">{automationOn ? "On" : "Off"}</span><Switch checked={automationOn} onCheckedChange={(checked) => saveSettings({ automationEnabled: checked })} aria-label="Enable all automated workflows" /></div>
         </div>
       </section>
+
+      {pinnedFlow ? (
+        <section className={cn("panel relative overflow-hidden p-5", killed ? "ring-1 ring-destructive/30" : "ring-1 ring-accent/25")}>
+          <div className={cn("absolute inset-y-0 left-0 w-1", killed ? "bg-destructive" : "bg-accent")} />
+          <div className="flex flex-wrap items-center gap-4 pl-2">
+            <div className={cn("grid h-12 w-12 place-items-center rounded-2xl", killed ? "bg-destructive/10 text-destructive" : "bg-accent/12 text-accent")}><Zap className="h-5 w-5" /></div>
+            <div className="min-w-0 flex-1">
+              <div className="flex flex-wrap items-center gap-2">
+                <p className="text-base font-semibold">{pinnedFlow.name}</p>
+                <span className="inline-flex items-center gap-1 rounded-full bg-accent/10 px-2 py-0.5 font-mono text-[9px] uppercase text-accent ring-1 ring-accent/25"><Pin className="h-2.5 w-2.5" />permanent</span>
+                {running ? <span className="inline-flex items-center gap-1.5 rounded-full bg-primary/10 px-2 py-0.5 font-mono text-[9px] uppercase text-primary"><span className="h-1.5 w-1.5 animate-signal rounded-full bg-primary" />running</span> : null}
+              </div>
+              <p className="mt-0.5 text-xs text-muted-foreground">
+                {killed
+                  ? "Halted by the emergency stop — its only brake."
+                  : running
+                    ? `Mid-run at step ${(hardwired?.activeRuns[0]?.stepIndex ?? 0) + 1} of ${hardwired?.stepCount ?? pinnedFlow.steps.length}.`
+                    : `Idle — waiting for “${pinnedFlow.steps[0]?.trigger ?? "joefortune"}”. Every limit is bypassed.`}
+                {hardwired?.lastBot ? ` Last answered ${hardwired.lastBot}.` : ""}
+              </p>
+            </div>
+            <div className="text-right"><p className="font-mono text-2xl font-semibold tabular-nums leading-none">{hardwired?.replies ?? 0}</p><p className="mt-0.5 text-[10px] text-muted-foreground">replies sent</p></div>
+            <button
+              onClick={() => saveSettings({ killSwitch: !killed })}
+              className={cn("inline-flex h-11 items-center gap-2 rounded-full px-5 text-sm font-semibold transition-all active:scale-[0.97]",
+                killed ? "bg-primary text-primary-foreground" : "bg-destructive text-destructive-foreground shadow-[0_0_24px_-6px_hsl(var(--destructive))]")}
+            >
+              <OctagonX className="h-4 w-4" />{killed ? "Release stop" : "Emergency stop"}
+            </button>
+          </div>
+        </section>
+      ) : null}
 
       <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
         <StatCard icon={MessagesSquare} label="Actions sent" value={stats?.sentToday ?? 0} hint={`of ${settings?.dailyCap ?? 0} daily cap`} accent="bg-primary" />

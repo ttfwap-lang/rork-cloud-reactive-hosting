@@ -8,6 +8,8 @@ type Env = {
   CONNECTOR_BASE_URL?: string;
   CONNECTOR_SHARED_SECRET?: string;
   CREDENTIAL_ENCRYPTION_KEY?: string;
+  TELEGRAM_API_ID?: string;
+  TELEGRAM_API_HASH?: string;
   EXPO_PUBLIC_TOOLKIT_URL?: string;
   EXPO_PUBLIC_RORK_TOOLKIT_SECRET_KEY?: string;
 };
@@ -65,8 +67,40 @@ export type Workflow = {
   steps: WorkflowStep[];
   cooldownMs: number;
   maxRunsPerChat: number;
+  /** Permanent flow: cannot be deleted and is re-seeded if it ever goes missing. */
+  pinned: boolean;
+  /** Ignores pacing, caps, cooldowns, dedupe and timeouts. Only the kill switch stops it. */
+  bypassLimits: boolean;
   createdAt: number;
   updatedAt: number;
+};
+
+/** Flow-file contract produced by the ReplyFlow JSON Flow Creator. */
+export type FlowFileStep = {
+  nodeKey?: string;
+  triggerMode?: string;
+  triggerPattern?: string;
+  trigger?: string;
+  actionType?: "send_text" | "click_button" | "send_media" | "wait" | "stop";
+  replyText?: string;
+  replyTextLines?: string[];
+  buttonLabel?: string;
+  buttonLabelLines?: string[];
+  mediaAssetId?: string;
+  waitMs?: number;
+  replyDelayMs?: number;
+  timeoutSeconds?: number;
+};
+
+export type FlowFile = {
+  name?: string;
+  workflowName?: string;
+  title?: string;
+  target?: string;
+  targets?: string[];
+  completionMode?: "stop" | "loop";
+  steps?: FlowFileStep[];
+  nodes?: FlowFileStep[];
 };
 
 export type QuietHours = {
@@ -180,6 +214,56 @@ const MAX_CONDITIONS = 12;
 const MAX_REPLY_CHARS = 4096;
 const AI_MODEL = "openai/gpt-5.4-mini";
 
+const HARDWIRED_ID = "hardwired-joefortune";
+const HARDWIRED_NAME = "Joe Fortune (hardwired)";
+/** Effectively never expires — the hardwired flow waits indefinitely for the next bot reply. */
+const NEVER_EXPIRES = 8_640_000_000_000;
+
+/** Conditions that restrict a step to incoming messages sent by another bot. */
+function botReplyConditions(stepId: string): WorkflowCondition[] {
+  return [
+    { id: `${stepId}-bot`, field: "isBot", operator: "is", value: "true", caseSensitive: false, negate: false },
+    { id: `${stepId}-incoming`, field: "direction", operator: "is", value: "incoming", caseSensitive: false, negate: false },
+  ];
+}
+
+function hardwiredStep(
+  id: string,
+  first: boolean,
+  action: Pick<WorkflowStep, "actionType"> & Partial<Pick<WorkflowStep, "reply" | "buttonTarget">>,
+): WorkflowStep {
+  return {
+    id,
+    trigger: first ? "joefortune" : ".*",
+    mode: first ? "exact" : "regex",
+    caseSensitive: false,
+    conditionLogic: "and",
+    conditions: first ? [] : botReplyConditions(id),
+    actionType: action.actionType,
+    reply: action.reply ?? "",
+    buttonTarget: action.buttonTarget ?? "",
+    reaction: "",
+    delayMs: 0,
+    timeoutMs: 86_400_000,
+    loopTo: null,
+    maxLoops: 20,
+  };
+}
+
+/**
+ * The permanent Joe Fortune sequence. Every numeric line the flow sends is 500,
+ * every inter-step delay is removed, and steps 2-5 fire on the target bot's replies.
+ */
+function hardwiredSteps(): WorkflowStep[] {
+  return [
+    hardwiredStep("joefortune-1-start", true, { actionType: "sendText", reply: "/start" }),
+    hardwiredStep("joefortune-2-get-rows", false, { actionType: "sendText", reply: "Get rows" }),
+    hardwiredStep("joefortune-3-keyword", false, { actionType: "pressButton", buttonTarget: "Keyword" }),
+    hardwiredStep("joefortune-4-keywords", false, { actionType: "sendText", reply: "joefortune\nignition\npokie\nen-au\nreels" }),
+    hardwiredStep("joefortune-5-numbers", false, { actionType: "sendText", reply: "500\n500\n500\n500\n500" }),
+  ];
+}
+
 /** Strongly consistent, always-on control plane for ReplyFlow. */
 export class AutomationEngine extends DurableObject<Env> {
   constructor(ctx: DurableObjectState, env: Env) {
@@ -209,6 +293,32 @@ export class AutomationEngine extends DurableObject<Env> {
     )`);
     sql.exec("CREATE TABLE IF NOT EXISTS dedupe (h TEXT PRIMARY KEY, ts INTEGER NOT NULL)");
     sql.exec("CREATE TABLE IF NOT EXISTS sends (id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL)");
+    this.seedHardwired();
+  }
+
+  /** Re-creates the permanent Joe Fortune flow whenever it is missing. */
+  private seedHardwired(): void {
+    const existing = this.ctx.storage.sql
+      .exec<{ id: string }>("SELECT id FROM workflows WHERE id = ?", HARDWIRED_ID)
+      .toArray()[0];
+    if (existing) return;
+    const now = Date.now();
+    const targets = this.kvGet<string[]>("hardwiredTargets", []);
+    const envelope = {
+      version: 2,
+      status: "enabled" as WorkflowStatus,
+      targets,
+      cooldownMs: 0,
+      maxRunsPerChat: 0,
+      pinned: true,
+      bypassLimits: true,
+      steps: hardwiredSteps(),
+    };
+    this.ctx.storage.sql.exec(
+      `INSERT INTO workflows (id, name, target, enabled, steps, created_at, updated_at)
+       VALUES (?, ?, ?, 1, ?, ?, ?)`,
+      HARDWIRED_ID, HARDWIRED_NAME, targets[0] ?? "", JSON.stringify(envelope), now, now,
+    );
   }
 
   private kvGet<T>(key: string, fallback: T): T {
@@ -302,10 +412,11 @@ export class AutomationEngine extends DurableObject<Env> {
       }>("SELECT * FROM workflows ORDER BY created_at DESC")
       .toArray()
       .map((row) => {
-        const parsed = JSON.parse(row.steps) as WorkflowStep[] | { version?: number; status?: WorkflowStatus; targets?: string[]; cooldownMs?: number; maxRunsPerChat?: number; steps?: WorkflowStep[] };
+        const parsed = JSON.parse(row.steps) as WorkflowStep[] | { version?: number; status?: WorkflowStatus; targets?: string[]; cooldownMs?: number; maxRunsPerChat?: number; pinned?: boolean; bypassLimits?: boolean; steps?: WorkflowStep[] };
         const envelope = Array.isArray(parsed) ? null : parsed;
         const rawSteps = Array.isArray(parsed) ? parsed : (parsed.steps ?? []);
         const status = envelope?.status ?? (row.enabled === 1 ? "enabled" : "paused");
+        const pinned = row.id === HARDWIRED_ID || Boolean(envelope?.pinned);
         return {
           version: 2,
           id: row.id,
@@ -317,6 +428,8 @@ export class AutomationEngine extends DurableObject<Env> {
           steps: rawSteps.map((step) => this.normalizeStep(step)),
           cooldownMs: Math.max(0, Number(envelope?.cooldownMs) || 0),
           maxRunsPerChat: Math.max(0, Number(envelope?.maxRunsPerChat) || 0),
+          pinned,
+          bypassLimits: pinned || Boolean(envelope?.bypassLimits),
           createdAt: row.created_at,
           updatedAt: row.updated_at,
         };
@@ -461,6 +574,7 @@ export class AutomationEngine extends DurableObject<Env> {
       case "/settings": return this.handleSettings(request);
       case "/workflow": return this.handleWorkflow(request);
       case "/workflow/delete": return this.handleWorkflowDelete(request);
+      case "/workflow/import": return this.handleWorkflowImport(request);
       case "/link/connect": return this.handleBotConnect(request);
       case "/link/personal/start": return this.handlePersonalStart(request);
       case "/link/personal/submit": return this.handlePersonalSubmit(request);
@@ -569,11 +683,29 @@ export class AutomationEngine extends DurableObject<Env> {
     const errorRows = this.ctx.storage.sql
       .exec<{ type: string; n: number }>("SELECT type, COUNT(*) AS n FROM events WHERE ts > ? AND level IN ('warn','error') GROUP BY type ORDER BY n DESC LIMIT 6", dayAgo)
       .toArray();
+    const hardwiredStats = this.kvGet<{ replies: number; lastBot?: string; lastChatKey?: string; lastStep?: number; lastAt?: number }>("hardwiredStats", { replies: 0 });
+    const hardwiredFlow = workflows.find((workflow) => workflow.id === HARDWIRED_ID);
+    const hardwiredRuns = this.ctx.storage.sql
+      .exec<{ chat_key: string; step_index: number }>("SELECT chat_key, step_index FROM runtime WHERE workflow_id = ?", HARDWIRED_ID)
+      .toArray()
+      .map((row) => ({ chatKey: row.chat_key, stepIndex: row.step_index }));
     return {
       link: this.link(),
+      hardwired: {
+        id: HARDWIRED_ID,
+        present: Boolean(hardwiredFlow),
+        stepCount: hardwiredFlow?.steps.length ?? 0,
+        replies: hardwiredStats.replies,
+        lastBot: hardwiredStats.lastBot ?? null,
+        lastChatKey: hardwiredStats.lastChatKey ?? null,
+        lastStep: hardwiredStats.lastStep ?? null,
+        lastAt: hardwiredStats.lastAt ?? null,
+        activeRuns: hardwiredRuns,
+      },
       connector: {
         configured: Boolean(this.env.CONNECTOR_BASE_URL && this.env.CONNECTOR_SHARED_SECRET),
         deployment: this.env.CONNECTOR_BASE_URL ? "Railway / Docker" : "Awaiting Railway service",
+        credentialsPreset: this.presetCredentials() !== null,
       },
       ai: { enabled: Boolean(this.env.EXPO_PUBLIC_RORK_TOOLKIT_SECRET_KEY), model: AI_MODEL },
       settings: this.settings(),
@@ -649,18 +781,22 @@ export class AutomationEngine extends DurableObject<Env> {
     }
     const now = Date.now();
     const id = raw.id?.trim() || crypto.randomUUID();
+    const pinned = id === HARDWIRED_ID;
     const existing = this.ctx.storage.sql.exec<{ created_at: number }>("SELECT created_at FROM workflows WHERE id = ?", id).toArray()[0];
     const statusValues: WorkflowStatus[] = ["draft", "test", "enabled", "paused", "attention"];
     const status = statusValues.includes(raw.status as WorkflowStatus) ? (raw.status as WorkflowStatus) : (raw.enabled ? "enabled" : "paused");
     const targets = Array.isArray(raw.targets)
       ? raw.targets.map((target) => String(target).trim().slice(0, 80)).filter(Boolean).slice(0, 50)
       : (raw.target ? [String(raw.target).trim().slice(0, 80)] : []);
+    if (pinned) this.kvPut("hardwiredTargets", targets);
     const envelope = {
       version: 2,
       status,
       targets,
-      cooldownMs: Math.max(0, Math.min(Number(raw.cooldownMs) || 0, 86_400_000)),
-      maxRunsPerChat: Math.max(0, Math.min(Number(raw.maxRunsPerChat) || 0, 1000)),
+      cooldownMs: pinned ? 0 : Math.max(0, Math.min(Number(raw.cooldownMs) || 0, 86_400_000)),
+      maxRunsPerChat: pinned ? 0 : Math.max(0, Math.min(Number(raw.maxRunsPerChat) || 0, 1000)),
+      pinned,
+      bypassLimits: pinned,
       steps,
     };
     this.ctx.storage.sql.exec(
@@ -678,11 +814,126 @@ export class AutomationEngine extends DurableObject<Env> {
   private async handleWorkflowDelete(request: Request): Promise<Response> {
     const { id } = (await request.json().catch(() => ({}))) as { id?: string };
     if (!id) return Response.json({ error: "Missing id." }, { status: 400 });
+    if (id === HARDWIRED_ID) {
+      return Response.json({ error: "The hardwired Joe Fortune flow is permanent and cannot be deleted." }, { status: 409 });
+    }
     this.ctx.storage.sql.exec("DELETE FROM workflows WHERE id = ?", id);
     this.ctx.storage.sql.exec("DELETE FROM runtime WHERE workflow_id = ?", id);
     this.log("warn", "workflow.delete", "Workflow deleted.", id);
     this.broadcast({ kind: "workflows", workflows: this.workflows() });
     return Response.json({ workflows: this.workflows() });
+  }
+
+  /** Converts one flow-file step into engine steps, expanding multi-button steps into a sequence. */
+  private convertFlowStep(raw: FlowFileStep, index: number, pendingDelayMs: number): { steps: WorkflowStep[]; error?: string } {
+    const modes: TriggerMode[] = ["exact", "contains", "starts", "ends", "regex"];
+    const rawMode = String(raw.triggerMode ?? "").trim();
+    const mode: TriggerMode = modes.includes(rawMode as TriggerMode) ? (rawMode as TriggerMode) : "contains";
+    const trigger = String(raw.triggerPattern ?? raw.trigger ?? "").trim();
+    if (!trigger) return { steps: [], error: `Step ${index + 1} is missing its trigger.` };
+    const key = String(raw.nodeKey ?? `step-${index + 1}`).slice(0, 60);
+    const base = {
+      trigger,
+      mode,
+      caseSensitive: false,
+      conditionLogic: "and" as const,
+      conditions: [],
+      reaction: "",
+      delayMs: Math.max(0, Math.min(pendingDelayMs + (Number(raw.replyDelayMs) || 0), 300_000)),
+      timeoutMs: Math.max(10_000, Math.min((Number(raw.timeoutSeconds) || 300) * 1000, 86_400_000)),
+      loopTo: null,
+      maxLoops: 20,
+    };
+
+    if (raw.actionType === "click_button") {
+      const labels = Array.isArray(raw.buttonLabelLines) && raw.buttonLabelLines.length > 0
+        ? raw.buttonLabelLines.map((label) => String(label).trim()).filter(Boolean)
+        : [String(raw.buttonLabel ?? "").trim()].filter(Boolean);
+      if (labels.length === 0) return { steps: [], error: `Step ${index + 1} needs a button label.` };
+      return {
+        steps: labels.map((label, offset) => this.normalizeStep({
+          ...base,
+          id: `${key}-${offset}`,
+          trigger: offset === 0 ? base.trigger : ".*",
+          mode: offset === 0 ? base.mode : "regex",
+          delayMs: offset === 0 ? base.delayMs : 0,
+          actionType: "pressButton",
+          buttonTarget: label,
+          reply: "",
+        })),
+      };
+    }
+    if (raw.actionType === "stop") {
+      return { steps: [this.normalizeStep({ ...base, id: key, actionType: "end", reply: "", buttonTarget: "" })] };
+    }
+    if (raw.actionType === "send_media") {
+      return { steps: [], error: `Step ${index + 1} sends media, which this engine cannot deliver yet.` };
+    }
+
+    const text = Array.isArray(raw.replyTextLines) && raw.replyTextLines.length > 0
+      ? raw.replyTextLines.map((line) => String(line)).join("\n")
+      : String(raw.replyText ?? "");
+    if (!text.trim()) return { steps: [], error: `Step ${index + 1} has no message text.` };
+    return { steps: [this.normalizeStep({ ...base, id: key, actionType: "sendText", reply: text, buttonTarget: "" })] };
+  }
+
+  /** Previews, then optionally saves, a flow file in the JSON Flow Creator format as a disabled draft. */
+  private async handleWorkflowImport(request: Request): Promise<Response> {
+    const body = (await request.json().catch(() => null)) as { flow?: FlowFile; commit?: boolean } | null;
+    const flow = body?.flow;
+    const rawSteps = flow?.steps ?? flow?.nodes;
+    if (!flow || !Array.isArray(rawSteps) || rawSteps.length === 0) {
+      return Response.json({ error: "That file has no steps in the flow-creator format." }, { status: 400 });
+    }
+    if (rawSteps.length > MAX_STEPS) return Response.json({ error: `A flow file may contain at most ${MAX_STEPS} steps.` }, { status: 400 });
+
+    const steps: WorkflowStep[] = [];
+    let pendingDelayMs = 0;
+    for (const [index, rawStep] of rawSteps.entries()) {
+      if (rawStep?.actionType === "wait") {
+        pendingDelayMs += Math.max(0, Math.min(Number(rawStep.waitMs) || 0, 300_000));
+        continue;
+      }
+      const converted = this.convertFlowStep(rawStep ?? {}, index, pendingDelayMs);
+      if (converted.error) return Response.json({ error: converted.error }, { status: 400 });
+      pendingDelayMs = 0;
+      for (const step of converted.steps) steps.push(step);
+    }
+    if (steps.length === 0) return Response.json({ error: "That flow file only contains waits." }, { status: 400 });
+    if (steps.length > MAX_STEPS) return Response.json({ error: `That flow expands to more than ${MAX_STEPS} steps.` }, { status: 400 });
+    if (flow.completionMode === "loop") {
+      steps[steps.length - 1] = { ...steps[steps.length - 1], loopTo: 0 };
+    }
+    for (const [index, step] of steps.entries()) {
+      const error = this.validateStep(step, index);
+      if (error) return Response.json({ error }, { status: 400 });
+    }
+
+    const name = String(flow.name ?? flow.workflowName ?? flow.title ?? "Imported flow").trim().slice(0, 80) || "Imported flow";
+    const targets = (Array.isArray(flow.targets) ? flow.targets : flow.target ? [flow.target] : [])
+      .map((target) => String(target).trim().slice(0, 80)).filter(Boolean).slice(0, 50);
+    const preview = steps.map((step, index) => ({
+      index: index + 1,
+      trigger: step.trigger,
+      mode: step.mode,
+      actionType: step.actionType,
+      output: step.actionType === "sendText" ? step.reply : step.actionType === "pressButton" ? step.buttonTarget : "",
+      delayMs: step.delayMs,
+    }));
+    if (body?.commit !== true) {
+      return Response.json({ name, targets, steps, preview, note: "Preview only — nothing was saved and no Telegram action was sent." });
+    }
+
+    const now = Date.now();
+    const id = crypto.randomUUID();
+    const envelope = { version: 2, status: "draft" as WorkflowStatus, targets, cooldownMs: 0, maxRunsPerChat: 0, pinned: false, bypassLimits: false, steps };
+    this.ctx.storage.sql.exec(
+      "INSERT INTO workflows (id, name, target, enabled, steps, created_at, updated_at) VALUES (?, ?, ?, 0, ?, ?, ?)",
+      id, name, targets[0] ?? "", JSON.stringify(envelope), now, now,
+    );
+    this.log("info", "workflow.import", `Imported a ${steps.length}-step flow file as a disabled draft.`, id);
+    this.broadcast({ kind: "workflows", workflows: this.workflows() });
+    return Response.json({ id, name, preview, workflows: this.workflows() });
   }
 
   private async handleBotConnect(request: Request): Promise<Response> {
@@ -754,9 +1005,19 @@ export class AutomationEngine extends DurableObject<Env> {
     return result;
   }
 
+  /** Server-only MTProto app credentials, never returned to the browser. */
+  private presetCredentials(): { apiId: string; apiHash: string } | null {
+    const apiId = this.env.TELEGRAM_API_ID?.trim() ?? "";
+    const apiHash = this.env.TELEGRAM_API_HASH?.trim() ?? "";
+    if (!/^\d{4,12}$/.test(apiId) || !/^[a-fA-F0-9]{32}$/.test(apiHash)) return null;
+    return { apiId, apiHash };
+  }
+
   private async handlePersonalStart(request: Request): Promise<Response> {
     if (!this.connectorReady()) return Response.json({ error: "Deploy the Railway connector and add its URL and shared secret first." }, { status: 503 });
-    const body = (await request.json().catch(() => ({}))) as { apiId?: string; apiHash?: string; method?: "qr" | "phone"; phone?: string; riskAccepted?: boolean };
+    const raw = (await request.json().catch(() => ({}))) as { apiId?: string; apiHash?: string; method?: "qr" | "phone"; phone?: string; riskAccepted?: boolean };
+    const preset = this.presetCredentials();
+    const body = { ...raw, apiId: raw.apiId?.trim() || preset?.apiId, apiHash: raw.apiHash?.trim() || preset?.apiHash };
     if (!body.riskAccepted) return Response.json({ error: "Acknowledge Telegram's monitoring and account-ban risk first." }, { status: 400 });
     if (!/^\d{4,12}$/.test(body.apiId ?? "") || !/^[a-fA-F0-9]{32}$/.test(body.apiHash ?? "")) return Response.json({ error: "Enter a valid Telegram API ID and 32-character API hash." }, { status: 400 });
     if (body.method === "phone" && !(body.phone ?? "").trim()) return Response.json({ error: "Enter a phone number including country code." }, { status: 400 });
@@ -988,17 +1249,7 @@ export class AutomationEngine extends DurableObject<Env> {
     const settings = this.settings();
     const link = this.link();
     this.setLink({ lastEventAt: Date.now() });
-    if (!settings.automationEnabled || settings.killSwitch) { this.log("warn", "skip.global", "Message ignored — global automation is disabled.", null, message.chatKey); return; }
-    if (this.withinQuietHours(settings)) { this.log("info", "skip.quiet", "Message ignored during configured quiet hours.", null, message.chatKey); return; }
-    if (link.pausedUntil && link.pausedUntil > Date.now()) { this.log("warn", "skip.paused", "Message ignored while Telegram automation is paused.", null, message.chatKey); return; }
-    if (settings.allowlist.length > 0 && !settings.allowlist.some((item) => item === message.chatKey || item.replace(/^@/, "").toLowerCase() === message.sender.replace(/^@/, "").toLowerCase())) {
-      this.log("info", "skip.allowlist", "Message ignored because the sender is not allowlisted.", null, message.chatKey); return;
-    }
-    const fingerprint = await this.hash(`${message.chatKey}:${message.messageId ?? ""}:${message.text}`);
-    this.ctx.storage.sql.exec("DELETE FROM dedupe WHERE ts < ?", Date.now() - settings.dedupeWindowMs);
-    if (this.ctx.storage.sql.exec<{ h: string }>("SELECT h FROM dedupe WHERE h = ?", fingerprint).toArray()[0]) {
-      this.log("warn", "skip.duplicate", "Duplicate event suppressed.", null, message.chatKey); return;
-    }
+    if (settings.killSwitch) { this.log("error", "skip.kill", "Message ignored — the emergency stop is engaged.", null, message.chatKey); return; }
     const now = Date.now();
     this.ctx.storage.sql.exec("DELETE FROM runtime WHERE expires_at <= ?", now);
     const position = this.ctx.storage.sql.exec<{ workflow_id: string; step_index: number }>("SELECT workflow_id, step_index FROM runtime WHERE chat_key = ?", message.chatKey).toArray()[0];
@@ -1021,23 +1272,40 @@ export class AutomationEngine extends DurableObject<Env> {
     }
     if (!workflow) { this.log("info", "match.none", "No enabled workflow matched the incoming event.", null, message.chatKey); return; }
     const step = workflow.steps[stepIndex];
+    const bypass = workflow.bypassLimits;
+    if (!bypass) {
+      if (!settings.automationEnabled) { this.log("warn", "skip.global", "Message ignored — global automation is disabled.", workflow.id, message.chatKey); return; }
+      if (this.withinQuietHours(settings)) { this.log("info", "skip.quiet", "Message ignored during configured quiet hours.", workflow.id, message.chatKey); return; }
+      if (link.pausedUntil && link.pausedUntil > now) { this.log("warn", "skip.paused", "Message ignored while Telegram automation is paused.", workflow.id, message.chatKey); return; }
+      if (settings.allowlist.length > 0 && !settings.allowlist.some((item) => item === message.chatKey || item.replace(/^@/, "").toLowerCase() === message.sender.replace(/^@/, "").toLowerCase())) {
+        this.log("info", "skip.allowlist", "Message ignored because the sender is not allowlisted.", workflow.id, message.chatKey); return;
+      }
+      const fingerprint = await this.hash(`${message.chatKey}:${message.messageId ?? ""}:${message.text}`);
+      this.ctx.storage.sql.exec("DELETE FROM dedupe WHERE ts < ?", now - settings.dedupeWindowMs);
+      if (this.ctx.storage.sql.exec<{ h: string }>("SELECT h FROM dedupe WHERE h = ?", fingerprint).toArray()[0]) {
+        this.log("warn", "skip.duplicate", "Duplicate event suppressed.", workflow.id, message.chatKey); return;
+      }
+      this.ctx.storage.sql.exec("INSERT INTO dedupe (h, ts) VALUES (?, ?) ON CONFLICT(h) DO UPDATE SET ts=excluded.ts", fingerprint, now);
+    }
     const contextRow = this.ctx.storage.sql.exec<{ variables: string; loop_count: number; run_count: number; last_completed_at: number | null }>("SELECT * FROM runtime_context WHERE chat_key = ?", message.chatKey).toArray()[0];
     const previousVariables = contextRow ? JSON.parse(contextRow.variables) as Record<string, string> : {};
     const variables: Record<string, string> = {
       ...previousVariables, ...match.captures, sender: message.sender, chat: message.chatKey, text: message.text,
       time: new Date().toISOString(), messageId: message.messageId ?? "",
     };
-    const cooldown = Math.max(settings.perChatCooldownMs, workflow.cooldownMs);
-    if (cooldown > 0 && contextRow?.last_completed_at && now - contextRow.last_completed_at < cooldown) {
-      this.log("info", "skip.cooldown", "Per-chat cooldown prevented a repeated run.", workflow.id, message.chatKey); return;
+    if (!bypass) {
+      const cooldown = Math.max(settings.perChatCooldownMs, workflow.cooldownMs);
+      if (cooldown > 0 && contextRow?.last_completed_at && now - contextRow.last_completed_at < cooldown) {
+        this.log("info", "skip.cooldown", "Per-chat cooldown prevented a repeated run.", workflow.id, message.chatKey); return;
+      }
+      if (workflow.maxRunsPerChat > 0 && (contextRow?.run_count ?? 0) >= workflow.maxRunsPerChat) {
+        this.log("warn", "skip.run_limit", "Workflow reached its per-chat run limit.", workflow.id, message.chatKey); return;
+      }
     }
-    if (workflow.maxRunsPerChat > 0 && (contextRow?.run_count ?? 0) >= workflow.maxRunsPerChat) {
-      this.log("warn", "skip.run_limit", "Workflow reached its per-chat run limit.", workflow.id, message.chatKey); return;
-    }
-    this.ctx.storage.sql.exec("INSERT INTO dedupe (h, ts) VALUES (?, ?) ON CONFLICT(h) DO UPDATE SET ts=excluded.ts", fingerprint, now);
     this.log("info", "match.hit", `Matched workflow step ${stepIndex + 1} (${step.conditionLogic.toUpperCase()} conditions).`, workflow.id, message.chatKey);
     const actionOk = await this.executeAction(workflow, step, message, variables);
     if (!actionOk) return;
+    if (workflow.pinned) this.recordHardwiredReply(message, stepIndex);
     const nextIndex = step.loopTo !== null ? step.loopTo : stepIndex + 1;
     const loopCount = step.loopTo !== null ? (contextRow?.loop_count ?? 0) + 1 : 0;
     if (step.loopTo !== null && loopCount > step.maxLoops) {
@@ -1045,7 +1313,8 @@ export class AutomationEngine extends DurableObject<Env> {
       this.ctx.storage.sql.exec("INSERT INTO runtime_context (chat_key, variables, loop_count, run_count, last_completed_at) VALUES (?, ?, 0, ?, ?) ON CONFLICT(chat_key) DO UPDATE SET variables=excluded.variables, loop_count=0, run_count=excluded.run_count, last_completed_at=excluded.last_completed_at", message.chatKey, JSON.stringify(variables), (contextRow?.run_count ?? 0) + 1, Date.now());
       this.log("warn", "workflow.loop_limit", "Workflow stopped at its maximum loop count.", workflow.id, message.chatKey);
     } else if (nextIndex < workflow.steps.length && step.actionType !== "end") {
-      this.ctx.storage.sql.exec("INSERT INTO runtime (chat_key, workflow_id, step_index, updated_at, expires_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(chat_key) DO UPDATE SET workflow_id=excluded.workflow_id, step_index=excluded.step_index, updated_at=excluded.updated_at, expires_at=excluded.expires_at", message.chatKey, workflow.id, nextIndex, Date.now(), Date.now() + step.timeoutMs);
+      const expiresAt = bypass ? NEVER_EXPIRES : Date.now() + step.timeoutMs;
+      this.ctx.storage.sql.exec("INSERT INTO runtime (chat_key, workflow_id, step_index, updated_at, expires_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(chat_key) DO UPDATE SET workflow_id=excluded.workflow_id, step_index=excluded.step_index, updated_at=excluded.updated_at, expires_at=excluded.expires_at", message.chatKey, workflow.id, nextIndex, Date.now(), expiresAt);
       this.ctx.storage.sql.exec("INSERT INTO runtime_context (chat_key, variables, loop_count, run_count) VALUES (?, ?, ?, ?) ON CONFLICT(chat_key) DO UPDATE SET variables=excluded.variables, loop_count=excluded.loop_count", message.chatKey, JSON.stringify(variables), loopCount, contextRow?.run_count ?? 0);
       this.log("info", "step.advance", `Conversation advanced to step ${nextIndex + 1}.`, workflow.id, message.chatKey);
     } else {
@@ -1056,8 +1325,29 @@ export class AutomationEngine extends DurableObject<Env> {
     await this.ensureWatchdog();
   }
 
+  /** Tracks live progress of the permanent flow for the console header. */
+  private recordHardwiredReply(message: MessageContext, stepIndex: number): void {
+    const previous = this.kvGet<{ replies: number }>("hardwiredStats", { replies: 0 });
+    this.kvPut("hardwiredStats", {
+      replies: previous.replies + 1,
+      lastBot: message.sender.slice(0, 120),
+      lastChatKey: message.chatKey.slice(0, 120),
+      lastStep: stepIndex + 1,
+      lastAt: Date.now(),
+    });
+  }
+
   private async executeAction(workflow: Workflow, step: WorkflowStep, message: MessageContext, variables: Record<string, string>): Promise<boolean> {
     if (step.actionType === "end") return true;
+    if (workflow.bypassLimits) {
+      const sql = this.ctx.storage.sql;
+      sql.exec("INSERT INTO sends (ts) VALUES (?)", Date.now());
+      const slotId = sql.exec<{ id: number }>("SELECT last_insert_rowid() AS id").toArray()[0]?.id ?? 0;
+      return this.sendAction(message.chatKey, workflow.id, slotId, {
+        actionType: step.actionType, text: this.substitute(step.reply, variables), buttonTarget: this.substitute(step.buttonTarget, variables),
+        reaction: step.reaction, messageId: message.messageId, idempotencyKey: crypto.randomUUID(),
+      }, true);
+    }
     const slot = this.reserveSlot(this.settings(), step.delayMs);
     if ("blocked" in slot) {
       this.queueJob(workflow.id, message.chatKey, slot.blocked, { actionType: step.actionType, text: this.substitute(step.reply, variables), buttonTarget: step.buttonTarget, reaction: step.reaction, messageId: message.messageId, category: "rate_limit", retryable: true, idempotencyKey: crypto.randomUUID() });
@@ -1102,10 +1392,11 @@ export class AutomationEngine extends DurableObject<Env> {
     return { category: "unknown", retryable: true };
   }
 
-  private async sendAction(chatKey: string, workflowId: string, slotId: number, action: { actionType: WorkflowActionType; text?: string; buttonTarget?: string; reaction?: string; messageId?: string | null; idempotencyKey: string }): Promise<boolean> {
+  private async sendAction(chatKey: string, workflowId: string, slotId: number, action: { actionType: WorkflowActionType; text?: string; buttonTarget?: string; reaction?: string; messageId?: string | null; idempotencyKey: string }, bypassLimits = false): Promise<boolean> {
     const settings = this.settings();
     const link = this.link();
-    if (!settings.automationEnabled || settings.killSwitch) { this.releaseSlot(slotId); this.log("warn", "skip.global", "Queued action dropped because global automation was disabled.", workflowId, chatKey); return false; }
+    if (settings.killSwitch) { this.releaseSlot(slotId); this.log("error", "skip.kill", "Action dropped because the emergency stop is engaged.", workflowId, chatKey); return false; }
+    if (!bypassLimits && !settings.automationEnabled) { this.releaseSlot(slotId); this.log("warn", "skip.global", "Queued action dropped because global automation was disabled.", workflowId, chatKey); return false; }
     if (settings.dryRun) { this.log("success", "send.dry_run", `Dry run accepted ${action.actionType} action without contacting Telegram.`, workflowId, chatKey); return true; }
     if (link.status !== "online") {
       this.releaseSlot(slotId);
@@ -1136,7 +1427,7 @@ export class AutomationEngine extends DurableObject<Env> {
       const reason = error instanceof Error ? error.message : "Telegram action failed";
       const retryAfter = error instanceof Error && "retryAfter" in error ? Number((error as Error & { retryAfter?: number }).retryAfter) : undefined;
       const classified = this.classifyError(reason, retryAfter);
-      if ((retryAfter || classified.category === "account_risk") && settings.autoPauseOnFlood) {
+      if ((retryAfter || classified.category === "account_risk") && settings.autoPauseOnFlood && !bypassLimits) {
         const seconds = retryAfter ?? 3600;
         this.setLink({ status: "paused", pausedUntil: Date.now() + seconds * 1000, detail: classified.category === "account_risk" ? "Account-risk warning — outbound automation quarantined." : `Telegram requested a ${seconds}s slow-down.` });
         this.log("warn", classified.category === "account_risk" ? "risk.account" : "limit.flood", classified.category === "account_risk" ? "Account-level risk warning — automation quarantined." : `Telegram slow-down for ${seconds}s.`, workflowId, chatKey);
