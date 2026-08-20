@@ -4,11 +4,57 @@ This folder is the only part of ReplyFlow that talks to your personal Telegram
 account. It has to run on a real Linux host that stays up 24/7. These steps use
 Railway; any Docker host works the same way.
 
-Follow the steps in order. It takes about ten minutes.
+There are two ways to do this:
+
+- **Hand it over** — paste a project token and let the deploy run itself. See
+  [Handover](#handover-let-the-script-do-it) directly below. This is the fast path.
+- **Do it by hand** — the click-by-click steps start at
+  [Step 1](#step-1--get-your-telegram-app-credentials). About ten minutes.
+
+---
+
+## Handover: let the script do it
+
+`deploy.sh` in this folder performs every manual step below in one run: it sets
+the variables, creates the persistent disk, uploads and builds the code,
+attaches a domain on port 8080, waits for the service to answer, and prints the
+readiness report. It is idempotent, so re-running it is safe, and it never
+echoes a secret value.
+
+### Get a project token
+
+1. Open your Railway **project** (not the account avatar menu).
+2. **Settings → Tokens → Create token**.
+3. Set the environment to **production** and name it something like `handover`.
+4. Copy the token.
+
+A project token reaches only this one project. An *account* token, created from
+the avatar menu, reaches every project you own — do not use one here.
+
+### Run it
+
+```bash
+bash <(curl -fsSL railway.com/install.sh) -y
+
+export RAILWAY_TOKEN=<the project token>
+export TELEGRAM_API_ID=<from my.telegram.org>
+export TELEGRAM_API_HASH=<from my.telegram.org>
+export SESSION_ENCRYPTION_KEY=0f32f873e33e08445fdb76b2e9a495a5aa7cad7cc61300f93c57d8889ee51a73
+export CONNECTOR_SHARED_SECRET=28231886a62412bbe363c4ba1859398ce12d5f2eb67b75582de2e73c2d8eeffe
+
+./connector/deploy.sh
+```
+
+The script refuses to start if a value is missing or the wrong shape, so a typo
+fails immediately instead of producing a service that looks up but cannot log in.
+
+When it finishes, delete the token: **Project Settings → Tokens → remove**. The
+service keeps running without it.
 
 ---
 
 ## Step 1 — Get your Telegram app credentials
+<!-- Manual path. Skip if you used the handover script above. -->
 
 1. Open <https://my.telegram.org> and log in with your phone number.
 2. Choose **API development tools**.
