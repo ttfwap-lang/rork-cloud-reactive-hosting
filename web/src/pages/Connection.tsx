@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState, type FormEvent } from "react";
 import { QRCodeSVG } from "qrcode.react";
-import { Bot, CheckCircle2, KeyRound, Loader2, Phone, PlugZap, QrCode, RefreshCw, Send, ShieldAlert, Trash2, TrainFront, UserRound } from "lucide-react";
+import { AlertTriangle, Bot, CheckCircle2, KeyRound, Loader2, Phone, PlugZap, QrCode, RefreshCw, Send, Server, ShieldAlert, Trash2, TrainFront, UserRound, Wrench } from "lucide-react";
 import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
@@ -13,9 +13,10 @@ import {
 } from "@/components/ui/alert-dialog";
 import { cn } from "@/lib/utils";
 import { useEngine } from "@/lib/engine-store";
+import type { HostingReport } from "@/lib/api";
 
 export default function Connection() {
-  const { snapshot, connectBot, startPersonal, submitPersonal, pollPersonal, checkConnector, reconnect, forgetConnection, simulate } = useEngine();
+  const { snapshot, connectBot, startPersonal, submitPersonal, pollPersonal, checkConnector, diagnoseHosting, applyHosting, reconnect, forgetConnection, simulate } = useEngine();
   const [mode, setMode] = useState<"personal" | "bot">("personal");
   const [loginMethod, setLoginMethod] = useState<"qr" | "phone">("qr");
   const [apiId, setApiId] = useState<string>("");
@@ -27,6 +28,9 @@ export default function Connection() {
   const [busy, setBusy] = useState<boolean>(false);
   const [checking, setChecking] = useState<boolean>(false);
   const [probe, setProbe] = useState<string>("");
+  const [hosting, setHosting] = useState<HostingReport | null>(null);
+  const [hostingBusy, setHostingBusy] = useState<"read" | "fix" | null>(null);
+  const [applied, setApplied] = useState<string[]>([]);
 
   const link = snapshot?.link;
   const connector = snapshot?.connector;
@@ -189,6 +193,95 @@ export default function Connection() {
           <form onSubmit={beginBot} className="space-y-3"><Input type="password" value={token} placeholder="123456789:AA..." onChange={(event) => setTokenValue(event.target.value)} className="h-11 rounded-xl bg-input/60 font-mono text-sm" /><Button type="submit" disabled={busy || token.trim().length < 20} className="h-11 w-full gap-2 rounded-xl font-semibold">{busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <PlugZap className="h-4 w-4" />}Encrypt token and connect</Button></form>
         </section>
       )}
+
+      <section className="panel overflow-hidden">
+        <div className="flex flex-wrap items-center gap-3 border-b border-white/[0.06] p-5">
+          <div className="grid h-10 w-10 shrink-0 place-items-center rounded-xl bg-accent/10 ring-1 ring-accent/20"><Server className="h-5 w-5 text-accent" /></div>
+          <div className="min-w-0 flex-1">
+            <h2 className="text-sm font-semibold">Hosting inspector</h2>
+            <p className="text-[11px] leading-relaxed text-muted-foreground">Reads your Railway project with the server-only token and reports exactly why the service is or is not answering. Nothing secret is shown here.</p>
+          </div>
+          <div className="flex shrink-0 gap-2">
+            <Button size="sm" variant="secondary" className="rounded-full" disabled={hostingBusy !== null} onClick={() => {
+              setHostingBusy("read");
+              setApplied([]);
+              diagnoseHosting().then(setHosting).catch(() => undefined).finally(() => setHostingBusy(null));
+            }}>
+              {hostingBusy === "read" ? <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" /> : <RefreshCw className="mr-1.5 h-3.5 w-3.5" />}Read status
+            </Button>
+            <Button size="sm" className="rounded-full" disabled={hostingBusy !== null} onClick={() => {
+              setHostingBusy("fix");
+              applyHosting().then((result) => { setApplied(result.applied); setHosting(result.report); }).catch(() => undefined).finally(() => setHostingBusy(null));
+            }}>
+              {hostingBusy === "fix" ? <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" /> : <Wrench className="mr-1.5 h-3.5 w-3.5" />}Fix and redeploy
+            </Button>
+          </div>
+        </div>
+
+        {hosting === null ? (
+          <p className="p-5 text-xs text-muted-foreground">Press <span className="font-medium text-foreground">Read status</span> to pull the live picture from Railway, or <span className="font-medium text-foreground">Fix and redeploy</span> to push every setting, create the persistent disk, point the address at port 8080 and start a build.</p>
+        ) : (
+          <div className="space-y-4 p-5">
+            <div className={cn("flex gap-3 rounded-2xl border p-4", hosting.ok ? "border-primary/20 bg-primary/[0.05]" : "border-amber-400/20 bg-amber-400/[0.05]")}>
+              {hosting.ok ? <CheckCircle2 className="mt-0.5 h-4 w-4 shrink-0 text-primary" /> : <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-amber-400" />}
+              <div className="min-w-0">
+                <p className={cn("text-sm font-semibold", hosting.ok ? "text-primary" : "text-amber-300")}>{hosting.detail}</p>
+                {hosting.projectName ? <p className="mt-0.5 text-[11px] text-muted-foreground">Project {hosting.projectName} · environment {hosting.environmentName} · {hosting.tokenKind} token</p> : null}
+              </div>
+            </div>
+
+            {applied.length > 0 ? (
+              <ul className="space-y-1.5 rounded-2xl bg-secondary/40 p-4 text-[11px] text-muted-foreground">
+                {applied.map((line) => <li key={line} className="flex gap-2"><CheckCircle2 className="mt-0.5 h-3 w-3 shrink-0 text-primary" />{line}</li>)}
+              </ul>
+            ) : null}
+
+            {hosting.findings.length > 0 ? (
+              <div>
+                <p className="mb-2 text-xs font-semibold">What is wrong</p>
+                <ul className="space-y-1.5">
+                  {hosting.findings.map((finding) => (
+                    <li key={finding} className="flex gap-2 rounded-xl bg-destructive/[0.06] px-3 py-2 text-[11px] leading-relaxed text-muted-foreground">
+                      <AlertTriangle className="mt-0.5 h-3 w-3 shrink-0 text-destructive" />{finding}
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            ) : null}
+
+            {hosting.services.length > 0 ? (
+              <div>
+                <p className="mb-2 text-xs font-semibold">Services</p>
+                <div className="space-y-2">
+                  {hosting.services.map((service) => (
+                    <div key={service.id} className="rounded-xl bg-secondary/40 px-3 py-2.5">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <span className="text-xs font-semibold">{service.name}</span>
+                        <span className={cn("rounded-full px-2 py-0.5 text-[10px] font-medium", service.latestStatus === "SUCCESS" ? "bg-primary/15 text-primary" : "bg-destructive/15 text-destructive")}>{service.latestStatus ?? "never deployed"}</span>
+                        {service.latestAt ? <span className="text-[10px] text-muted-foreground">{new Date(service.latestAt).toLocaleString()}</span> : null}
+                      </div>
+                      <dl className="mt-1.5 grid gap-x-4 gap-y-0.5 text-[10px] text-muted-foreground sm:grid-cols-2">
+                        <div>Root folder: <span className="text-foreground">{service.rootDirectory ?? "repository root"}</span></div>
+                        <div>Builder: <span className="text-foreground">{service.builder ?? "unknown"}</span></div>
+                        <div>Disks: <span className="text-foreground">{service.volumeMounts.length > 0 ? service.volumeMounts.join(", ") : "none"}</span></div>
+                        <div>Addresses: <span className="text-foreground">{service.domains.length > 0 ? service.domains.map((entry) => `${entry.domain} → ${entry.targetPort ?? "auto"}`).join(", ") : "none"}</span></div>
+                        <div className="sm:col-span-2">Settings present: <span className="text-foreground">{service.variableKeys.length > 0 ? service.variableKeys.join(", ") : "none"}</span></div>
+                      </dl>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            ) : null}
+
+            {hosting.buildLog.length > 0 ? (
+              <div>
+                <p className="mb-2 text-xs font-semibold">Build log tail</p>
+                <pre className="max-h-72 overflow-auto rounded-xl bg-black/40 p-3 font-mono text-[10px] leading-relaxed text-muted-foreground">{hosting.buildLog.join("\n")}</pre>
+              </div>
+            ) : null}
+          </div>
+        )}
+      </section>
 
       <section className="panel p-5">
         <h2 className="text-sm font-semibold">Live engine test</h2><p className="mt-1 text-[11px] text-muted-foreground">Push a synthetic inbound message through matching, captures, variables and safety checks.</p>

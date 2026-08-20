@@ -12,6 +12,58 @@ type Env = {
   TELEGRAM_API_HASH?: string;
   EXPO_PUBLIC_TOOLKIT_URL?: string;
   EXPO_PUBLIC_RORK_TOOLKIT_SECRET_KEY?: string;
+  /** Railway API token, accepted under either casing. Never leaves the worker. */
+  Railway_token?: string;
+  RAILWAY_TOKEN?: string;
+  RAILWAY_PROJECT_ID?: string;
+};
+
+const RAILWAY_API = "https://backboard.railway.com/graphql/v2";
+const CONNECTOR_MOUNT_PATH = "/data";
+const CONNECTOR_PORT = 8080;
+const REQUIRED_CONNECTOR_VARS = [
+  "TELEGRAM_API_ID",
+  "TELEGRAM_API_HASH",
+  "SESSION_ENCRYPTION_KEY",
+  "CONNECTOR_SHARED_SECRET",
+  "CONTROL_PLANE_URL",
+  "SESSION_PATH",
+] as const;
+
+type RailwayTokenKind = "project" | "account";
+type RailwayScope = {
+  kind: RailwayTokenKind;
+  projectId: string;
+  environmentId: string;
+  projectName: string;
+  environmentName: string;
+};
+
+/** One Railway service, reduced to the facts that explain why it is or is not serving. */
+export type HostingServiceReport = {
+  id: string;
+  name: string;
+  rootDirectory: string | null;
+  builder: string | null;
+  source: string | null;
+  latestStatus: string | null;
+  latestAt: number | null;
+  domains: Array<{ domain: string; targetPort: number | null }>;
+  /** Variable NAMES only. Stored values are never read into the report. */
+  variableKeys: string[];
+  volumeMounts: string[];
+};
+
+export type HostingReport = {
+  ok: boolean;
+  detail: string;
+  tokenKind: RailwayTokenKind | null;
+  projectName: string | null;
+  environmentName: string | null;
+  services: HostingServiceReport[];
+  findings: string[];
+  buildLog: string[];
+  checkedAt: number;
 };
 
 /**
@@ -589,6 +641,8 @@ export class AutomationEngine extends DurableObject<Env> {
       case "/link/personal/poll": return this.handlePersonalPoll();
       case "/hardwired/run": return this.handleHardwiredRun(request);
       case "/connector/check": return Response.json({ probe: await this.probeConnector() });
+      case "/hosting/diagnose": return Response.json({ report: await this.hostingDiagnose() });
+      case "/hosting/apply": return this.handleHostingApply();
       case "/link/reconnect": return this.handleReconnect();
       case "/link/disconnect": return this.handleDisconnect(false);
       case "/link/forget": return this.handleDisconnect(true);
@@ -1729,6 +1783,339 @@ export class AutomationEngine extends DurableObject<Env> {
     } catch {
       return { reachable: false, detail: "The connector address could not be reached.", checkedAt, workerAgeSeconds: null };
     }
+  }
+
+  // ------------------------------------------------------------------ hosting
+
+  private railwayToken(): string | null {
+    const raw = (this.env.Railway_token ?? this.env.RAILWAY_TOKEN ?? "").trim();
+    return raw.length > 0 ? raw : null;
+  }
+
+  /** One POST to Railway's GraphQL API. Project tokens use a different header than account tokens. */
+  private async railwayQuery<T>(kind: RailwayTokenKind, query: string, variables: Record<string, unknown> = {}): Promise<T> {
+    const token = this.railwayToken();
+    if (!token) throw new Error("No hosting token is stored on the engine.");
+    const headers: Record<string, string> = { "Content-Type": "application/json" };
+    if (kind === "project") headers["Project-Access-Token"] = token;
+    else headers.Authorization = `Bearer ${token}`;
+    const response = await fetch(RAILWAY_API, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ query, variables }),
+      signal: AbortSignal.timeout(20_000),
+    });
+    const payload = (await response.json().catch(() => ({}))) as { data?: T; errors?: Array<{ message?: string }> };
+    const failure = payload.errors?.map((entry) => entry.message).find((message): message is string => typeof message === "string");
+    if (failure) throw new Error(failure);
+    if (!payload.data) throw new Error(`Railway answered with status ${response.status}.`);
+    return payload.data;
+  }
+
+  /** Works out which project and environment the stored token can actually reach. */
+  private async railwayScope(): Promise<RailwayScope> {
+    let projectFailure = "rejected";
+    try {
+      const data = await this.railwayQuery<{ projectToken: { projectId: string; environmentId: string; project: { name: string }; environment: { name: string } } }>(
+        "project",
+        "query { projectToken { projectId environmentId project { name } environment { name } } }",
+      );
+      const scope = data.projectToken;
+      return { kind: "project", projectId: scope.projectId, environmentId: scope.environmentId, projectName: scope.project.name, environmentName: scope.environment.name };
+    } catch (failure) {
+      projectFailure = failure instanceof Error ? failure.message : "rejected";
+    }
+    const data = await this.railwayQuery<{ projects: { edges: Array<{ node: { id: string; name: string; environments: { edges: Array<{ node: { id: string; name: string } }> } } }> } }>(
+      "account",
+      "query { projects(first: 50) { edges { node { id name environments(first: 20) { edges { node { id name } } } } } } }",
+    ).catch((failure: unknown) => {
+      const detail = failure instanceof Error ? failure.message : "rejected";
+      throw new Error(`The stored hosting token was not accepted. As a project token: ${projectFailure}. As an account token: ${detail}`);
+    });
+    const nodes = data.projects.edges.map((edge) => edge.node);
+    const wanted = this.env.RAILWAY_PROJECT_ID?.trim();
+    const chosen = (wanted ? nodes.find((node) => node.id === wanted) : undefined)
+      ?? nodes.find((node) => node.environments.edges.length > 0)
+      ?? nodes[0];
+    if (!chosen) throw new Error("The token is valid but cannot see any projects.");
+    const environments = chosen.environments.edges.map((edge) => edge.node);
+    const environment = environments.find((entry) => entry.name === "production") ?? environments[0];
+    if (!environment) throw new Error(`Project "${chosen.name}" has no environments.`);
+    return { kind: "account", projectId: chosen.id, environmentId: environment.id, projectName: chosen.name, environmentName: environment.name };
+  }
+
+  private async railwayServices(scope: RailwayScope): Promise<Array<{ id: string; name: string }>> {
+    const project = await this.railwayQuery<{ project: { services: { edges: Array<{ node: { id: string; name: string } }> } } }>(
+      scope.kind,
+      "query project($id: String!) { project(id: $id) { services { edges { node { id name } } } } }",
+      { id: scope.projectId },
+    ).catch(() => null);
+    return project?.project.services.edges.map((edge) => edge.node) ?? [];
+  }
+
+  private async railwayMounts(scope: RailwayScope): Promise<Array<{ mountPath: string; serviceId: string | null }>> {
+    const environment = await this.railwayQuery<{ environment: { volumeInstances: { edges: Array<{ node: { mountPath: string; serviceId: string | null } }> } } }>(
+      scope.kind,
+      "query environment($id: String!) { environment(id: $id) { volumeInstances { edges { node { mountPath serviceId } } } } }",
+      { id: scope.environmentId },
+    ).catch(() => null);
+    return environment?.environment.volumeInstances.edges.map((edge) => edge.node) ?? [];
+  }
+
+  private async hostingServiceReport(
+    scope: RailwayScope,
+    node: { id: string; name: string },
+    mounts: Array<{ mountPath: string; serviceId: string | null }>,
+  ): Promise<HostingServiceReport> {
+    const instance = await this.railwayQuery<{
+      serviceInstance: {
+        rootDirectory: string | null;
+        builder: string | null;
+        source: { image: string | null; repo: string | null } | null;
+        latestDeployment: { id: string; status: string; createdAt: string } | null;
+      } | null;
+    }>(
+      scope.kind,
+      "query instance($serviceId: String!, $environmentId: String!) { serviceInstance(serviceId: $serviceId, environmentId: $environmentId) { rootDirectory builder source { image repo } latestDeployment { id status createdAt } } }",
+      { serviceId: node.id, environmentId: scope.environmentId },
+    ).catch(() => null);
+
+    const domains = await this.railwayQuery<{ domains: { serviceDomains: Array<{ domain: string; targetPort: number | null }>; customDomains: Array<{ domain: string; targetPort: number | null }> } }>(
+      scope.kind,
+      "query domains($projectId: String!, $environmentId: String!, $serviceId: String!) { domains(projectId: $projectId, environmentId: $environmentId, serviceId: $serviceId) { serviceDomains { domain targetPort } customDomains { domain targetPort } } }",
+      { projectId: scope.projectId, environmentId: scope.environmentId, serviceId: node.id },
+    ).catch(() => null);
+
+    const variables = await this.railwayQuery<{ variables: Record<string, unknown> }>(
+      scope.kind,
+      "query variables($projectId: String!, $environmentId: String!, $serviceId: String) { variables(projectId: $projectId, environmentId: $environmentId, serviceId: $serviceId) }",
+      { projectId: scope.projectId, environmentId: scope.environmentId, serviceId: node.id },
+    ).catch(() => null);
+
+    const deployment = instance?.serviceInstance?.latestDeployment ?? null;
+    const created = deployment ? Date.parse(deployment.createdAt) : Number.NaN;
+    return {
+      id: node.id,
+      name: node.name,
+      rootDirectory: instance?.serviceInstance?.rootDirectory ?? null,
+      builder: instance?.serviceInstance?.builder ?? null,
+      source: instance?.serviceInstance?.source?.repo ?? instance?.serviceInstance?.source?.image ?? null,
+      latestStatus: deployment?.status ?? null,
+      latestAt: Number.isFinite(created) ? created : null,
+      domains: [...(domains?.domains.serviceDomains ?? []), ...(domains?.domains.customDomains ?? [])]
+        .map((entry) => ({ domain: entry.domain, targetPort: entry.targetPort })),
+      variableKeys: Object.keys(variables?.variables ?? {}).sort(),
+      volumeMounts: mounts.filter((mount) => mount.serviceId === node.id).map((mount) => mount.mountPath),
+    };
+  }
+
+  private async hostingBuildLog(scope: RailwayScope, deploymentId: string): Promise<string[]> {
+    const data = await this.railwayQuery<{ buildLogs: Array<{ message: string }> }>(
+      scope.kind,
+      "query buildLogs($deploymentId: String!, $limit: Int) { buildLogs(deploymentId: $deploymentId, limit: $limit) { message } }",
+      { deploymentId, limit: 150 },
+    ).catch(() => null);
+    if (!data) return [];
+    return data.buildLogs.map((entry) => entry.message.replace(/\s+$/, "")).filter((line) => line.length > 0).slice(-60);
+  }
+
+  /** Turns raw Railway facts into plain-language reasons the address is not serving. */
+  private hostingFindings(services: HostingServiceReport[]): string[] {
+    if (services.length === 0) return ["This project has no services, so its address has nothing to answer with."];
+    const findings: string[] = [];
+    for (const service of services) {
+      const label = `"${service.name}"`;
+      if (service.latestStatus === null) findings.push(`${label} has never completed a deployment.`);
+      else if (["FAILED", "CRASHED"].includes(service.latestStatus)) findings.push(`${label} last deployment ended as ${service.latestStatus}.`);
+      else if (["REMOVED", "SKIPPED"].includes(service.latestStatus)) findings.push(`${label} has no active deployment (${service.latestStatus}).`);
+      if (service.rootDirectory !== null && service.rootDirectory.replace(/^\/+/, "") !== "connector") {
+        findings.push(`${label} builds from "${service.rootDirectory}" instead of the connector folder.`);
+      }
+      if (service.domains.length === 0) findings.push(`${label} has no public address attached.`);
+      for (const domain of service.domains) {
+        if (domain.targetPort !== null && domain.targetPort !== CONNECTOR_PORT) {
+          findings.push(`${label} serves ${domain.domain} on port ${domain.targetPort}, but the connector listens on ${CONNECTOR_PORT}.`);
+        }
+      }
+      if (!service.volumeMounts.includes(CONNECTOR_MOUNT_PATH)) {
+        findings.push(`${label} has no persistent disk at ${CONNECTOR_MOUNT_PATH}, so a Telegram login would be wiped on restart.`);
+      }
+      const missing = REQUIRED_CONNECTOR_VARS.filter((name) => !service.variableKeys.includes(name));
+      if (missing.length > 0) findings.push(`${label} is missing these settings: ${missing.join(", ")}.`);
+    }
+    return findings;
+  }
+
+  private async hostingDiagnose(): Promise<HostingReport> {
+    const checkedAt = Date.now();
+    const blank: HostingReport = { ok: false, detail: "", tokenKind: null, projectName: null, environmentName: null, services: [], findings: [], buildLog: [], checkedAt };
+    if (!this.railwayToken()) {
+      return { ...blank, detail: "No hosting token is stored yet. Save it as a server-only secret named Railway_token, then run this again." };
+    }
+
+    let scope: RailwayScope;
+    try {
+      scope = await this.railwayScope();
+    } catch (failure) {
+      return { ...blank, detail: failure instanceof Error ? failure.message : "The hosting token could not be verified." };
+    }
+
+    const mounts = await this.railwayMounts(scope);
+    const nodes = await this.railwayServices(scope);
+    const services: HostingServiceReport[] = [];
+    for (const node of nodes.slice(0, 8)) services.push(await this.hostingServiceReport(scope, node, mounts));
+
+    const broken = services.find((service) => service.latestStatus !== null && service.latestStatus !== "SUCCESS");
+    let buildLog: string[] = [];
+    if (broken) {
+      const instance = await this.railwayQuery<{ serviceInstance: { latestDeployment: { id: string } | null } | null }>(
+        scope.kind,
+        "query instance($serviceId: String!, $environmentId: String!) { serviceInstance(serviceId: $serviceId, environmentId: $environmentId) { latestDeployment { id } } }",
+        { serviceId: broken.id, environmentId: scope.environmentId },
+      ).catch(() => null);
+      const deploymentId = instance?.serviceInstance?.latestDeployment?.id;
+      if (deploymentId) buildLog = await this.hostingBuildLog(scope, deploymentId);
+    }
+
+    const findings = this.hostingFindings(services);
+    const healthy = findings.length === 0 && services.length > 0;
+    return {
+      ok: healthy,
+      detail: healthy
+        ? `Everything Railway reports about "${scope.projectName}" looks correct.`
+        : `Found ${findings.length} problem${findings.length === 1 ? "" : "s"} in project "${scope.projectName}".`,
+      tokenKind: scope.kind,
+      projectName: scope.projectName,
+      environmentName: scope.environmentName,
+      services,
+      findings,
+      buildLog,
+      checkedAt,
+    };
+  }
+
+  /**
+   * Derives the connector's session key from the engine's own encryption key.
+   * Deterministic on purpose: a changing key would orphan an existing session.
+   */
+  private async connectorSessionKey(): Promise<string | null> {
+    const material = this.env.CREDENTIAL_ENCRYPTION_KEY?.trim();
+    if (!material) return null;
+    return this.hmac(material, "replyflow/connector/session-key");
+  }
+
+  /** Pushes the connector's settings, disk and port to Railway, then redeploys it. */
+  private async handleHostingApply(): Promise<Response> {
+    const credentials = this.presetCredentials();
+    const sharedSecret = this.env.CONNECTOR_SHARED_SECRET?.trim();
+    const sessionKey = await this.connectorSessionKey();
+    if (!this.railwayToken()) return Response.json({ error: "No hosting token is stored yet." }, { status: 400 });
+    if (!credentials) return Response.json({ error: "A valid Telegram app ID and 32-character hash must be stored on the engine first." }, { status: 400 });
+    if (!sharedSecret) return Response.json({ error: "CONNECTOR_SHARED_SECRET is not stored on the engine." }, { status: 400 });
+    if (!sessionKey) return Response.json({ error: "CREDENTIAL_ENCRYPTION_KEY is not stored on the engine." }, { status: 400 });
+
+    let scope: RailwayScope;
+    try {
+      scope = await this.railwayScope();
+    } catch (failure) {
+      return Response.json({ error: failure instanceof Error ? failure.message : "The hosting token could not be verified." }, { status: 502 });
+    }
+
+    const nodes = await this.railwayServices(scope);
+    const target = nodes.find((node) => /connector|reply|telego/i.test(node.name)) ?? nodes[0];
+    if (!target) return Response.json({ error: "This project has no service to configure. Create one from the connector folder first." }, { status: 409 });
+
+    const controlPlane = this.kvGet<string | null>("publicOrigin", null) ?? "";
+    const applied: string[] = [];
+
+    try {
+      await this.railwayQuery(
+        scope.kind,
+        "mutation upsert($input: VariableCollectionUpsertInput!) { variableCollectionUpsert(input: $input) }",
+        {
+          input: {
+            projectId: scope.projectId,
+            environmentId: scope.environmentId,
+            serviceId: target.id,
+            skipDeploys: true,
+            replace: false,
+            variables: {
+              TELEGRAM_API_ID: credentials.apiId,
+              TELEGRAM_API_HASH: credentials.apiHash,
+              SESSION_ENCRYPTION_KEY: sessionKey,
+              CONNECTOR_SHARED_SECRET: sharedSecret,
+              CONTROL_PLANE_URL: controlPlane,
+              SESSION_PATH: CONNECTOR_MOUNT_PATH,
+            },
+          },
+        },
+      );
+      applied.push("Stored the six connector settings.");
+    } catch (failure) {
+      const detail = failure instanceof Error ? failure.message : "unknown error";
+      return Response.json({ error: `Could not store the connector settings: ${detail}` }, { status: 502 });
+    }
+
+    const mounts = await this.railwayMounts(scope);
+    const hasDisk = mounts.some((mount) => mount.serviceId === target.id && mount.mountPath === CONNECTOR_MOUNT_PATH);
+    if (!hasDisk) {
+      try {
+        await this.railwayQuery(
+          scope.kind,
+          "mutation createVolume($input: VolumeCreateInput!) { volumeCreate(input: $input) { id } }",
+          { input: { projectId: scope.projectId, environmentId: scope.environmentId, serviceId: target.id, mountPath: CONNECTOR_MOUNT_PATH } },
+        );
+        applied.push(`Created the persistent disk at ${CONNECTOR_MOUNT_PATH}.`);
+      } catch (failure) {
+        applied.push(`Could not create the persistent disk: ${failure instanceof Error ? failure.message : "unknown error"}`);
+      }
+    }
+
+    const domains = await this.railwayQuery<{ domains: { serviceDomains: Array<{ id: string; domain: string; targetPort: number | null }> } }>(
+      scope.kind,
+      "query domains($projectId: String!, $environmentId: String!, $serviceId: String!) { domains(projectId: $projectId, environmentId: $environmentId, serviceId: $serviceId) { serviceDomains { id domain targetPort } } }",
+      { projectId: scope.projectId, environmentId: scope.environmentId, serviceId: target.id },
+    ).catch(() => null);
+    const existing = domains?.domains.serviceDomains ?? [];
+    if (existing.length === 0) {
+      try {
+        await this.railwayQuery(
+          scope.kind,
+          "mutation createDomain($input: ServiceDomainCreateInput!) { serviceDomainCreate(input: $input) { domain } }",
+          { input: { environmentId: scope.environmentId, serviceId: target.id, targetPort: CONNECTOR_PORT } },
+        );
+        applied.push(`Attached a public address on port ${CONNECTOR_PORT}.`);
+      } catch (failure) {
+        applied.push(`Could not attach a public address: ${failure instanceof Error ? failure.message : "unknown error"}`);
+      }
+    } else {
+      for (const domain of existing.filter((entry) => entry.targetPort !== CONNECTOR_PORT)) {
+        try {
+          await this.railwayQuery(
+            scope.kind,
+            "mutation updateDomain($input: ServiceDomainUpdateInput!) { serviceDomainUpdate(input: $input) }",
+            { input: { environmentId: scope.environmentId, serviceId: target.id, serviceDomainId: domain.id, domain: domain.domain, targetPort: CONNECTOR_PORT } },
+          );
+          applied.push(`Repointed ${domain.domain} to port ${CONNECTOR_PORT}.`);
+        } catch (failure) {
+          applied.push(`Could not repoint ${domain.domain}: ${failure instanceof Error ? failure.message : "unknown error"}`);
+        }
+      }
+    }
+
+    try {
+      await this.railwayQuery(
+        scope.kind,
+        "mutation redeploy($serviceId: String!, $environmentId: String!) { serviceInstanceRedeploy(serviceId: $serviceId, environmentId: $environmentId) }",
+        { serviceId: target.id, environmentId: scope.environmentId },
+      );
+      applied.push("Started a fresh deployment. It usually takes two to four minutes.");
+    } catch (failure) {
+      applied.push(`Could not start a deployment: ${failure instanceof Error ? failure.message : "unknown error"}`);
+    }
+
+    this.log("info", "hosting.apply", `Applied hosting configuration to "${target.name}".`);
+    return Response.json({ applied, report: await this.hostingDiagnose() });
   }
 
   private async refreshConnectorHealth(): Promise<void> {

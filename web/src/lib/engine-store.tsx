@@ -10,6 +10,7 @@ import {
   type ConversationAnalysis,
   type EngineEvent,
   type FlowImportPreview,
+  type HostingReport,
   type PersonalStartInput,
   type Settings,
   type Snapshot,
@@ -37,6 +38,8 @@ type EngineContextValue = {
   pollPersonal: () => Promise<void>;
   runHardwired: (chatKey: string) => Promise<void>;
   checkConnector: () => Promise<void>;
+  diagnoseHosting: () => Promise<HostingReport>;
+  applyHosting: () => Promise<{ applied: string[]; report: HostingReport }>;
   reconnect: () => Promise<void>;
   disconnect: () => void;
   forgetConnection: () => Promise<void>;
@@ -157,6 +160,18 @@ export function EngineProvider({ children }: { children: ReactNode }) {
     },
     onError: (error: Error) => toast.error(error.message),
   });
+  const diagnoseHostingMutation = useMutation({
+    mutationFn: api.diagnoseHosting,
+    onError: (error: Error) => toast.error(error.message),
+  });
+  const applyHostingMutation = useMutation({
+    mutationFn: api.applyHosting,
+    onSuccess: (result) => {
+      invalidate();
+      toast.success("Hosting configuration applied", { description: result.applied[result.applied.length - 1] ?? "" });
+    },
+    onError: (error: Error) => toast.error(error.message),
+  });
   const reconnectMutation = useMutation({
     mutationFn: api.reconnect,
     onSuccess: () => { invalidate(); toast.success("Reconnect requested"); },
@@ -222,6 +237,8 @@ export function EngineProvider({ children }: { children: ReactNode }) {
     },
     runHardwired: async (chatKey) => { await runHardwiredMutation.mutateAsync(chatKey); },
     checkConnector: async () => { await checkConnectorMutation.mutateAsync(); },
+    diagnoseHosting: async () => (await diagnoseHostingMutation.mutateAsync()).report,
+    applyHosting: async () => applyHostingMutation.mutateAsync(),
     reconnect: async () => { await reconnectMutation.mutateAsync(); },
     disconnect: () => disconnectMutation.mutate(),
     forgetConnection: async () => { await forgetMutation.mutateAsync(); },
@@ -233,7 +250,8 @@ export function EngineProvider({ children }: { children: ReactNode }) {
   }), [
     authed, signIn, signOut, query.data, query.isLoading, query.error, liveEvents, streamOnline, queryClient,
     settingsMutation, workflowMutation, deleteMutation, importMutation, botMutation, personalMutation, submitPersonalMutation,
-    runHardwiredMutation, checkConnectorMutation, reconnectMutation, disconnectMutation, forgetMutation, retryMutation, jobMutation, simulateMutation, analysisMutation,
+    runHardwiredMutation, checkConnectorMutation, diagnoseHostingMutation, applyHostingMutation,
+    reconnectMutation, disconnectMutation, forgetMutation, retryMutation, jobMutation, simulateMutation, analysisMutation,
   ]);
 
   return <EngineContext.Provider value={value}>{children}</EngineContext.Provider>;

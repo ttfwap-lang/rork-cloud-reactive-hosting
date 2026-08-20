@@ -179,6 +179,31 @@ export type ConversationAnalysis = {
 
 export type ConnectorProbe = { reachable: boolean; detail: string; checkedAt: number | null; workerAgeSeconds: number | null };
 
+export type HostingServiceReport = {
+  id: string;
+  name: string;
+  rootDirectory: string | null;
+  builder: string | null;
+  source: string | null;
+  latestStatus: string | null;
+  latestAt: number | null;
+  domains: Array<{ domain: string; targetPort: number | null }>;
+  variableKeys: string[];
+  volumeMounts: string[];
+};
+
+export type HostingReport = {
+  ok: boolean;
+  detail: string;
+  tokenKind: "project" | "account" | null;
+  projectName: string | null;
+  environmentName: string | null;
+  services: HostingServiceReport[];
+  findings: string[];
+  buildLog: string[];
+  checkedAt: number;
+};
+
 export type Snapshot = {
   link: LinkState;
   hardwired: HardwiredState;
@@ -241,6 +266,8 @@ export const api = {
   pollPersonal: () => call<{ link: LinkState; warning?: string }>("/link/personal/poll", {}),
   runHardwired: (chatKey: string) => call<Snapshot>("/hardwired/run", { chatKey }),
   checkConnector: () => call<{ probe: ConnectorProbe }>("/connector/check", {}),
+  diagnoseHosting: () => call<{ report: HostingReport }>("/hosting/diagnose", {}),
+  applyHosting: () => call<{ applied: string[]; report: HostingReport }>("/hosting/apply", {}),
   reconnect: () => call<{ link: LinkState }>("/link/reconnect", {}),
   disconnect: () => call<{ link: LinkState }>("/link/disconnect", {}),
   forgetConnection: () => call<{ link: LinkState }>("/link/forget", {}),
