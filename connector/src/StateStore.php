@@ -22,6 +22,31 @@ final class StateStore
         return self::path('owner.madeline');
     }
 
+    /** True once a Telegram session directory exists on the persistent disk. */
+    public static function sessionExists(): bool
+    {
+        return file_exists(self::sessionPath());
+    }
+
+    /**
+     * Records that the always-on process is alive. Deliberately plain text and
+     * free of session material so the self-check page can read it cheaply.
+     */
+    public static function heartbeat(): void
+    {
+        @file_put_contents(self::path('worker.heartbeat'), (string) time(), LOCK_EX);
+    }
+
+    public static function heartbeatAge(): ?int
+    {
+        $raw = @file_get_contents(self::path('worker.heartbeat'));
+        if ($raw === false || !ctype_digit(trim($raw))) {
+            return null;
+        }
+
+        return max(0, time() - (int) trim($raw));
+    }
+
     public static function read(): array
     {
         $file = self::path('state.sealed');
@@ -63,6 +88,7 @@ final class StateStore
         foreach (glob(self::path('action_*')) ?: [] as $file) {
             @unlink($file);
         }
+        @unlink(self::path('worker.heartbeat'));
     }
 
     private static function key(): string

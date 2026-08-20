@@ -46,6 +46,9 @@ export default function Overview() {
   const hardwired = snapshot?.hardwired;
   const pinnedFlow = snapshot?.workflows.find((workflow) => workflow.pinned);
   const running = (hardwired?.activeRuns.length ?? 0) > 0;
+  const linkOnline = snapshot?.link.status === "online";
+  // Armed / Live / Not connected — never let the flow look active while Telegram is down.
+  const readiness = killed ? "Stopped" : !linkOnline ? "Not connected" : running ? "Live" : "Armed";
 
   return (
     <div className="mx-auto w-full max-w-5xl space-y-5">
@@ -61,22 +64,29 @@ export default function Overview() {
       </section>
 
       {pinnedFlow ? (
-        <section className={cn("panel relative overflow-hidden p-5", killed ? "ring-1 ring-destructive/30" : "ring-1 ring-accent/25")}>
-          <div className={cn("absolute inset-y-0 left-0 w-1", killed ? "bg-destructive" : "bg-accent")} />
+        <section className={cn("panel relative overflow-hidden p-5", killed ? "ring-1 ring-destructive/30" : !linkOnline ? "ring-1 ring-amber-400/25" : "ring-1 ring-accent/25")}>
+          <div className={cn("absolute inset-y-0 left-0 w-1", killed ? "bg-destructive" : !linkOnline ? "bg-amber-400" : "bg-accent")} />
           <div className="flex flex-wrap items-center gap-4 pl-2">
             <div className={cn("grid h-12 w-12 place-items-center rounded-2xl", killed ? "bg-destructive/10 text-destructive" : "bg-accent/12 text-accent")}><Zap className="h-5 w-5" /></div>
             <div className="min-w-0 flex-1">
               <div className="flex flex-wrap items-center gap-2">
                 <p className="text-base font-semibold">{pinnedFlow.name}</p>
                 <span className="inline-flex items-center gap-1 rounded-full bg-accent/10 px-2 py-0.5 font-mono text-[9px] uppercase text-accent ring-1 ring-accent/25"><Pin className="h-2.5 w-2.5" />permanent</span>
-                {running ? <span className="inline-flex items-center gap-1.5 rounded-full bg-primary/10 px-2 py-0.5 font-mono text-[9px] uppercase text-primary"><span className="h-1.5 w-1.5 animate-signal rounded-full bg-primary" />running</span> : null}
+                <span className={cn("inline-flex items-center gap-1.5 rounded-full px-2 py-0.5 font-mono text-[9px] uppercase ring-1",
+                  killed ? "bg-destructive/10 text-destructive ring-destructive/25"
+                    : !linkOnline ? "bg-amber-400/10 text-amber-300 ring-amber-400/25"
+                      : running ? "bg-accent/15 text-accent ring-accent/30" : "bg-primary/12 text-primary ring-primary/25")}>
+                  {running && linkOnline && !killed ? <span className="h-1.5 w-1.5 animate-signal rounded-full bg-accent" /> : null}{readiness}
+                </span>
               </div>
               <p className="mt-0.5 text-xs text-muted-foreground">
                 {killed
                   ? "Halted by the emergency stop — its only brake."
-                  : running
-                    ? `Mid-run at step ${(hardwired?.activeRuns[0]?.stepIndex ?? 0) + 1} of ${hardwired?.stepCount ?? pinnedFlow.steps.length}.`
-                    : `Idle — waiting for “${pinnedFlow.steps[0]?.trigger ?? "joefortune"}”. Every limit is bypassed.`}
+                  : !linkOnline
+                    ? "Telegram is not connected, so this flow cannot send anything yet."
+                    : running
+                      ? `Mid-run at step ${(hardwired?.activeRuns[0]?.stepIndex ?? 0) + 1} of ${hardwired?.stepCount ?? pinnedFlow.steps.length}.`
+                      : `Waiting for “${pinnedFlow.steps[0]?.trigger ?? "joefortune"}”. Every limit is bypassed.`}
                 {hardwired?.lastBot ? ` Last answered ${hardwired.lastBot}.` : ""}
               </p>
             </div>

@@ -1,4 +1,4 @@
-import { useState, type FormEvent } from "react";
+import { useEffect, useRef, useState, type FormEvent } from "react";
 import { QRCodeSVG } from "qrcode.react";
 import { Bot, CheckCircle2, KeyRound, Loader2, Phone, PlugZap, QrCode, RefreshCw, Send, ShieldAlert, Trash2, TrainFront, UserRound } from "lucide-react";
 import { toast } from "sonner";
@@ -15,7 +15,7 @@ import { cn } from "@/lib/utils";
 import { useEngine } from "@/lib/engine-store";
 
 export default function Connection() {
-  const { snapshot, connectBot, startPersonal, submitPersonal, reconnect, forgetConnection, simulate } = useEngine();
+  const { snapshot, connectBot, startPersonal, submitPersonal, pollPersonal, reconnect, forgetConnection, simulate } = useEngine();
   const [mode, setMode] = useState<"personal" | "bot">("personal");
   const [loginMethod, setLoginMethod] = useState<"qr" | "phone">("qr");
   const [apiId, setApiId] = useState<string>("");
@@ -31,6 +31,28 @@ export default function Connection() {
   const connector = snapshot?.connector;
   const presetCredentials = connector?.credentialsPreset ?? false;
   const isPersonalFlow = link?.mode === "personal" && ["awaiting_qr", "awaiting_code", "awaiting_password", "connecting"].includes(link.status);
+  const linkStatus = link?.status;
+
+  // Someone has to hold the connection open for Telegram to deliver the scanned
+  // login token, so the console keeps polling for as long as a code is on screen.
+  const pollRef = useRef(pollPersonal);
+  useEffect(() => { pollRef.current = pollPersonal; });
+  useEffect(() => {
+    if (linkStatus !== "awaiting_qr") return;
+    let cancelled = false;
+    const loop = async (): Promise<void> => {
+      while (!cancelled) {
+        try {
+          await pollRef.current();
+        } catch {
+          if (cancelled) return;
+          await new Promise((resolve) => setTimeout(resolve, 3000));
+        }
+      }
+    };
+    void loop();
+    return () => { cancelled = true; };
+  }, [linkStatus]);
 
   const beginPersonal = async (event: FormEvent): Promise<void> => {
     event.preventDefault();
@@ -105,7 +127,7 @@ export default function Connection() {
           {isPersonalFlow && link?.status === "awaiting_qr" && link.qrUrl ? (
             <div className="grid gap-6 p-5 sm:grid-cols-[220px_1fr] sm:items-center">
               <div className="mx-auto rounded-2xl bg-white p-4 shadow-[0_0_50px_hsl(168_82%_44%/0.16)]"><QRCodeSVG value={link.qrUrl} size={188} level="M" /></div>
-              <div><p className="text-sm font-semibold">Scan with your Telegram app</p><ol className="mt-3 space-y-2 text-xs text-muted-foreground"><li>1. Open Telegram Settings.</li><li>2. Choose Devices → Link Desktop Device.</li><li>3. Scan this code before it refreshes.</li></ol><p className="mt-4 text-[11px] text-amber-300">Telegram may ask for your two-step password next. It is sent once and never stored.</p></div>
+              <div><p className="text-sm font-semibold">Scan with your Telegram app</p><ol className="mt-3 space-y-2 text-xs text-muted-foreground"><li>1. Open Telegram Settings.</li><li>2. Choose Devices → Link Desktop Device.</li><li>3. Scan this code before it refreshes.</li></ol><p className="mt-3 flex items-center gap-1.5 text-[11px] text-primary"><Loader2 className="h-3 w-3 animate-spin" />Waiting for the scan — this page refreshes the code automatically.</p><p className="mt-3 text-[11px] text-amber-300">Telegram may ask for your two-step password next. It is sent once and never stored.</p></div>
             </div>
           ) : link?.status === "awaiting_code" || link?.status === "awaiting_password" ? (
             <div className="p-5">

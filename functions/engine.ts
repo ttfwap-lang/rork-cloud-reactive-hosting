@@ -578,6 +578,8 @@ export class AutomationEngine extends DurableObject<Env> {
       case "/link/connect": return this.handleBotConnect(request);
       case "/link/personal/start": return this.handlePersonalStart(request);
       case "/link/personal/submit": return this.handlePersonalSubmit(request);
+      case "/link/personal/poll": return this.handlePersonalPoll();
+      case "/hardwired/run": return this.handleHardwiredRun(request);
       case "/link/reconnect": return this.handleReconnect();
       case "/link/disconnect": return this.handleDisconnect(false);
       case "/link/forget": return this.handleDisconnect(true);
@@ -1000,8 +1002,12 @@ export class AutomationEngine extends DurableObject<Env> {
       },
       body: payload,
     });
-    const result = (await response.json().catch(() => ({}))) as T & { error?: string };
-    if (!response.ok) throw new Error(result.error ?? `Connector request failed (${response.status}).`);
+    const result = (await response.json().catch(() => ({}))) as T & { error?: string; retryAfter?: number };
+    if (!response.ok) {
+      const error = new Error(result.error ?? `Connector request failed (${response.status}).`) as Error & { retryAfter?: number };
+      if (typeof result.retryAfter === "number") error.retryAfter = result.retryAfter;
+      throw error;
+    }
     return result;
   }
 
@@ -1058,6 +1064,60 @@ export class AutomationEngine extends DurableObject<Env> {
     }
   }
 
+  /**
+   * Holds the QR code open with Telegram until it is scanned or refreshed.
+   * Someone has to keep the connection open for the login token to arrive, so the
+   * console calls this repeatedly for as long as it is showing a code.
+   */
+  private async handlePersonalPoll(): Promise<Response> {
+    if (this.link().mode !== "personal") return Response.json({ error: "No personal-account login is active." }, { status: 409 });
+    if (!this.connectorReady()) return Response.json({ error: "The Railway connector is not configured yet." }, { status: 503 });
+    try {
+      const result = await this.connectorCall<{ status: LinkStatus; qrUrl?: string; qrExpiresAt?: number; identity?: string; phoneMasked?: string; detail?: string }>("/v1/login/qr/wait", {});
+      const previous = this.link();
+      this.setLink({
+        status: result.status,
+        qrUrl: result.qrUrl ?? null,
+        qrExpiresAt: result.qrExpiresAt ?? null,
+        identity: result.identity ?? previous.identity,
+        phoneMasked: result.phoneMasked ?? previous.phoneMasked,
+        detail: result.detail ?? previous.detail,
+        connectorHeartbeatAt: Date.now(),
+        since: result.status === "online" ? (previous.since ?? Date.now()) : previous.since,
+      });
+      if (previous.status !== result.status) {
+        this.log(result.status === "online" ? "success" : "info", "personal.login", `Personal login entered ${result.status} state.`);
+      }
+      this.broadcast({ kind: "link", link: this.link() });
+      return Response.json({ link: this.link() });
+    } catch (error) {
+      // Soft failure: a dropped poll must not tear down a login that is still valid.
+      this.log("warn", "personal.poll", "A QR polling attempt failed; the console will retry.");
+      return Response.json({ link: this.link(), warning: (error instanceof Error ? error.message : "QR polling failed.").slice(0, 240) });
+    }
+  }
+
+  /** Fires the hardwired flow into a chosen chat without waiting for a trigger message. */
+  private async handleHardwiredRun(request: Request): Promise<Response> {
+    const body = (await request.json().catch(() => ({}))) as { chatKey?: string };
+    const chatKey = String(body.chatKey ?? "").trim().slice(0, 120);
+    if (!chatKey) return Response.json({ error: "Enter the chat or bot username to run the flow in." }, { status: 400 });
+    if (this.settings().killSwitch) return Response.json({ error: "Release the emergency stop before running the flow." }, { status: 409 });
+    if (this.link().status !== "online") return Response.json({ error: "Connect Telegram before running the flow." }, { status: 409 });
+    const hardwired = this.workflows().find((workflow) => workflow.id === HARDWIRED_ID);
+    if (!hardwired || hardwired.steps.length === 0) return Response.json({ error: "The hardwired flow is unavailable." }, { status: 409 });
+    this.ctx.storage.sql.exec("DELETE FROM runtime WHERE chat_key = ?", chatKey);
+    this.log("info", "hardwired.run", "Manual run started for the hardwired flow.", HARDWIRED_ID, chatKey);
+    await this.ingest(
+      this.normalizeMessage({
+        chatKey, sender: "console", text: hardwired.steps[0].trigger, direction: "outgoing",
+        chatType: "private", isBot: false, messageId: null,
+      }),
+      { forceWorkflowId: HARDWIRED_ID },
+    );
+    return Response.json(await this.snapshot());
+  }
+
   private async handleReconnect(): Promise<Response> {
     if (this.link().mode === "bot") {
       const token = await this.botToken();
@@ -1098,11 +1158,12 @@ export class AutomationEngine extends DurableObject<Env> {
     const signature = request.headers.get("X-ReplyFlow-Signature") ?? "";
     if (!secret || !timestamp || !nonce || Math.abs(Date.now() - Number(timestamp)) > 60_000) return false;
     const key = `connectorNonce:${nonce}`;
-    if (this.kvGet<boolean>(key, false)) return false;
+    if (this.kvGet<number>(key, 0) > 0) return false;
     const expected = await this.hmac(secret, `POST\n/connector/event\n${timestamp}\n${nonce}\n${body}`);
     if (!this.safeEqual(expected, signature)) return false;
-    this.kvPut(key, true);
-    this.ctx.storage.setAlarm(Date.now() + 120_000).catch(() => undefined);
+    // Swept by the watchdog. Setting a dedicated alarm here would overwrite the
+    // single shared alarm that schedules delayed steps and flood-wait retries.
+    this.kvPut(key, Date.now());
     return true;
   }
 
@@ -1245,7 +1306,8 @@ export class AutomationEngine extends DurableObject<Env> {
     return template.replace(/\{([a-zA-Z0-9_.-]+)\}/g, (_match, key: string) => variables[key] ?? "").slice(0, MAX_REPLY_CHARS);
   }
 
-  private async ingest(message: MessageContext): Promise<void> {
+  private async ingest(message: MessageContext, options?: { forceWorkflowId?: string }): Promise<void> {
+    const forced = options?.forceWorkflowId;
     const settings = this.settings();
     const link = this.link();
     this.setLink({ lastEventAt: Date.now() });
@@ -1253,7 +1315,9 @@ export class AutomationEngine extends DurableObject<Env> {
     const now = Date.now();
     this.ctx.storage.sql.exec("DELETE FROM runtime WHERE expires_at <= ?", now);
     const position = this.ctx.storage.sql.exec<{ workflow_id: string; step_index: number }>("SELECT workflow_id, step_index FROM runtime WHERE chat_key = ?", message.chatKey).toArray()[0];
-    const all = this.workflows().filter((workflow) => workflow.status === "enabled" || workflow.status === "test").filter((workflow) => this.targetsMatch(workflow, message));
+    const all = this.workflows()
+      .filter((workflow) => (forced ? workflow.id === forced : workflow.status === "enabled" || workflow.status === "test"))
+      .filter((workflow) => forced !== undefined || this.targetsMatch(workflow, message));
     let workflow: Workflow | undefined;
     let stepIndex = 0;
     let match: MatchResult = { matched: false, captures: {} };
@@ -1427,6 +1491,17 @@ export class AutomationEngine extends DurableObject<Env> {
       const reason = error instanceof Error ? error.message : "Telegram action failed";
       const retryAfter = error instanceof Error && "retryAfter" in error ? Number((error as Error & { retryAfter?: number }).retryAfter) : undefined;
       const classified = this.classifyError(reason, retryAfter);
+      // The one wait the hardwired flow honours: Telegram asked for it explicitly,
+      // so the action is rescheduled for exactly that long instead of being paused.
+      if (bypassLimits && retryAfter && retryAfter > 0) {
+        this.releaseSlot(slotId);
+        const notBefore = Date.now() + Math.min(retryAfter, 3600) * 1000;
+        this.queueJob(workflowId, chatKey, reason, { ...action, ...classified, autoRetry: true, notBefore });
+        this.log("warn", "limit.flood_wait", `Telegram asked for a ${retryAfter}s pause — the action resumes automatically after it.`, workflowId, chatKey);
+        this.ctx.waitUntil(this.scheduleAlarm(notBefore));
+        this.broadcast({ kind: "refresh" });
+        return false;
+      }
       if ((retryAfter || classified.category === "account_risk") && settings.autoPauseOnFlood && !bypassLimits) {
         const seconds = retryAfter ?? 3600;
         this.setLink({ status: "paused", pausedUntil: Date.now() + seconds * 1000, detail: classified.category === "account_risk" ? "Account-risk warning — outbound automation quarantined." : `Telegram requested a ${seconds}s slow-down.` });
@@ -1533,6 +1608,51 @@ export class AutomationEngine extends DurableObject<Env> {
     if (pending === null || pending === undefined) await this.env.DO.setAlarm("AutomationEngine", this.ctx.id.name ?? "primary", Date.now() + WATCHDOG_MS).catch(() => undefined);
   }
 
+  /** Brings the single shared alarm forward when work is due before the next watchdog tick. */
+  private async scheduleAlarm(at: number): Promise<void> {
+    const name = this.ctx.id.name ?? "primary";
+    const target = Math.max(Date.now() + 1_000, at);
+    const pending = await this.env.DO.getAlarm("AutomationEngine", name).catch(() => null);
+    if (pending === null || pending === undefined || pending > target) {
+      await this.env.DO.setAlarm("AutomationEngine", name, target).catch(() => undefined);
+    }
+  }
+
+  /** Replays flood-delayed bypass actions once Telegram's requested wait has elapsed. */
+  private async runDueRetries(now: number): Promise<void> {
+    const rows = this.ctx.storage.sql
+      .exec<{ id: string; workflow_id: string | null; chat_key: string; payload: string; attempts: number }>(
+        "SELECT id, workflow_id, chat_key, payload, attempts FROM failed_jobs WHERE status = 'pending' ORDER BY ts ASC LIMIT 20",
+      )
+      .toArray();
+    let earliest: number | null = null;
+    for (const row of rows) {
+      let payload: { actionType?: WorkflowActionType; text?: string; buttonTarget?: string; reaction?: string; messageId?: string | null; idempotencyKey?: string; autoRetry?: boolean; notBefore?: number };
+      try {
+        payload = JSON.parse(row.payload) as typeof payload;
+      } catch {
+        continue;
+      }
+      if (payload.autoRetry !== true) continue;
+      const notBefore = Number(payload.notBefore) || 0;
+      if (notBefore > now) {
+        earliest = earliest === null ? notBefore : Math.min(earliest, notBefore);
+        continue;
+      }
+      const sql = this.ctx.storage.sql;
+      sql.exec("INSERT INTO sends (ts) VALUES (?)", now);
+      const slotId = sql.exec<{ id: number }>("SELECT last_insert_rowid() AS id").toArray()[0]?.id ?? 0;
+      const ok = await this.sendAction(row.chat_key, row.workflow_id ?? "", slotId, {
+        actionType: payload.actionType ?? "sendText", text: payload.text, buttonTarget: payload.buttonTarget,
+        reaction: payload.reaction, messageId: payload.messageId, idempotencyKey: payload.idempotencyKey ?? row.id,
+      }, true);
+      // Closed either way: a fresh attempt is queued by sendAction when it fails again.
+      sql.exec("UPDATE failed_jobs SET attempts = ?, status = ? WHERE id = ?", row.attempts + 1, ok ? "resolved" : "cancelled", row.id);
+      this.log(ok ? "success" : "warn", "job.auto_retry", ok ? "Flood-delayed action resumed automatically." : "Flood-delayed action failed again and was rescheduled.", row.workflow_id, row.chat_key);
+    }
+    if (earliest !== null) await this.scheduleAlarm(earliest);
+  }
+
   async onAlarm(): Promise<void> {
     const now = Date.now();
     const link = this.link();
@@ -1550,6 +1670,8 @@ export class AutomationEngine extends DurableObject<Env> {
     this.ctx.storage.sql.exec("DELETE FROM runtime WHERE expires_at <= ?", now);
     this.ctx.storage.sql.exec("DELETE FROM dedupe WHERE ts < ?", now - this.settings().dedupeWindowMs);
     this.ctx.storage.sql.exec("DELETE FROM events WHERE id NOT IN (SELECT id FROM events ORDER BY id DESC LIMIT ?)", MAX_EVENTS);
+    this.ctx.storage.sql.exec("DELETE FROM kv WHERE k LIKE 'connectorNonce:%' AND CAST(v AS INTEGER) < ?", now - 120_000);
+    await this.runDueRetries(now);
     if (link.mode === "bot" && link.status === "online") await this.repairBotWebhook();
     if (link.mode === "personal" && this.connectorReady()) await this.refreshConnectorHealth();
     this.broadcast({ kind: "heartbeat", ts: now, link: this.link() });

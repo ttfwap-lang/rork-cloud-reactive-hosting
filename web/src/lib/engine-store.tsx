@@ -34,6 +34,8 @@ type EngineContextValue = {
   connectBot: (botToken: string) => Promise<void>;
   startPersonal: (input: PersonalStartInput) => Promise<void>;
   submitPersonal: (kind: "code" | "password", value: string) => Promise<void>;
+  pollPersonal: () => Promise<void>;
+  runHardwired: (chatKey: string) => Promise<void>;
   reconnect: () => Promise<void>;
   disconnect: () => void;
   forgetConnection: () => Promise<void>;
@@ -140,6 +142,11 @@ export function EngineProvider({ children }: { children: ReactNode }) {
     onSuccess: () => invalidate(),
     onError: (error: Error) => toast.error(error.message),
   });
+  const runHardwiredMutation = useMutation({
+    mutationFn: api.runHardwired,
+    onSuccess: () => { invalidate(); toast.success("Hardwired flow started"); },
+    onError: (error: Error) => toast.error(error.message),
+  });
   const reconnectMutation = useMutation({
     mutationFn: api.reconnect,
     onSuccess: () => { invalidate(); toast.success("Reconnect requested"); },
@@ -199,6 +206,11 @@ export function EngineProvider({ children }: { children: ReactNode }) {
     connectBot: async (botToken) => { await botMutation.mutateAsync(botToken); },
     startPersonal: async (input) => { await personalMutation.mutateAsync(input); },
     submitPersonal: async (kind, inputValue) => { await submitPersonalMutation.mutateAsync({ kind, value: inputValue }); },
+    pollPersonal: async () => {
+      const result = await api.pollPersonal();
+      queryClient.setQueryData<Snapshot>(QUERY_KEY, (previous) => (previous ? { ...previous, link: result.link } : previous));
+    },
+    runHardwired: async (chatKey) => { await runHardwiredMutation.mutateAsync(chatKey); },
     reconnect: async () => { await reconnectMutation.mutateAsync(); },
     disconnect: () => disconnectMutation.mutate(),
     forgetConnection: async () => { await forgetMutation.mutateAsync(); },
@@ -208,9 +220,9 @@ export function EngineProvider({ children }: { children: ReactNode }) {
     previewWorkflow: async (step, text) => api.previewWorkflow(step, text),
     analyzeConversation: async (input) => (await analysisMutation.mutateAsync(input)).analysis,
   }), [
-    authed, signIn, signOut, query.data, query.isLoading, query.error, liveEvents, streamOnline,
+    authed, signIn, signOut, query.data, query.isLoading, query.error, liveEvents, streamOnline, queryClient,
     settingsMutation, workflowMutation, deleteMutation, importMutation, botMutation, personalMutation, submitPersonalMutation,
-    reconnectMutation, disconnectMutation, forgetMutation, retryMutation, jobMutation, simulateMutation, analysisMutation,
+    runHardwiredMutation, reconnectMutation, disconnectMutation, forgetMutation, retryMutation, jobMutation, simulateMutation, analysisMutation,
   ]);
 
   return <EngineContext.Provider value={value}>{children}</EngineContext.Provider>;

@@ -22,6 +22,11 @@
       "php-http/discovery": true
     },
     "optimize-autoloader": true,
-    "sort-packages": true
-  }
+    "sort-packages": true,
+    "platform": {
+      "php": "8.4.2"
+    }
+  },
+  "minimum-stability": "stable",
+  "prefer-stable": true
 }

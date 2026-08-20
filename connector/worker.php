@@ -4,17 +4,8 @@ declare(strict_types=1);
 
 require __DIR__.'/vendor/autoload.php';
 
-use ReplyFlow\ReplyFlowEventHandler;
-use ReplyFlow\StateStore;
+use ReplyFlow\SessionRunner;
 
-while (true) {
-    try {
-        $state = StateStore::read();
-        if (($state['status'] ?? '') === 'online' && !($state['disabled'] ?? false)) {
-            ReplyFlowEventHandler::startAndLoop(StateStore::sessionPath());
-        }
-    } catch (Throwable) {
-        // Deliberately omit exception details: session data can be sensitive.
-    }
-    sleep(5);
-}
+// The always-on process: owns the Telegram session and the event loop, and
+// serves the web layer over MadelineProto's IPC socket once it is running.
+SessionRunner::supervise();

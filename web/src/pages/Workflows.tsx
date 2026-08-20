@@ -1,6 +1,6 @@
 import { useMemo, useRef, useState } from "react";
 import { Link } from "react-router-dom";
-import { ArrowDown, Bot, Braces, FileJson, GitBranch, ImagePlus, Infinity as InfinityIcon, Pin, Plus, RotateCw, Sparkles, Timer, Trash2, X, Zap } from "lucide-react";
+import { ArrowDown, Bot, Braces, FileJson, GitBranch, ImagePlus, Infinity as InfinityIcon, Pin, Play, Plus, RotateCw, Sparkles, Timer, Trash2, X, Zap } from "lucide-react";
 import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
@@ -11,9 +11,32 @@ import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/u
 import { cn } from "@/lib/utils";
 import { useEngine } from "@/lib/engine-store";
 import type {
-  ConditionField, ConditionOperator, FlowImportPreview, HardwiredState, TriggerMode, Workflow,
+  ConditionField, ConditionOperator, FlowImportPreview, HardwiredState, LinkState, TriggerMode, Workflow,
   WorkflowActionType, WorkflowCondition, WorkflowStatus, WorkflowStep,
 } from "@/lib/api";
+
+type ReadinessTone = "live" | "armed" | "stopped" | "offline";
+
+/** Plain-language state of the permanent flow, so it can never look active while Telegram is down. */
+function readiness(link: LinkState | undefined, killSwitch: boolean, running: boolean): { tone: ReadinessTone; label: string; detail: string } {
+  if (killSwitch) return { tone: "stopped", label: "Stopped", detail: "The emergency stop is engaged. Release it in Settings to arm the flow again." };
+  if (link?.status !== "online") {
+    return {
+      tone: "offline",
+      label: "Not connected",
+      detail: link?.mode === "none" ? "No Telegram account is linked yet. Connect one to arm this flow." : `Telegram is ${(link?.status ?? "offline").replace(/_/g, " ")}. The flow cannot send until it is back online.`,
+    };
+  }
+  if (running) return { tone: "live", label: "Live", detail: "A conversation is in progress right now." };
+  return { tone: "armed", label: "Armed", detail: "Connected and waiting for the trigger." };
+}
+
+const READINESS_TONES: Record<ReadinessTone, string> = {
+  live: "bg-accent/15 text-accent ring-accent/30",
+  armed: "bg-primary/12 text-primary ring-primary/25",
+  stopped: "bg-destructive/12 text-destructive ring-destructive/25",
+  offline: "bg-amber-400/10 text-amber-300 ring-amber-400/25",
+};
 
 const REMOVED_LIMITS = [
   "No step timeout", "No run limit", "No cooldown", "No per-chat spacing",
@@ -68,19 +91,38 @@ function stepSummary(step: WorkflowStep): string {
   return step.actionType;
 }
 
-function HardwiredCard({ workflow, hardwired, onEdit }: { workflow: Workflow; hardwired: HardwiredState | undefined; onEdit: () => void }) {
+function HardwiredCard({ workflow, hardwired, link, killSwitch, onEdit, onRun }: {
+  workflow: Workflow;
+  hardwired: HardwiredState | undefined;
+  link: LinkState | undefined;
+  killSwitch: boolean;
+  onEdit: () => void;
+  onRun: (chatKey: string) => Promise<void>;
+}) {
   const activeSteps = useMemo<Set<number>>(() => new Set((hardwired?.activeRuns ?? []).map((run) => run.stepIndex)), [hardwired?.activeRuns]);
   const running = activeSteps.size > 0;
+  const state = useMemo(() => readiness(link, killSwitch, running), [link, killSwitch, running]);
+  const [runTarget, setRunTarget] = useState<string>("");
+  const [starting, setStarting] = useState<boolean>(false);
+  const canRun = state.tone === "armed" || state.tone === "live";
+
+  const start = (): void => {
+    setStarting(true);
+    onRun(runTarget.trim()).then(() => setRunTarget("")).catch(() => undefined).finally(() => setStarting(false));
+  };
+
   return (
     <div className="panel relative overflow-hidden p-4 ring-1 ring-accent/30">
       <div className="absolute inset-y-0 left-0 w-1 bg-accent" />
       <div className="flex flex-wrap items-center gap-2.5 pl-2">
         <span className={cn("h-2 w-2 rounded-full", running ? "animate-signal bg-accent" : "bg-accent/40")} />
         <button className="min-w-0 text-left" onClick={onEdit}><p className="truncate text-sm font-semibold">{workflow.name}</p></button>
+        <span className={cn("inline-flex items-center gap-1 rounded-full px-2 py-0.5 font-mono text-[9px] uppercase ring-1", READINESS_TONES[state.tone])}>{state.label}</span>
         <span className="inline-flex items-center gap-1 rounded-full bg-accent/10 px-2 py-0.5 font-mono text-[9px] uppercase text-accent ring-1 ring-accent/25"><Pin className="h-2.5 w-2.5" />permanent</span>
         <span className="inline-flex items-center gap-1 rounded-full bg-primary/10 px-2 py-0.5 font-mono text-[9px] uppercase text-primary ring-1 ring-primary/25"><Zap className="h-2.5 w-2.5" />always on</span>
         <div className="ml-auto text-right"><p className="font-mono text-lg font-semibold tabular-nums leading-none">{hardwired?.replies ?? 0}</p><p className="text-[10px] text-muted-foreground">replies sent</p></div>
       </div>
+      <p className={cn("mt-2 pl-2 text-[11px]", state.tone === "offline" || state.tone === "stopped" ? "text-amber-300" : "text-muted-foreground")}>{state.detail}</p>
 
       <div className="mt-3 space-y-1 pl-2">
         {workflow.steps.map((step, index) => (
@@ -100,6 +142,22 @@ function HardwiredCard({ workflow, hardwired, onEdit }: { workflow: Workflow; ha
         {hardwired?.lastBot ? ` Last answered ${hardwired.lastBot} at step ${hardwired.lastStep ?? 1}.` : ""}
       </p>
       {workflow.targets.length === 0 ? <p className="mt-2 pl-2 text-[11px] text-amber-400">Open it to set your test bot as the allowed sender, otherwise it answers any chat that says “joefortune”.</p> : null}
+
+      <div className="mt-3 flex flex-wrap items-center gap-2 rounded-xl bg-secondary/35 p-2 pl-3">
+        <Play className="h-3.5 w-3.5 shrink-0 text-accent" />
+        <span className="text-[11px] font-medium">Run now</span>
+        <Input
+          value={runTarget}
+          placeholder={workflow.targets[0] ?? "@yourbot"}
+          onChange={(event) => setRunTarget(event.target.value)}
+          onKeyDown={(event) => { if (event.key === "Enter" && runTarget.trim() && canRun && !starting) start(); }}
+          className="h-8 min-w-[9rem] flex-1 rounded-lg bg-background/60 font-mono text-[11px]"
+        />
+        <Button size="sm" className="h-8 shrink-0 rounded-lg text-[11px]" disabled={!runTarget.trim() || !canRun || starting} onClick={start}>
+          {starting ? "Starting…" : "Start flow"}
+        </Button>
+      </div>
+      <p className="mt-1.5 pl-2 text-[10px] text-muted-foreground">Sends the first step straight into that chat, then continues on each bot reply.</p>
     </div>
   );
 }
@@ -112,7 +170,7 @@ function statusTone(status: WorkflowStatus): string {
 }
 
 export default function Workflows() {
-  const { snapshot, saveWorkflow, deleteWorkflow, importFlow } = useEngine();
+  const { snapshot, saveWorkflow, deleteWorkflow, importFlow, runHardwired } = useEngine();
   const [draft, setDraft] = useState<Workflow | null>(null);
   const [saving, setSaving] = useState<boolean>(false);
   const [pendingFlow, setPendingFlow] = useState<{ flow: unknown; name: string; preview: FlowImportPreview[] } | null>(null);
@@ -183,7 +241,16 @@ export default function Workflows() {
         <div className="panel p-4"><Bot className="h-4 w-4 text-amber-300" /><p className="mt-2 text-xs font-semibold">Personal actions</p><p className="mt-1 text-[11px] text-muted-foreground">Press buttons, react and mark read through the isolated connector.</p></div>
       </div>
 
-      {pinned ? <HardwiredCard workflow={pinned} hardwired={snapshot?.hardwired} onEdit={() => setDraft(structuredClone(pinned))} /> : null}
+      {pinned ? (
+        <HardwiredCard
+          workflow={pinned}
+          hardwired={snapshot?.hardwired}
+          link={snapshot?.link}
+          killSwitch={snapshot?.settings.killSwitch ?? false}
+          onEdit={() => setDraft(structuredClone(pinned))}
+          onRun={runHardwired}
+        />
+      ) : null}
 
       {others.length === 0 ? (
         <div className="panel px-4 py-14 text-center"><GitBranch className="mx-auto h-6 w-6 text-muted-foreground" /><p className="mt-3 text-sm font-medium">No other workflows yet</p><p className="mt-1 text-xs text-muted-foreground">Import a flow file, start manually, or turn screenshots into a disabled draft.</p></div>

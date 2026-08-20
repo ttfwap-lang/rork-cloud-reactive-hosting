@@ -4,73 +4,204 @@ declare(strict_types=1);
 
 namespace ReplyFlow;
 
+use Amp\CancelledException;
+use Amp\TimeoutCancellation;
 use danog\MadelineProto\API;
 use danog\MadelineProto\Settings;
-use RuntimeException;
 use Throwable;
 
 final class TelegramService
 {
+    /** Longest a single QR poll may block before returning a refreshed code. */
+    private const QR_WAIT_SECONDS = 25.0;
+    /** Longest flood wait absorbed inline; anything larger is handed back to the control plane. */
+    private const INLINE_FLOOD_LIMIT = 25;
+    /** Keeps the always-on supervisor away from the session while a login is in flight. */
+    private const LOGIN_LOCK_SECONDS = 90;
+
     private API $api;
 
-    public function __construct(?int $apiId = null, ?string $apiHash = null)
+    public function __construct()
     {
-        $state = StateStore::read();
-        $resolvedId = $apiId ?? (isset($state['apiId']) ? (int) $state['apiId'] : null);
-        $resolvedHash = $apiHash ?? ($state['apiHash'] ?? null);
-        if (!$resolvedId || !$resolvedHash) {
-            throw new RuntimeException('Telegram API credentials are not configured.');
+        $credentials = self::credentials();
+        if ($credentials === null) {
+            throw new ConnectorException('Telegram API credentials are not configured on the connector.', null, 503);
         }
+        $this->api = new API(
+            StateStore::sessionPath(),
+            self::buildSettings($credentials['apiId'], $credentials['apiHash']),
+        );
+    }
+
+    /**
+     * App credentials resolved from the connector's own environment first, so the
+     * api_id/api_hash pair never has to travel from the control plane or browser.
+     */
+    public static function credentials(): ?array
+    {
+        $apiId = trim((string) (getenv('TELEGRAM_API_ID') ?: ''));
+        $apiHash = trim((string) (getenv('TELEGRAM_API_HASH') ?: ''));
+        if ($apiId === '' || $apiHash === '') {
+            try {
+                $state = StateStore::read();
+            } catch (Throwable) {
+                return null;
+            }
+            $apiId = $apiId !== '' ? $apiId : (string) ($state['apiId'] ?? '');
+            $apiHash = $apiHash !== '' ? $apiHash : (string) ($state['apiHash'] ?? '');
+        }
+        if (preg_match('/^\d{4,12}$/', $apiId) !== 1 || preg_match('/^[a-fA-F0-9]{32}$/', $apiHash) !== 1) {
+            return null;
+        }
+
+        return ['apiId' => (int) $apiId, 'apiHash' => $apiHash];
+    }
+
+    public static function buildSettings(int $apiId, string $apiHash): Settings
+    {
         $settings = new Settings();
-        $settings->getAppInfo()->setApiId($resolvedId)->setApiHash($resolvedHash);
+        $settings->getAppInfo()->setApiId($apiId)->setApiHash($apiHash);
+        // Level 2 keeps startup/connection notices without echoing message bodies.
         $settings->getLogger()->setLevel(2);
-        $this->api = new API(StateStore::sessionPath(), $settings);
+        // Absorb Telegram's own cool-off requests transparently instead of failing.
+        $settings->getRpc()->setFloodTimeout(300);
+
+        return $settings;
     }
 
     public function startLogin(array $input): array
     {
         $state = StateStore::read();
-        $state['apiId'] = (int) $input['apiId'];
-        $state['apiHash'] = (string) $input['apiHash'];
         $state['disabled'] = false;
+        $state['loginLockUntil'] = time() + self::LOGIN_LOCK_SECONDS;
+        // Only persisted when the environment does not already carry them.
+        if (getenv('TELEGRAM_API_ID') === false || getenv('TELEGRAM_API_ID') === '') {
+            if (isset($input['apiId'])) {
+                $state['apiId'] = (int) $input['apiId'];
+            }
+            if (isset($input['apiHash'])) {
+                $state['apiHash'] = (string) $input['apiHash'];
+            }
+        }
         StateStore::write($state);
 
         if (($input['method'] ?? 'qr') === 'phone') {
             $phone = trim((string) ($input['phone'] ?? ''));
             $this->api->phoneLogin($phone);
-            $state = array_merge($state, ['status' => 'awaiting_code', 'phoneMasked' => self::maskPhone($phone)]);
+            $state['status'] = 'awaiting_code';
+            $state['phoneMasked'] = self::maskPhone($phone);
             StateStore::write($state);
+
             return $this->publicState($state, 'Telegram sent a login code.');
         }
 
+        if ($this->api->getAuthorization() === API::LOGGED_IN) {
+            return $this->finishLogin('Existing personal session restored.');
+        }
         $qr = $this->api->qrLogin();
         if ($qr === null) {
-            return $this->refreshState('Existing personal session restored.');
+            return $this->finishLogin('Existing personal session restored.');
         }
         $state['status'] = 'awaiting_qr';
         StateStore::write($state);
-        return array_merge($this->publicState($state, 'Scan in Telegram: Settings → Devices → Link Desktop Device.'), [
-            'qrUrl' => $qr->getQRText(),
-            'qrExpiresAt' => (int) round(microtime(true) * 1000) + 30000,
-        ]);
+
+        return array_merge(
+            $this->publicState($state, 'Scan in Telegram: Settings → Devices → Link Desktop Device.'),
+            ['qrUrl' => $qr->getQRText(), 'qrExpiresAt' => self::nowMs() + 30_000],
+        );
+    }
+
+    /**
+     * Blocks until the QR code is either scanned or expires, then reports the
+     * outcome. Someone has to hold the connection open for Telegram to deliver
+     * the login token, so the console calls this repeatedly while showing the code.
+     */
+    public function waitForQr(): array
+    {
+        $state = StateStore::read();
+        if (($state['disabled'] ?? false) === true) {
+            throw new ConnectorException('The connector is disconnected.', null, 409);
+        }
+        $state['loginLockUntil'] = time() + self::LOGIN_LOCK_SECONDS;
+        StateStore::write($state);
+
+        if ($this->api->getAuthorization() === API::LOGGED_IN) {
+            return $this->finishLogin('Personal Telegram session is online.');
+        }
+        $qr = $this->api->qrLogin();
+        if ($qr === null) {
+            return $this->finishLogin('Personal Telegram session is online.');
+        }
+        try {
+            $qr->waitForLoginOrQrCodeExpiration(new TimeoutCancellation(self::QR_WAIT_SECONDS));
+        } catch (CancelledException) {
+            // Poll window elapsed; fall through and hand back a current code.
+        } catch (Throwable $error) {
+            if (self::isPasswordRequired($error)) {
+                $state['status'] = 'awaiting_password';
+                StateStore::write($state);
+
+                return $this->publicState($state, 'Two-step verification is enabled. Enter the password; it is never stored.');
+            }
+            throw $error;
+        }
+
+        if ($this->api->getAuthorization() === API::LOGGED_IN) {
+            return $this->finishLogin('Personal Telegram session is online.');
+        }
+        if ($this->api->getAuthorization() === API::WAITING_PASSWORD) {
+            $state['status'] = 'awaiting_password';
+            StateStore::write($state);
+
+            return $this->publicState($state, 'Two-step verification is enabled. Enter the password; it is never stored.');
+        }
+        $fresh = $this->api->qrLogin();
+        if ($fresh === null) {
+            return $this->finishLogin('Personal Telegram session is online.');
+        }
+        $state['status'] = 'awaiting_qr';
+        StateStore::write($state);
+
+        return array_merge(
+            $this->publicState($state, 'Waiting for the code to be scanned.'),
+            ['qrUrl' => $fresh->getQRText(), 'qrExpiresAt' => self::nowMs() + 30_000],
+        );
     }
 
     public function submit(string $kind, string $value): array
     {
+        $state = StateStore::read();
+        $state['loginLockUntil'] = time() + self::LOGIN_LOCK_SECONDS;
+        StateStore::write($state);
+
         if ($kind === 'code') {
             $authorization = $this->api->completePhoneLogin(trim($value));
             if (($authorization['_'] ?? '') === 'account.password') {
-                $state = StateStore::read();
                 $state['status'] = 'awaiting_password';
                 StateStore::write($state);
+
                 return $this->publicState($state, 'Two-step verification is enabled. Enter the password; it is never stored.');
             }
         } elseif ($kind === 'password') {
             $this->api->complete2faLogin($value);
         } else {
-            throw new RuntimeException('Unsupported login submission.');
+            throw new ConnectorException('Unsupported login submission.');
         }
-        return $this->refreshState('Personal Telegram session is online.');
+
+        return $this->finishLogin('Personal Telegram session is online.');
+    }
+
+    /** Marks the session live and releases it so the always-on process can take over. */
+    private function finishLogin(string $detail): array
+    {
+        $state = StateStore::read();
+        $state['status'] = 'online';
+        $state['disabled'] = false;
+        $state['loginLockUntil'] = 0;
+        $state = $this->withIdentity($state);
+        StateStore::write($state);
+
+        return $this->publicState($state, $detail);
     }
 
     public function refreshState(string $detail = 'Connector health check completed.'): array
@@ -79,10 +210,10 @@ final class TelegramService
         if (($state['disabled'] ?? false) === true) {
             $state['status'] = 'offline';
             StateStore::write($state);
+
             return $this->publicState($state, 'Session is preserved but disconnected.');
         }
-        $authorization = $this->api->getAuthorization();
-        $status = match ($authorization) {
+        $status = match ($this->api->getAuthorization()) {
             API::LOGGED_IN => 'online',
             API::WAITING_CODE => 'awaiting_code',
             API::WAITING_PASSWORD => 'awaiting_password',
@@ -90,16 +221,32 @@ final class TelegramService
         };
         $state['status'] = $status;
         if ($status === 'online') {
-            $self = $this->api->getSelf();
-            $username = is_array($self) ? ($self['username'] ?? null) : null;
-            $name = is_array($self) ? trim((string) (($self['first_name'] ?? '').' '.($self['last_name'] ?? ''))) : '';
-            $state['identity'] = $username ? '@'.$username : ($name !== '' ? $name : 'Personal account');
-            if (is_array($self) && isset($self['phone'])) {
-                $state['phoneMasked'] = self::maskPhone((string) $self['phone']);
-            }
+            $state['loginLockUntil'] = 0;
+            $state = $this->withIdentity($state);
         }
         StateStore::write($state);
+
         return $this->publicState($state, $detail);
+    }
+
+    private function withIdentity(array $state): array
+    {
+        try {
+            $self = $this->api->getSelf();
+        } catch (Throwable) {
+            return $state;
+        }
+        if (!is_array($self)) {
+            return $state;
+        }
+        $username = $self['username'] ?? null;
+        $name = trim((string) (($self['first_name'] ?? '').' '.($self['last_name'] ?? '')));
+        $state['identity'] = $username ? '@'.$username : ($name !== '' ? $name : 'Personal account');
+        if (isset($self['phone'])) {
+            $state['phoneMasked'] = self::maskPhone((string) $self['phone']);
+        }
+
+        return $state;
     }
 
     public function disconnect(): array
@@ -108,6 +255,7 @@ final class TelegramService
         $state['disabled'] = true;
         $state['status'] = 'offline';
         StateStore::write($state);
+
         return $this->publicState($state, 'Session preserved and event delivery paused.');
     }
 
@@ -116,6 +264,7 @@ final class TelegramService
         $state = StateStore::read();
         $state['disabled'] = false;
         StateStore::write($state);
+
         return $this->refreshState('Persistent session restored.');
     }
 
@@ -127,18 +276,24 @@ final class TelegramService
             // Local deletion still proceeds if Telegram is unreachable.
         }
         StateStore::clear();
-        return ['status' => 'offline', 'identity' => null, 'phoneMasked' => null, 'detail' => 'Telegram authorization revoked and encrypted session files removed.'];
+
+        return [
+            'status' => 'offline',
+            'identity' => null,
+            'phoneMasked' => null,
+            'detail' => 'Telegram authorization revoked and encrypted session files removed.',
+        ];
     }
 
     public function execute(array $action): array
     {
         $state = StateStore::read();
         if (($state['disabled'] ?? false) || ($state['status'] ?? '') !== 'online') {
-            throw new RuntimeException('Personal session is not online.');
+            throw new ConnectorException('Personal session is not online.', null, 409);
         }
-        $idempotencyKey = preg_replace('/[^a-zA-Z0-9_-]/', '', (string) ($action['idempotencyKey'] ?? ''));
+        $idempotencyKey = preg_replace('/[^a-zA-Z0-9_-]/', '', (string) ($action['idempotencyKey'] ?? '')) ?? '';
         if ($idempotencyKey === '') {
-            throw new RuntimeException('An idempotency key is required.');
+            throw new ConnectorException('An idempotency key is required.');
         }
         $receipt = StateStore::path('action_'.hash('sha256', $idempotencyKey));
         if (is_file($receipt)) {
@@ -147,23 +302,53 @@ final class TelegramService
         $peer = (string) ($action['chatKey'] ?? '');
         $type = (string) ($action['actionType'] ?? '');
         if ($peer === '') {
-            throw new RuntimeException('A target chat is required.');
+            throw new ConnectorException('A target chat is required.');
         }
 
-        match ($type) {
-            'sendText' => $this->api->messages->sendMessage(peer: $peer, message: (string) ($action['text'] ?? '')),
-            'pressButton' => $this->pressButton($peer, (string) ($action['buttonTarget'] ?? '')),
-            'react' => $this->react($peer, (int) ($action['messageId'] ?? 0), (string) ($action['reaction'] ?? '')),
-            'markRead' => $this->api->messages->readHistory(peer: $peer, max_id: (int) ($action['messageId'] ?? 0)),
-            default => throw new RuntimeException('Unsupported personal-account action.'),
-        };
+        $this->runAction($peer, $type, $action);
+
         file_put_contents($receipt, json_encode(['at' => time(), 'type' => $type], JSON_THROW_ON_ERROR), LOCK_EX);
         foreach (glob(StateStore::path('action_*')) ?: [] as $file) {
             if (filemtime($file) !== false && filemtime($file) < time() - 172800) {
                 @unlink($file);
             }
         }
+
         return ['ok' => true, 'duplicate' => false];
+    }
+
+    /**
+     * Performs one Telegram action, honouring a short flood wait inline and
+     * surfacing longer ones so the control plane can reschedule precisely.
+     */
+    private function runAction(string $peer, string $type, array $action, bool $isRetry = false): void
+    {
+        try {
+            match ($type) {
+                'sendText' => $this->api->messages->sendMessage(peer: $peer, message: (string) ($action['text'] ?? '')),
+                'pressButton' => $this->pressButton($peer, (string) ($action['buttonTarget'] ?? '')),
+                'react' => $this->react($peer, (int) ($action['messageId'] ?? 0), (string) ($action['reaction'] ?? '')),
+                'markRead' => $this->api->messages->readHistory(peer: $peer, max_id: (int) ($action['messageId'] ?? 0)),
+                default => throw new ConnectorException('Unsupported personal-account action.'),
+            };
+        } catch (ConnectorException $error) {
+            throw $error;
+        } catch (Throwable $error) {
+            $seconds = ConnectorException::floodSeconds($error);
+            if ($seconds === null) {
+                throw $error;
+            }
+            if ($isRetry || $seconds > self::INLINE_FLOOD_LIMIT) {
+                throw new ConnectorException(
+                    "Telegram asked for a {$seconds}s pause.",
+                    $seconds,
+                    429,
+                    $error,
+                );
+            }
+            sleep($seconds);
+            $this->runAction($peer, $type, $action, true);
+        }
     }
 
     private function pressButton(string $peer, string $target): void
@@ -177,25 +362,26 @@ final class TelegramService
                         continue;
                     }
                     if (!array_key_exists('data', $button)) {
-                        throw new RuntimeException('That button cannot be safely pressed by the connector.');
+                        throw new ConnectorException('That button cannot be safely pressed by the connector.');
                     }
                     $this->api->messages->getBotCallbackAnswer(peer: $peer, msg_id: (int) $message['id'], data: $button['data']);
+
                     return;
                 }
             }
         }
-        throw new RuntimeException('The requested button was not found in recent messages.');
+        throw new ConnectorException('The requested button was not found in recent messages.');
     }
 
     private function react(string $peer, int $messageId, string $emoji): void
     {
         if ($messageId <= 0 || $emoji === '') {
-            throw new RuntimeException('A message and reaction are required.');
+            throw new ConnectorException('A message and reaction are required.');
         }
         $this->api->messages->sendReaction(
             peer: $peer,
             msg_id: $messageId,
-            reaction: [['_'=>'reactionEmoji', 'emoticon'=>$emoji]],
+            reaction: [['_' => 'reactionEmoji', 'emoticon' => $emoji]],
         );
     }
 
@@ -209,9 +395,22 @@ final class TelegramService
         ];
     }
 
+    private static function isPasswordRequired(Throwable $error): bool
+    {
+        return str_contains(strtoupper($error->getMessage()), 'SESSION_PASSWORD_NEEDED');
+    }
+
+    private static function nowMs(): int
+    {
+        return (int) round(microtime(true) * 1000);
+    }
+
     private static function maskPhone(string $phone): string
     {
         $digits = preg_replace('/\D/', '', $phone) ?? '';
-        return strlen($digits) <= 4 ? '••••' : '+'.substr($digits, 0, 2).str_repeat('•', max(2, strlen($digits) - 4)).substr($digits, -2);
+
+        return strlen($digits) <= 4
+            ? '••••'
+            : '+'.substr($digits, 0, 2).str_repeat('•', max(2, strlen($digits) - 4)).substr($digits, -2);
     }
 }
