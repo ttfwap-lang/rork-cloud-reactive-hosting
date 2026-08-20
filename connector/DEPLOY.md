@@ -115,14 +115,20 @@ correctly shaped.
 
 ## Step 7 — Connect it to ReplyFlow
 
-Back in the ReplyFlow engine, set these two server-side values:
+Back in the ReplyFlow engine, set these server-side values:
 
 ```
-CONNECTOR_BASE_URL=https://YOUR-ADDRESS
+CONNECTOR_BASE_URL=https://replytelego-production.up.railway.app
 CONNECTOR_SHARED_SECRET=28231886a62412bbe363c4ba1859398ce12d5f2eb67b75582de2e73c2d8eeffe
+CREDENTIAL_ENCRYPTION_KEY=6eb2c8778711d19478d672c3bb357c93687eb63ddb96618808ce9db0653d015e
 ```
 
 `CONNECTOR_SHARED_SECRET` must be byte-identical to the one in step 4.
+
+Then open the console → **Connection** and press **Test service**. It reports
+whether the address answers and whether the always-on process is running. The
+login button stays disabled until that check passes, so you can never scan a QR
+code into a service that is not there.
 
 ---
 
@@ -147,6 +153,11 @@ through in order.
 
 ## If something goes wrong
 
+- **`/health` and `/selfcheck` return `Application not found`** — that reply comes
+  from Railway itself, not from this service: the domain exists but no running
+  deployment is attached to it. Check the service's **Deployments** tab for a
+  failed or crashed build, confirm **Root Directory** is `connector`, and confirm
+  the generated domain targets port `8080`.
 - **`/selfcheck` says "Always-on process: Stalled"** — the background process
   died. Check Railway's deploy logs for a crash on startup.
 - **Login never completes** — confirm the volume is mounted at `/data` and that

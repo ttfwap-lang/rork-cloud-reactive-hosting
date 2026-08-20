@@ -177,10 +177,12 @@ export type ConversationAnalysis = {
   }>;
 };
 
+export type ConnectorProbe = { reachable: boolean; detail: string; checkedAt: number | null; workerAgeSeconds: number | null };
+
 export type Snapshot = {
   link: LinkState;
   hardwired: HardwiredState;
-  connector: { configured: boolean; deployment: string; credentialsPreset: boolean };
+  connector: { configured: boolean; deployment: string; credentialsPreset: boolean; probe: ConnectorProbe };
   ai: { enabled: boolean; model: string };
   settings: Settings;
   workflows: Workflow[];
@@ -238,6 +240,7 @@ export const api = {
   submitPersonal: (kind: "code" | "password", value: string) => call<{ link: LinkState }>("/link/personal/submit", { kind, value }),
   pollPersonal: () => call<{ link: LinkState; warning?: string }>("/link/personal/poll", {}),
   runHardwired: (chatKey: string) => call<Snapshot>("/hardwired/run", { chatKey }),
+  checkConnector: () => call<{ probe: ConnectorProbe }>("/connector/check", {}),
   reconnect: () => call<{ link: LinkState }>("/link/reconnect", {}),
   disconnect: () => call<{ link: LinkState }>("/link/disconnect", {}),
   forgetConnection: () => call<{ link: LinkState }>("/link/forget", {}),

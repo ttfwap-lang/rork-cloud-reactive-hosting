@@ -36,6 +36,7 @@ type EngineContextValue = {
   submitPersonal: (kind: "code" | "password", value: string) => Promise<void>;
   pollPersonal: () => Promise<void>;
   runHardwired: (chatKey: string) => Promise<void>;
+  checkConnector: () => Promise<void>;
   reconnect: () => Promise<void>;
   disconnect: () => void;
   forgetConnection: () => Promise<void>;
@@ -147,6 +148,15 @@ export function EngineProvider({ children }: { children: ReactNode }) {
     onSuccess: () => { invalidate(); toast.success("Hardwired flow started"); },
     onError: (error: Error) => toast.error(error.message),
   });
+  const checkConnectorMutation = useMutation({
+    mutationFn: api.checkConnector,
+    onSuccess: (result) => {
+      invalidate();
+      if (result.probe.reachable) toast.success("Connector reached", { description: result.probe.detail });
+      else toast.error("Connector unreachable", { description: result.probe.detail });
+    },
+    onError: (error: Error) => toast.error(error.message),
+  });
   const reconnectMutation = useMutation({
     mutationFn: api.reconnect,
     onSuccess: () => { invalidate(); toast.success("Reconnect requested"); },
@@ -211,6 +221,7 @@ export function EngineProvider({ children }: { children: ReactNode }) {
       queryClient.setQueryData<Snapshot>(QUERY_KEY, (previous) => (previous ? { ...previous, link: result.link } : previous));
     },
     runHardwired: async (chatKey) => { await runHardwiredMutation.mutateAsync(chatKey); },
+    checkConnector: async () => { await checkConnectorMutation.mutateAsync(); },
     reconnect: async () => { await reconnectMutation.mutateAsync(); },
     disconnect: () => disconnectMutation.mutate(),
     forgetConnection: async () => { await forgetMutation.mutateAsync(); },
@@ -222,7 +233,7 @@ export function EngineProvider({ children }: { children: ReactNode }) {
   }), [
     authed, signIn, signOut, query.data, query.isLoading, query.error, liveEvents, streamOnline, queryClient,
     settingsMutation, workflowMutation, deleteMutation, importMutation, botMutation, personalMutation, submitPersonalMutation,
-    runHardwiredMutation, reconnectMutation, disconnectMutation, forgetMutation, retryMutation, jobMutation, simulateMutation, analysisMutation,
+    runHardwiredMutation, checkConnectorMutation, reconnectMutation, disconnectMutation, forgetMutation, retryMutation, jobMutation, simulateMutation, analysisMutation,
   ]);
 
   return <EngineContext.Provider value={value}>{children}</EngineContext.Provider>;

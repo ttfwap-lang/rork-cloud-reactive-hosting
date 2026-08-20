@@ -14,6 +14,14 @@ type Env = {
   EXPO_PUBLIC_RORK_TOOLKIT_SECRET_KEY?: string;
 };
 
+/**
+ * Result of the last plain HTTP reachability probe against the connector's
+ * liveness route. Environment variables can be present while the Railway service
+ * is missing, so configuration alone must never be reported as "ready".
+ */
+export type ConnectorProbe = { reachable: boolean; detail: string; checkedAt: number | null; workerAgeSeconds: number | null };
+const EMPTY_PROBE: ConnectorProbe = { reachable: false, detail: "Not checked yet.", checkedAt: null, workerAgeSeconds: null };
+
 export type TriggerMode = "exact" | "contains" | "starts" | "ends" | "regex";
 export type ConditionField =
   | "text"
@@ -580,6 +588,7 @@ export class AutomationEngine extends DurableObject<Env> {
       case "/link/personal/submit": return this.handlePersonalSubmit(request);
       case "/link/personal/poll": return this.handlePersonalPoll();
       case "/hardwired/run": return this.handleHardwiredRun(request);
+      case "/connector/check": return Response.json({ probe: await this.probeConnector() });
       case "/link/reconnect": return this.handleReconnect();
       case "/link/disconnect": return this.handleDisconnect(false);
       case "/link/forget": return this.handleDisconnect(true);
@@ -708,6 +717,7 @@ export class AutomationEngine extends DurableObject<Env> {
         configured: Boolean(this.env.CONNECTOR_BASE_URL && this.env.CONNECTOR_SHARED_SECRET),
         deployment: this.env.CONNECTOR_BASE_URL ? "Railway / Docker" : "Awaiting Railway service",
         credentialsPreset: this.presetCredentials() !== null,
+        probe: this.kvGet<ConnectorProbe>("connectorProbe", EMPTY_PROBE),
       },
       ai: { enabled: Boolean(this.env.EXPO_PUBLIC_RORK_TOOLKIT_SECRET_KEY), model: AI_MODEL },
       settings: this.settings(),
@@ -1673,6 +1683,7 @@ export class AutomationEngine extends DurableObject<Env> {
     this.ctx.storage.sql.exec("DELETE FROM kv WHERE k LIKE 'connectorNonce:%' AND CAST(v AS INTEGER) < ?", now - 120_000);
     await this.runDueRetries(now);
     if (link.mode === "bot" && link.status === "online") await this.repairBotWebhook();
+    if (this.connectorReady()) await this.probeConnector();
     if (link.mode === "personal" && this.connectorReady()) await this.refreshConnectorHealth();
     this.broadcast({ kind: "heartbeat", ts: now, link: this.link() });
     await this.env.DO.setAlarm("AutomationEngine", this.ctx.id.name ?? "primary", now + WATCHDOG_MS).catch(() => undefined);
@@ -1688,6 +1699,35 @@ export class AutomationEngine extends DurableObject<Env> {
     if (info?.ok && info.result?.url !== expected) {
       await fetch(`https://api.telegram.org/bot${token}/setWebhook`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ url: expected, allowed_updates: ["message", "edited_message"] }) }).catch(() => null);
       this.log("warn", "link.repair", "Webhook drift detected and repaired.");
+    }
+  }
+
+  /** Probes the connector's liveness route and remembers the outcome for the console. */
+  private async probeConnector(): Promise<ConnectorProbe> {
+    const probe = await this.readConnectorHealth();
+    this.kvPut("connectorProbe", probe);
+    return probe;
+  }
+
+  private async readConnectorHealth(): Promise<ConnectorProbe> {
+    const checkedAt = Date.now();
+    const base = this.env.CONNECTOR_BASE_URL?.replace(/\/$/, "");
+    if (!base) return { reachable: false, detail: "No connector address is configured yet.", checkedAt, workerAgeSeconds: null };
+    try {
+      const response = await fetch(`${base}/health`, { signal: AbortSignal.timeout(8_000) });
+      if (!response.ok) {
+        const detail = response.status === 404
+          ? "The address answers, but no service is deployed there yet."
+          : `The connector answered with status ${response.status}.`;
+        return { reachable: false, detail, checkedAt, workerAgeSeconds: null };
+      }
+      const body = (await response.json().catch(() => ({}))) as { worker?: number | null };
+      const age = typeof body.worker === "number" ? body.worker : null;
+      if (age === null) return { reachable: true, detail: "Service is up, but its always-on process has not reported yet.", checkedAt, workerAgeSeconds: null };
+      if (age > 120) return { reachable: true, detail: `Service is up, but its always-on process last reported ${age}s ago.`, checkedAt, workerAgeSeconds: age };
+      return { reachable: true, detail: "Service is up and its always-on process is current.", checkedAt, workerAgeSeconds: age };
+    } catch {
+      return { reachable: false, detail: "The connector address could not be reached.", checkedAt, workerAgeSeconds: null };
     }
   }
 

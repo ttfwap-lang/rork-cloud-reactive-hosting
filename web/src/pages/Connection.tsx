@@ -15,7 +15,7 @@ import { cn } from "@/lib/utils";
 import { useEngine } from "@/lib/engine-store";
 
 export default function Connection() {
-  const { snapshot, connectBot, startPersonal, submitPersonal, pollPersonal, reconnect, forgetConnection, simulate } = useEngine();
+  const { snapshot, connectBot, startPersonal, submitPersonal, pollPersonal, checkConnector, reconnect, forgetConnection, simulate } = useEngine();
   const [mode, setMode] = useState<"personal" | "bot">("personal");
   const [loginMethod, setLoginMethod] = useState<"qr" | "phone">("qr");
   const [apiId, setApiId] = useState<string>("");
@@ -25,11 +25,13 @@ export default function Connection() {
   const [loginValue, setLoginValue] = useState<string>("");
   const [token, setTokenValue] = useState<string>("");
   const [busy, setBusy] = useState<boolean>(false);
+  const [checking, setChecking] = useState<boolean>(false);
   const [probe, setProbe] = useState<string>("");
 
   const link = snapshot?.link;
   const connector = snapshot?.connector;
   const presetCredentials = connector?.credentialsPreset ?? false;
+  const serviceUp = connector?.probe.reachable ?? false;
   const isPersonalFlow = link?.mode === "personal" && ["awaiting_qr", "awaiting_code", "awaiting_password", "connecting"].includes(link.status);
   const linkStatus = link?.status;
 
@@ -122,7 +124,18 @@ export default function Connection() {
               <TrainFront className="mt-0.5 h-4 w-4 shrink-0 text-amber-400" />
               <div><p className="text-sm font-semibold text-amber-300">Railway connector package is ready</p><p className="mt-1 text-xs leading-relaxed text-muted-foreground">Deploy the included connector with an encrypted persistent volume, then add its URL and shared secret to activate live personal login. The dashboard and signed protocol are already wired.</p></div>
             </div>
-          ) : null}
+          ) : (
+            <div className={cn("m-5 flex flex-wrap items-center gap-3 rounded-2xl border p-4", serviceUp ? "border-primary/20 bg-primary/[0.05]" : "border-destructive/25 bg-destructive/[0.05]")}>
+              {serviceUp ? <CheckCircle2 className="h-4 w-4 shrink-0 text-primary" /> : <TrainFront className="h-4 w-4 shrink-0 text-destructive" />}
+              <div className="min-w-0 flex-1">
+                <p className={cn("text-sm font-semibold", serviceUp ? "text-primary" : "text-destructive")}>{serviceUp ? "Always-on service reachable" : "Always-on service not reachable"}</p>
+                <p className="mt-0.5 text-[11px] leading-relaxed text-muted-foreground">{connector.probe.detail}{connector.probe.checkedAt ? ` Checked ${new Date(connector.probe.checkedAt).toLocaleTimeString()}.` : ""}</p>
+              </div>
+              <Button size="sm" variant="secondary" className="shrink-0 rounded-full" disabled={checking} onClick={() => { setChecking(true); checkConnector().finally(() => setChecking(false)); }}>
+                {checking ? <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" /> : <RefreshCw className="mr-1.5 h-3.5 w-3.5" />}Test service
+              </Button>
+            </div>
+          )}
 
           {isPersonalFlow && link?.status === "awaiting_qr" && link.qrUrl ? (
             <div className="grid gap-6 p-5 sm:grid-cols-[220px_1fr] sm:items-center">
@@ -165,7 +178,7 @@ export default function Connection() {
               <div className="flex items-center justify-between rounded-xl bg-secondary/40 px-3 py-2.5"><div><p className="text-xs font-medium">Use phone-code fallback</p><p className="text-[10px] text-muted-foreground">QR is recommended and selected by default.</p></div><Switch checked={loginMethod === "phone"} onCheckedChange={(checked) => setLoginMethod(checked ? "phone" : "qr")} /></div>
               {loginMethod === "phone" ? <div><label className="mb-1.5 block text-xs font-medium text-muted-foreground">Phone number</label><div className="relative"><Phone className="absolute left-3 top-3.5 h-4 w-4 text-muted-foreground" /><Input value={phone} onChange={(event) => setPhone(event.target.value)} placeholder="+1 555 123 4567" className="h-11 rounded-xl bg-input/60 pl-10" /></div></div> : null}
               <label className="flex items-start gap-3 rounded-xl border border-amber-400/20 bg-amber-400/[0.04] p-3 text-xs leading-relaxed text-muted-foreground"><Checkbox checked={riskAccepted} onCheckedChange={(checked) => setRiskAccepted(checked === true)} className="mt-0.5" /><span>I understand Telegram monitors API-client activity and may restrict or ban accounts. I will only automate consent-based existing conversations and accept the MadelineProto AGPL notice.</span></label>
-              <Button type="submit" disabled={busy || !connector?.configured || (!presetCredentials && (apiId.length < 4 || apiHash.length !== 32)) || !riskAccepted || (loginMethod === "phone" && !phone.trim())} className="h-11 w-full gap-2 rounded-xl font-semibold">{busy ? <Loader2 className="h-4 w-4 animate-spin" /> : loginMethod === "qr" ? <QrCode className="h-4 w-4" /> : <Phone className="h-4 w-4" />}{loginMethod === "qr" ? "Generate secure QR" : "Send login code"}</Button>
+              <Button type="submit" disabled={busy || !serviceUp || (!presetCredentials && (apiId.length < 4 || apiHash.length !== 32)) || !riskAccepted || (loginMethod === "phone" && !phone.trim())} className="h-11 w-full gap-2 rounded-xl font-semibold">{busy ? <Loader2 className="h-4 w-4 animate-spin" /> : loginMethod === "qr" ? <QrCode className="h-4 w-4" /> : <Phone className="h-4 w-4" />}{loginMethod === "qr" ? "Generate secure QR" : "Send login code"}</Button>
               <p className="text-center text-[10px] text-muted-foreground">One-time codes and two-step passwords are never persisted or returned after use.</p>
             </form>
           )}
