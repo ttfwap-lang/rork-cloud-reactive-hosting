@@ -11,6 +11,7 @@ import {
   type EngineEvent,
   type FlowImportPreview,
   type HostingReport,
+  type HostingStatus,
   type PersonalStartInput,
   type Settings,
   type Snapshot,
@@ -40,6 +41,10 @@ type EngineContextValue = {
   checkConnector: () => Promise<void>;
   diagnoseHosting: () => Promise<HostingReport>;
   applyHosting: () => Promise<{ applied: string[]; report: HostingReport }>;
+  hostingStatus: HostingStatus | undefined;
+  hostingStatusUpdatedAt: number;
+  refreshHostingStatus: () => void;
+  setAutoDeploy: (input: { enabled: boolean; repository?: string; branch?: string }) => Promise<void>;
   reconnect: () => Promise<void>;
   disconnect: () => void;
   forgetConnection: () => Promise<void>;
@@ -52,6 +57,9 @@ type EngineContextValue = {
 
 const EngineContext = createContext<EngineContextValue | null>(null);
 const QUERY_KEY = ["engine-state"] as const;
+const HOSTING_KEY = ["hosting-status"] as const;
+/** The status dashboard refreshes on this cadence, awake or in a background tab. */
+const HOSTING_POLL_MS = 30_000;
 
 export function EngineProvider({ children }: { children: ReactNode }) {
   const queryClient = useQueryClient();
@@ -65,6 +73,15 @@ export function EngineProvider({ children }: { children: ReactNode }) {
     queryFn: () => api.state(),
     enabled: authed,
     refetchInterval: 60_000,
+    retry: 1,
+  });
+
+  const hostingQuery = useQuery({
+    queryKey: HOSTING_KEY,
+    queryFn: () => api.hostingStatus().then((result) => result.status),
+    enabled: authed,
+    refetchInterval: HOSTING_POLL_MS,
+    refetchIntervalInBackground: true,
     retry: 1,
   });
 
@@ -172,6 +189,16 @@ export function EngineProvider({ children }: { children: ReactNode }) {
     },
     onError: (error: Error) => toast.error(error.message),
   });
+  const autoDeployMutation = useMutation({
+    mutationFn: api.setAutoDeploy,
+    onSuccess: (result) => {
+      queryClient.setQueryData<HostingStatus>(HOSTING_KEY, result.status);
+      toast.success(result.status.autoDeploy.enabled ? "Build on push is on" : "Build on push is off", {
+        description: result.applied[result.applied.length - 1] ?? result.status.autoDeploy.detail,
+      });
+    },
+    onError: (error: Error) => toast.error(error.message),
+  });
   const reconnectMutation = useMutation({
     mutationFn: api.reconnect,
     onSuccess: () => { invalidate(); toast.success("Reconnect requested"); },
@@ -239,6 +266,10 @@ export function EngineProvider({ children }: { children: ReactNode }) {
     checkConnector: async () => { await checkConnectorMutation.mutateAsync(); },
     diagnoseHosting: async () => (await diagnoseHostingMutation.mutateAsync()).report,
     applyHosting: async () => applyHostingMutation.mutateAsync(),
+    hostingStatus: hostingQuery.data,
+    hostingStatusUpdatedAt: hostingQuery.dataUpdatedAt,
+    refreshHostingStatus: () => { queryClient.invalidateQueries({ queryKey: HOSTING_KEY }); },
+    setAutoDeploy: async (input) => { await autoDeployMutation.mutateAsync(input); },
     reconnect: async () => { await reconnectMutation.mutateAsync(); },
     disconnect: () => disconnectMutation.mutate(),
     forgetConnection: async () => { await forgetMutation.mutateAsync(); },
@@ -250,6 +281,7 @@ export function EngineProvider({ children }: { children: ReactNode }) {
   }), [
     authed, signIn, signOut, query.data, query.isLoading, query.error, liveEvents, streamOnline, queryClient,
     settingsMutation, workflowMutation, deleteMutation, importMutation, botMutation, personalMutation, submitPersonalMutation,
+    hostingQuery.data, hostingQuery.dataUpdatedAt, autoDeployMutation,
     runHardwiredMutation, checkConnectorMutation, diagnoseHostingMutation, applyHostingMutation,
     reconnectMutation, disconnectMutation, forgetMutation, retryMutation, jobMutation, simulateMutation, analysisMutation,
   ]);

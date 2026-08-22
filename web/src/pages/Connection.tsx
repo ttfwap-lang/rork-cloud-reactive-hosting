@@ -13,6 +13,7 @@ import {
 } from "@/components/ui/alert-dialog";
 import { cn } from "@/lib/utils";
 import { useEngine } from "@/lib/engine-store";
+import { HostingStatus } from "@/components/HostingStatus";
 import type { HostingReport } from "@/lib/api";
 
 export default function Connection() {
@@ -193,6 +194,8 @@ export default function Connection() {
           <form onSubmit={beginBot} className="space-y-3"><Input type="password" value={token} placeholder="123456789:AA..." onChange={(event) => setTokenValue(event.target.value)} className="h-11 rounded-xl bg-input/60 font-mono text-sm" /><Button type="submit" disabled={busy || token.trim().length < 20} className="h-11 w-full gap-2 rounded-xl font-semibold">{busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <PlugZap className="h-4 w-4" />}Encrypt token and connect</Button></form>
         </section>
       )}
+
+      <HostingStatus />
 
       <section className="panel overflow-hidden">
         <div className="flex flex-wrap items-center gap-3 border-b border-white/[0.06] p-5">

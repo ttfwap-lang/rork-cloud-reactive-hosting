@@ -21,6 +21,16 @@ type Env = {
 const RAILWAY_API = "https://backboard.railway.com/graphql/v2";
 const CONNECTOR_MOUNT_PATH = "/data";
 const CONNECTOR_PORT = 8080;
+const CONNECTOR_ROOT_DIRECTORY = "connector";
+/** Only connector changes should trigger a rebuild; console-only pushes must not. */
+const CONNECTOR_WATCH_PATTERNS = ["connector/**"];
+const DEFAULT_BRANCH = "main";
+/** ~4 hours of one-minute samples. */
+const HEALTH_HISTORY_MAX = 240;
+/** Railway facts are refreshed at most this often, so 30s polling stays cheap. */
+const HOSTING_CACHE_MS = 60_000;
+const AUTO_REPAIR_COOLDOWN_MS = 10 * 60_000;
+const AUTO_REPAIR_MAX_ATTEMPTS = 5;
 const REQUIRED_CONNECTOR_VARS = [
   "TELEGRAM_API_ID",
   "TELEGRAM_API_HASH",
@@ -52,6 +62,7 @@ export type HostingServiceReport = {
   /** Variable NAMES only. Stored values are never read into the report. */
   variableKeys: string[];
   volumeMounts: string[];
+  autoDeploy: HostingAutoDeploy;
 };
 
 export type HostingReport = {
@@ -66,13 +77,93 @@ export type HostingReport = {
   checkedAt: number;
 };
 
+/** Whether a push to the connected repository starts a build by itself. */
+export type HostingAutoDeploy = {
+  enabled: boolean;
+  repository: string | null;
+  branch: string | null;
+  watchPatterns: string[];
+  detail: string;
+};
+
+export type HealthSample = { t: number; up: boolean; ms: number | null };
+
+/** Everything the live status dashboard renders, refreshed on a 30s poll. */
+export type HostingStatus = {
+  probe: ConnectorProbe;
+  uptimePct: number | null;
+  windowMs: number;
+  sampleCount: number;
+  onlineSince: number | null;
+  lastDownAt: number | null;
+  history: HealthSample[];
+  build: { serviceName: string | null; status: string | null; at: number | null; refreshedAt: number | null; failure: BuildFailure | null };
+  autoDeploy: HostingAutoDeploy;
+  repair: { attempts: number; lastAt: number | null; nextAt: number | null; lastDetail: string | null; exhausted: boolean };
+  checkedAt: number;
+};
+
+type RailwayTrigger = { id: string; serviceId: string | null; branch: string | null; repository: string | null; provider: string | null };
+type HostingFacts = {
+  serviceName: string | null;
+  status: string | null;
+  at: number | null;
+  autoDeploy: HostingAutoDeploy;
+  refreshedAt: number;
+  /** False when the stored token was rejected outright. */
+  tokenOk: boolean;
+  serviceCount: number;
+  failure: BuildFailure | null;
+  /** Structural only: what kind of source is attached, never which one. */
+  sourceKind: "repo" | "image" | null;
+  rootDirectory: string | null;
+  buildLogLines: number;
+};
+
+/** Plain-language cause of a failed build, derived from the log but never quoting it. */
+export type BuildFailure = { code: string; hint: string };
+/** Coarse outcome of a repair attempt. Engine-generated only, so it is safe to expose. */
+export type HostingApplyCode =
+  | "ok"
+  | "no_token"
+  | "no_credentials"
+  | "no_shared_secret"
+  | "no_session_key"
+  | "token_rejected"
+  | "no_service"
+  | "settings_rejected";
+type HostingApplyResult = { ok: boolean; applied: string[]; error: string | null; code: HostingApplyCode };
+type AutoRepairState = { attempts: number; lastAt: number | null; nextAt: number | null; lastDetail: string | null; lastCode: HostingApplyCode | null };
+const EMPTY_REPAIR: AutoRepairState = { attempts: 0, lastAt: null, nextAt: null, lastDetail: null, lastCode: null };
+
+/**
+ * Unauthenticated status summary. Deliberately carries no project, service,
+ * variable or address names — only booleans, counts and engine-generated codes.
+ */
+export type PublicStatus = {
+  reachable: boolean;
+  uptimePct: number | null;
+  sampleCount: number;
+  buildStatus: string | null;
+  autoDeployEnabled: boolean;
+  tokenAccepted: boolean | null;
+  serviceCount: number | null;
+  sourceKind: "repo" | "image" | null;
+  rootDirectory: string | null;
+  buildLogLines: number | null;
+  buildFailure: BuildFailure | null;
+  repair: { attempts: number; exhausted: boolean; code: HostingApplyCode | null };
+  checkedAt: number;
+};
+const EMPTY_AUTODEPLOY: HostingAutoDeploy = { enabled: false, repository: null, branch: null, watchPatterns: [], detail: "Not checked yet." };
+
 /**
  * Result of the last plain HTTP reachability probe against the connector's
  * liveness route. Environment variables can be present while the Railway service
  * is missing, so configuration alone must never be reported as "ready".
  */
-export type ConnectorProbe = { reachable: boolean; detail: string; checkedAt: number | null; workerAgeSeconds: number | null };
-const EMPTY_PROBE: ConnectorProbe = { reachable: false, detail: "Not checked yet.", checkedAt: null, workerAgeSeconds: null };
+export type ConnectorProbe = { reachable: boolean; detail: string; checkedAt: number | null; workerAgeSeconds: number | null; latencyMs: number | null };
+const EMPTY_PROBE: ConnectorProbe = { reachable: false, detail: "Not checked yet.", checkedAt: null, workerAgeSeconds: null, latencyMs: null };
 
 export type TriggerMode = "exact" | "contains" | "starts" | "ends" | "regex";
 export type ConditionField =
@@ -614,6 +705,14 @@ export class AutomationEngine extends DurableObject<Env> {
     if (path === "/connector/event" && request.method === "POST") return this.handleConnectorEvent(request);
     if (path === "/auth" && request.method === "POST") return this.handleAuth(request);
 
+    // Unauthenticated on purpose and deliberately value-free: it only guarantees the
+    // heartbeat alarm exists so the engine keeps running with no console open.
+    if (path === "/wake") {
+      await this.ensureWatchdog();
+      return Response.json({ ok: true });
+    }
+    if (path === "/status/public") return Response.json(this.publicStatus());
+
     if (path === "/stream" && request.headers.get("Upgrade") === "websocket") {
       const ticket = url.searchParams.get("ticket") ?? "";
       const record = this.kvGet<{ value: string; expiresAt: number } | null>("streamTicket", null);
@@ -643,6 +742,8 @@ export class AutomationEngine extends DurableObject<Env> {
       case "/connector/check": return Response.json({ probe: await this.probeConnector() });
       case "/hosting/diagnose": return Response.json({ report: await this.hostingDiagnose() });
       case "/hosting/apply": return this.handleHostingApply();
+      case "/hosting/status": return Response.json({ status: await this.hostingStatus() });
+      case "/hosting/autodeploy": return this.handleAutoDeploy(request);
       case "/link/reconnect": return this.handleReconnect();
       case "/link/disconnect": return this.handleDisconnect(false);
       case "/link/forget": return this.handleDisconnect(true);
@@ -1718,6 +1819,16 @@ export class AutomationEngine extends DurableObject<Env> {
   }
 
   async onAlarm(): Promise<void> {
+    // The heartbeat must survive any failure inside this tick: if the reschedule is
+    // skipped the engine silently stops being always-on, so it lives in a finally.
+    try {
+      await this.runWatchdogTick();
+    } finally {
+      await this.env.DO.setAlarm("AutomationEngine", this.ctx.id.name ?? "primary", Date.now() + WATCHDOG_MS).catch(() => undefined);
+    }
+  }
+
+  private async runWatchdogTick(): Promise<void> {
     const now = Date.now();
     const link = this.link();
     if (link.pausedUntil && link.pausedUntil <= now) {
@@ -1737,10 +1848,13 @@ export class AutomationEngine extends DurableObject<Env> {
     this.ctx.storage.sql.exec("DELETE FROM kv WHERE k LIKE 'connectorNonce:%' AND CAST(v AS INTEGER) < ?", now - 120_000);
     await this.runDueRetries(now);
     if (link.mode === "bot" && link.status === "online") await this.repairBotWebhook();
-    if (this.connectorReady()) await this.probeConnector();
+    if (this.connectorReady()) {
+      const probe = await this.probeConnector();
+      if (!probe.reachable) await this.refreshHostingFacts();
+      await this.autoRepairHosting(probe);
+    }
     if (link.mode === "personal" && this.connectorReady()) await this.refreshConnectorHealth();
     this.broadcast({ kind: "heartbeat", ts: now, link: this.link() });
-    await this.env.DO.setAlarm("AutomationEngine", this.ctx.id.name ?? "primary", now + WATCHDOG_MS).catch(() => undefined);
   }
 
   private async repairBotWebhook(): Promise<void> {
@@ -1760,28 +1874,70 @@ export class AutomationEngine extends DurableObject<Env> {
   private async probeConnector(): Promise<ConnectorProbe> {
     const probe = await this.readConnectorHealth();
     this.kvPut("connectorProbe", probe);
+    this.recordHealthSample(probe);
     return probe;
+  }
+
+  /** Appends one liveness sample to the rolling window that backs the uptime figure. */
+  private recordHealthSample(probe: ConnectorProbe): void {
+    const history = this.kvGet<HealthSample[]>("healthHistory", []);
+    const sample: HealthSample = { t: probe.checkedAt ?? Date.now(), up: probe.reachable, ms: probe.latencyMs };
+    const last = history.length > 0 ? history[history.length - 1] : undefined;
+    // Guard against a burst of dashboard polls flooding the window with duplicates.
+    if (last && sample.t - last.t < 15_000 && last.up === sample.up) {
+      history[history.length - 1] = sample;
+    } else {
+      history.push(sample);
+    }
+    this.kvPut("healthHistory", history.slice(-HEALTH_HISTORY_MAX));
+  }
+
+  /** Uptime percentage, current unbroken online run, and the last outage in the window. */
+  private uptimeFrom(history: HealthSample[]): { uptimePct: number | null; onlineSince: number | null; lastDownAt: number | null; windowMs: number } {
+    if (history.length === 0) return { uptimePct: null, onlineSince: null, lastDownAt: null, windowMs: 0 };
+    const first = history[0];
+    const newest = history[history.length - 1];
+    if (!first || !newest) return { uptimePct: null, onlineSince: null, lastDownAt: null, windowMs: 0 };
+    let up = 0;
+    let onlineSince: number | null = null;
+    let lastDownAt: number | null = null;
+    for (const sample of history) {
+      if (sample.up) up += 1;
+      else lastDownAt = sample.t;
+    }
+    for (let index = history.length - 1; index >= 0; index -= 1) {
+      const sample = history[index];
+      if (!sample || !sample.up) break;
+      onlineSince = sample.t;
+    }
+    return {
+      uptimePct: Math.round((up / history.length) * 1000) / 10,
+      onlineSince,
+      lastDownAt,
+      windowMs: Math.max(0, newest.t - first.t),
+    };
   }
 
   private async readConnectorHealth(): Promise<ConnectorProbe> {
     const checkedAt = Date.now();
     const base = this.env.CONNECTOR_BASE_URL?.replace(/\/$/, "");
-    if (!base) return { reachable: false, detail: "No connector address is configured yet.", checkedAt, workerAgeSeconds: null };
+    if (!base) return { reachable: false, detail: "No connector address is configured yet.", checkedAt, workerAgeSeconds: null, latencyMs: null };
     try {
       const response = await fetch(`${base}/health`, { signal: AbortSignal.timeout(8_000) });
+      const latencyMs = Date.now() - checkedAt;
       if (!response.ok) {
         const detail = response.status === 404
           ? "The address answers, but no service is deployed there yet."
           : `The connector answered with status ${response.status}.`;
-        return { reachable: false, detail, checkedAt, workerAgeSeconds: null };
+        return { reachable: false, detail, checkedAt, workerAgeSeconds: null, latencyMs };
       }
       const body = (await response.json().catch(() => ({}))) as { worker?: number | null };
       const age = typeof body.worker === "number" ? body.worker : null;
-      if (age === null) return { reachable: true, detail: "Service is up, but its always-on process has not reported yet.", checkedAt, workerAgeSeconds: null };
-      if (age > 120) return { reachable: true, detail: `Service is up, but its always-on process last reported ${age}s ago.`, checkedAt, workerAgeSeconds: age };
-      return { reachable: true, detail: "Service is up and its always-on process is current.", checkedAt, workerAgeSeconds: age };
+      if (age === null) return { reachable: true, detail: "Service is up, but its always-on process has not reported yet.", checkedAt, workerAgeSeconds: null, latencyMs };
+      if (age > 120) return { reachable: true, detail: `Service is up, but its always-on process last reported ${age}s ago.`, checkedAt, workerAgeSeconds: age, latencyMs };
+      return { reachable: true, detail: "Service is up and its always-on process is current.", checkedAt, workerAgeSeconds: age, latencyMs };
     } catch {
-      return { reachable: false, detail: "The connector address could not be reached.", checkedAt, workerAgeSeconds: null };
+      return { reachable: false, detail: "The connector address could not be reached.", checkedAt, workerAgeSeconds: null, latencyMs: Date.now() - checkedAt };
     }
   }
 
@@ -1853,6 +2009,36 @@ export class AutomationEngine extends DurableObject<Env> {
     return project?.project.services.edges.map((edge) => edge.node) ?? [];
   }
 
+  /** Push triggers already armed on the project, keyed back to their service. */
+  private async railwayTriggers(scope: RailwayScope): Promise<RailwayTrigger[]> {
+    const data = await this.railwayQuery<{
+      project: { services: { edges: Array<{ node: { id: string; repoTriggers: { edges: Array<{ node: RailwayTrigger }> } } }> } };
+    }>(
+      scope.kind,
+      "query triggers($id: String!) { project(id: $id) { services { edges { node { id repoTriggers { edges { node { id serviceId branch repository provider } } } } } } } }",
+      { id: scope.projectId },
+    ).catch(() => null);
+    if (!data) return [];
+    return data.project.services.edges.flatMap((service) =>
+      service.node.repoTriggers.edges.map((edge) => ({ ...edge.node, serviceId: edge.node.serviceId ?? service.node.id })),
+    );
+  }
+
+  /** Reads whether a push to the repository would start a build on its own. */
+  private autoDeployFor(serviceId: string, repo: string | null, watchPatterns: string[], triggers: RailwayTrigger[]): HostingAutoDeploy {
+    const trigger = triggers.find((entry) => entry.serviceId === serviceId) ?? null;
+    const repository = trigger?.repository ?? repo;
+    if (!repository) {
+      return { enabled: false, repository: null, branch: null, watchPatterns, detail: "No repository is connected, so a push cannot start a build." };
+    }
+    if (!trigger) {
+      return { enabled: false, repository, branch: null, watchPatterns, detail: "A repository is connected, but no push trigger is armed." };
+    }
+    const branch = trigger.branch ?? DEFAULT_BRANCH;
+    const scoped = watchPatterns.length > 0 ? ` Only changes under ${watchPatterns.join(", ")} rebuild.` : "";
+    return { enabled: true, repository, branch, watchPatterns, detail: `Pushes to ${branch} rebuild automatically.${scoped}` };
+  }
+
   private async railwayMounts(scope: RailwayScope): Promise<Array<{ mountPath: string; serviceId: string | null }>> {
     const environment = await this.railwayQuery<{ environment: { volumeInstances: { edges: Array<{ node: { mountPath: string; serviceId: string | null } }> } } }>(
       scope.kind,
@@ -1866,17 +2052,19 @@ export class AutomationEngine extends DurableObject<Env> {
     scope: RailwayScope,
     node: { id: string; name: string },
     mounts: Array<{ mountPath: string; serviceId: string | null }>,
+    triggers: RailwayTrigger[],
   ): Promise<HostingServiceReport> {
     const instance = await this.railwayQuery<{
       serviceInstance: {
         rootDirectory: string | null;
         builder: string | null;
+        watchPatterns: string[] | null;
         source: { image: string | null; repo: string | null } | null;
         latestDeployment: { id: string; status: string; createdAt: string } | null;
       } | null;
     }>(
       scope.kind,
-      "query instance($serviceId: String!, $environmentId: String!) { serviceInstance(serviceId: $serviceId, environmentId: $environmentId) { rootDirectory builder source { image repo } latestDeployment { id status createdAt } } }",
+      "query instance($serviceId: String!, $environmentId: String!) { serviceInstance(serviceId: $serviceId, environmentId: $environmentId) { rootDirectory builder watchPatterns source { image repo } latestDeployment { id status createdAt } } }",
       { serviceId: node.id, environmentId: scope.environmentId },
     ).catch(() => null);
 
@@ -1906,6 +2094,12 @@ export class AutomationEngine extends DurableObject<Env> {
         .map((entry) => ({ domain: entry.domain, targetPort: entry.targetPort })),
       variableKeys: Object.keys(variables?.variables ?? {}).sort(),
       volumeMounts: mounts.filter((mount) => mount.serviceId === node.id).map((mount) => mount.mountPath),
+      autoDeploy: this.autoDeployFor(
+        node.id,
+        instance?.serviceInstance?.source?.repo ?? null,
+        instance?.serviceInstance?.watchPatterns ?? [],
+        triggers,
+      ),
     };
   }
 
@@ -1917,6 +2111,49 @@ export class AutomationEngine extends DurableObject<Env> {
     ).catch(() => null);
     if (!data) return [];
     return data.buildLogs.map((entry) => entry.message.replace(/\s+$/, "")).filter((line) => line.length > 0).slice(-60);
+  }
+
+  /**
+   * Maps a failed build log onto a known cause. Only engine-authored text is
+   * returned, so the log itself never leaves the authenticated console.
+   */
+  private classifyBuildFailure(log: string[]): BuildFailure | null {
+    if (log.length === 0) return null;
+    const text = log.join("\n").toLowerCase();
+    // A handful of lines means Docker never really started: the source could not be
+    // fetched, so there was nothing to build.
+    if (log.length <= 6) {
+      return { code: "no_build_output", hint: "The build stopped almost immediately with no Docker output, which means the platform could not fetch the source it was told to build." };
+    }
+    const rules: Array<{ test: RegExp; code: string; hint: string }> = [
+      { test: /failed to (read|compute cache key for|solve).*dockerfile|dockerfile.*(not found|does not exist)|cannot locate specified dockerfile/, code: "dockerfile_missing", hint: "Railway cannot find the Dockerfile, so it is building from the repository root instead of the connector folder." },
+      { test: /composer\.json.*(no such file|not found)|failed to compute cache key.*composer/, code: "context_missing", hint: "The build folder has no composer.json, so Railway is building the wrong directory." },
+      { test: /requires ext-|the requested php extension|php extension .{1,40} is missing/, code: "missing_extension", hint: "A PHP extension the Telegram library needs is not compiled into the image." },
+      { test: /your requirements could not be resolved|could not find a version of package|no matching package found/, code: "dependency_resolution", hint: "Composer could not resolve the dependency set against the pinned PHP version." },
+      { test: /killed|out of memory|cannot allocate memory|signal: killed|exit code: 137/, code: "out_of_memory", hint: "The build ran out of memory, usually while Composer resolved dependencies." },
+      { test: /e: unable to locate package|e: failed to fetch|apt-get.{0,40}(error|failed)/, code: "apt_failure", hint: "A Debian system package could not be installed during the build." },
+      { test: /manifest unknown|pull access denied|manifest for .{1,60} not found|failed to resolve source metadata/, code: "base_image", hint: "One of the pinned base images could not be pulled." },
+      { test: /temporary failure in name resolution|could not resolve host|connection timed out/, code: "network", hint: "The build could not reach the network reliably." },
+      { test: /permission denied/, code: "permissions", hint: "A file could not be read or executed during the build." },
+    ];
+    for (const rule of rules) {
+      if (rule.test.test(text)) return { code: rule.code, hint: rule.hint };
+    }
+    return { code: "unknown", hint: "The build failed for a reason the console does not recognise yet. Open the Hosting inspector to read the log." };
+  }
+
+  /** Fetches and classifies the newest build log for a service, when it failed. */
+  private async buildFailureFor(scope: RailwayScope, serviceId: string, status: string | null): Promise<{ failure: BuildFailure | null; lines: number }> {
+    if (status === null || status === "SUCCESS") return { failure: null, lines: 0 };
+    const instance = await this.railwayQuery<{ serviceInstance: { latestDeployment: { id: string } | null } | null }>(
+      scope.kind,
+      "query instance($serviceId: String!, $environmentId: String!) { serviceInstance(serviceId: $serviceId, environmentId: $environmentId) { latestDeployment { id } } }",
+      { serviceId, environmentId: scope.environmentId },
+    ).catch(() => null);
+    const deploymentId = instance?.serviceInstance?.latestDeployment?.id;
+    if (!deploymentId) return { failure: null, lines: 0 };
+    const log = await this.hostingBuildLog(scope, deploymentId);
+    return { failure: this.classifyBuildFailure(log), lines: log.length };
   }
 
   /** Turns raw Railway facts into plain-language reasons the address is not serving. */
@@ -1961,9 +2198,10 @@ export class AutomationEngine extends DurableObject<Env> {
     }
 
     const mounts = await this.railwayMounts(scope);
+    const triggers = await this.railwayTriggers(scope);
     const nodes = await this.railwayServices(scope);
     const services: HostingServiceReport[] = [];
-    for (const node of nodes.slice(0, 8)) services.push(await this.hostingServiceReport(scope, node, mounts));
+    for (const node of nodes.slice(0, 8)) services.push(await this.hostingServiceReport(scope, node, mounts, triggers));
 
     const broken = services.find((service) => service.latestStatus !== null && service.latestStatus !== "SUCCESS");
     let buildLog: string[] = [];
@@ -2004,26 +2242,36 @@ export class AutomationEngine extends DurableObject<Env> {
     return this.hmac(material, "replyflow/connector/session-key");
   }
 
-  /** Pushes the connector's settings, disk and port to Railway, then redeploys it. */
   private async handleHostingApply(): Promise<Response> {
+    const result = await this.applyHostingConfig();
+    if (!result.ok) return Response.json({ error: result.error ?? "The hosting fix could not be applied." }, { status: 502 });
+    return Response.json({ applied: result.applied, report: await this.hostingDiagnose() });
+  }
+
+  /**
+   * Pushes the connector's settings, build folder, disk and port to Railway, then
+   * redeploys. Shared by the console button and the unattended watchdog repair.
+   */
+  private async applyHostingConfig(): Promise<HostingApplyResult> {
     const credentials = this.presetCredentials();
     const sharedSecret = this.env.CONNECTOR_SHARED_SECRET?.trim();
     const sessionKey = await this.connectorSessionKey();
-    if (!this.railwayToken()) return Response.json({ error: "No hosting token is stored yet." }, { status: 400 });
-    if (!credentials) return Response.json({ error: "A valid Telegram app ID and 32-character hash must be stored on the engine first." }, { status: 400 });
-    if (!sharedSecret) return Response.json({ error: "CONNECTOR_SHARED_SECRET is not stored on the engine." }, { status: 400 });
-    if (!sessionKey) return Response.json({ error: "CREDENTIAL_ENCRYPTION_KEY is not stored on the engine." }, { status: 400 });
+    const fail = (code: HostingApplyCode, error: string): HostingApplyResult => ({ ok: false, applied: [], error, code });
+    if (!this.railwayToken()) return fail("no_token", "No hosting token is stored yet.");
+    if (!credentials) return fail("no_credentials", "A valid Telegram app ID and 32-character hash must be stored on the engine first.");
+    if (!sharedSecret) return fail("no_shared_secret", "CONNECTOR_SHARED_SECRET is not stored on the engine.");
+    if (!sessionKey) return fail("no_session_key", "CREDENTIAL_ENCRYPTION_KEY is not stored on the engine.");
 
     let scope: RailwayScope;
     try {
       scope = await this.railwayScope();
     } catch (failure) {
-      return Response.json({ error: failure instanceof Error ? failure.message : "The hosting token could not be verified." }, { status: 502 });
+      return fail("token_rejected", failure instanceof Error ? failure.message : "The hosting token could not be verified.");
     }
 
     const nodes = await this.railwayServices(scope);
     const target = nodes.find((node) => /connector|reply|telego/i.test(node.name)) ?? nodes[0];
-    if (!target) return Response.json({ error: "This project has no service to configure. Create one from the connector folder first." }, { status: 409 });
+    if (!target) return fail("no_service", "This project has no service to configure. Create one from the connector folder first.");
 
     const controlPlane = this.kvGet<string | null>("publicOrigin", null) ?? "";
     const applied: string[] = [];
@@ -2053,7 +2301,24 @@ export class AutomationEngine extends DurableObject<Env> {
       applied.push("Stored the six connector settings.");
     } catch (failure) {
       const detail = failure instanceof Error ? failure.message : "unknown error";
-      return Response.json({ error: `Could not store the connector settings: ${detail}` }, { status: 502 });
+      return fail("settings_rejected", `Could not store the connector settings: ${detail}`);
+    }
+
+    // The connector lives in a subfolder, so Railway must build from there rather
+    // than the repository root, and only rebuild when that subfolder changes.
+    try {
+      await this.railwayQuery(
+        scope.kind,
+        "mutation updateInstance($serviceId: String!, $environmentId: String, $input: ServiceInstanceUpdateInput!) { serviceInstanceUpdate(serviceId: $serviceId, environmentId: $environmentId, input: $input) }",
+        {
+          serviceId: target.id,
+          environmentId: scope.environmentId,
+          input: { rootDirectory: CONNECTOR_ROOT_DIRECTORY, watchPatterns: CONNECTOR_WATCH_PATTERNS, healthcheckPath: "/health" },
+        },
+      );
+      applied.push(`Set the build folder to "${CONNECTOR_ROOT_DIRECTORY}" and the health check to /health.`);
+    } catch (failure) {
+      applied.push(`Could not set the build folder: ${failure instanceof Error ? failure.message : "unknown error"}`);
     }
 
     const mounts = await this.railwayMounts(scope);
@@ -2115,7 +2380,278 @@ export class AutomationEngine extends DurableObject<Env> {
     }
 
     this.log("info", "hosting.apply", `Applied hosting configuration to "${target.name}".`);
-    return Response.json({ applied, report: await this.hostingDiagnose() });
+    return { ok: true, applied, error: null, code: "ok" };
+  }
+
+  /** Cached-only snapshot; performs no outbound calls so it is safe to leave open. */
+  private publicStatus(): PublicStatus {
+    const probe = this.kvGet<ConnectorProbe>("connectorProbe", EMPTY_PROBE);
+    const history = this.kvGet<HealthSample[]>("healthHistory", []);
+    const facts = this.kvGet<HostingFacts | null>("hostingFacts", null);
+    const repair = this.kvGet<AutoRepairState>("autoRepair", EMPTY_REPAIR);
+    return {
+      reachable: probe.reachable,
+      uptimePct: this.uptimeFrom(history).uptimePct,
+      sampleCount: history.length,
+      buildStatus: facts?.status ?? null,
+      autoDeployEnabled: facts?.autoDeploy.enabled ?? false,
+      tokenAccepted: facts?.tokenOk ?? null,
+      serviceCount: facts?.serviceCount ?? null,
+      sourceKind: facts?.sourceKind ?? null,
+      rootDirectory: facts?.rootDirectory ?? null,
+      buildLogLines: facts?.buildLogLines ?? null,
+      buildFailure: facts?.failure ?? null,
+      repair: { attempts: repair.attempts, exhausted: repair.attempts >= AUTO_REPAIR_MAX_ATTEMPTS, code: repair.lastCode ?? null },
+      checkedAt: Date.now(),
+    };
+  }
+
+  /**
+   * Arms or disarms build-on-push for the connector service. Enabling connects the
+   * repository when one is supplied, then creates the push trigger Railway watches.
+   */
+  private async handleAutoDeploy(request: Request): Promise<Response> {
+    const body = (await request.json().catch(() => ({}))) as { enabled?: boolean; repository?: string; branch?: string };
+    const enabled = body.enabled !== false;
+    const requestedRepo = (body.repository ?? "").trim();
+    const requestedBranch = (body.branch ?? "").trim();
+    if (requestedRepo.length > 0 && !/^[\w.-]+\/[\w.-]+$/.test(requestedRepo)) {
+      return Response.json({ error: "A repository looks like owner/name, for example acme/replyflow." }, { status: 400 });
+    }
+    if (!this.railwayToken()) return Response.json({ error: "No hosting token is stored yet." }, { status: 400 });
+
+    let scope: RailwayScope;
+    try {
+      scope = await this.railwayScope();
+    } catch (failure) {
+      return Response.json({ error: failure instanceof Error ? failure.message : "The hosting token could not be verified." }, { status: 502 });
+    }
+
+    const nodes = await this.railwayServices(scope);
+    const target = nodes.find((node) => /connector|reply|telego/i.test(node.name)) ?? nodes[0];
+    if (!target) return Response.json({ error: "This project has no service to arm." }, { status: 409 });
+
+    const triggers = await this.railwayTriggers(scope);
+    const mine = triggers.filter((entry) => entry.serviceId === target.id);
+    const applied: string[] = [];
+
+    if (!enabled) {
+      for (const trigger of mine) {
+        try {
+          await this.railwayQuery(scope.kind, "mutation removeTrigger($id: String!) { deploymentTriggerDelete(id: $id) }", { id: trigger.id });
+          applied.push(`Removed the push trigger on ${trigger.branch ?? "the default branch"}.`);
+        } catch (failure) {
+          applied.push(`Could not remove a push trigger: ${failure instanceof Error ? failure.message : "unknown error"}`);
+        }
+      }
+      if (mine.length === 0) applied.push("There was no push trigger to remove.");
+      this.kvPut("autoDeployWanted", false);
+      this.log("info", "hosting.autodeploy", "Build-on-push disabled for the connector service.");
+      return Response.json({ applied, status: await this.hostingStatus(true) });
+    }
+
+    const instance = await this.railwayQuery<{ serviceInstance: { source: { repo: string | null } | null } | null }>(
+      scope.kind,
+      "query instance($serviceId: String!, $environmentId: String!) { serviceInstance(serviceId: $serviceId, environmentId: $environmentId) { source { repo } } }",
+      { serviceId: target.id, environmentId: scope.environmentId },
+    ).catch(() => null);
+
+    const connected = instance?.serviceInstance?.source?.repo ?? null;
+    const repository = requestedRepo.length > 0 ? requestedRepo : (connected ?? mine[0]?.repository ?? null);
+    if (!repository) {
+      return Response.json({
+        error: "This service has no repository attached, so a push has nothing to react to. Supply the repository as owner/name, or connect it in the hosting dashboard first.",
+      }, { status: 409 });
+    }
+    const branch = requestedBranch.length > 0 ? requestedBranch : (mine[0]?.branch ?? DEFAULT_BRANCH);
+
+    if (repository !== connected) {
+      try {
+        await this.railwayQuery(
+          scope.kind,
+          "mutation connect($id: String!, $input: ServiceConnectInput!) { serviceConnect(id: $id, input: $input) { id } }",
+          { id: target.id, input: { repo: repository, branch } },
+        );
+        applied.push(`Connected ${repository} on branch ${branch}.`);
+      } catch (failure) {
+        return Response.json({ error: `Could not connect ${repository}: ${failure instanceof Error ? failure.message : "unknown error"}` }, { status: 502 });
+      }
+    }
+
+    // A trigger left on another branch would keep firing, so replace rather than stack.
+    for (const stale of mine.filter((entry) => entry.branch !== branch)) {
+      await this.railwayQuery(scope.kind, "mutation removeTrigger($id: String!) { deploymentTriggerDelete(id: $id) }", { id: stale.id }).catch(() => undefined);
+    }
+    if (!mine.some((entry) => entry.branch === branch)) {
+      try {
+        await this.railwayQuery(
+          scope.kind,
+          "mutation addTrigger($input: DeploymentTriggerCreateInput!) { deploymentTriggerCreate(input: $input) { id } }",
+          {
+            input: {
+              projectId: scope.projectId,
+              environmentId: scope.environmentId,
+              serviceId: target.id,
+              provider: "github",
+              repository,
+              branch,
+              rootDirectory: CONNECTOR_ROOT_DIRECTORY,
+              checkSuites: false,
+            },
+          },
+        );
+        applied.push(`Armed a build whenever ${branch} receives a push.`);
+      } catch (failure) {
+        return Response.json({ error: `Could not arm the push trigger: ${failure instanceof Error ? failure.message : "unknown error"}` }, { status: 502 });
+      }
+    } else {
+      applied.push(`A push trigger on ${branch} was already armed.`);
+    }
+
+    try {
+      await this.railwayQuery(
+        scope.kind,
+        "mutation updateInstance($serviceId: String!, $environmentId: String, $input: ServiceInstanceUpdateInput!) { serviceInstanceUpdate(serviceId: $serviceId, environmentId: $environmentId, input: $input) }",
+        { serviceId: target.id, environmentId: scope.environmentId, input: { watchPatterns: CONNECTOR_WATCH_PATTERNS, rootDirectory: CONNECTOR_ROOT_DIRECTORY } },
+      );
+      applied.push(`Limited rebuilds to changes under ${CONNECTOR_WATCH_PATTERNS.join(", ")}.`);
+    } catch (failure) {
+      applied.push(`Could not limit which changes rebuild: ${failure instanceof Error ? failure.message : "unknown error"}`);
+    }
+
+    this.kvPut("autoDeployWanted", true);
+    this.log("success", "hosting.autodeploy", `Build-on-push armed for ${repository} on ${branch}.`);
+    return Response.json({ applied, status: await this.hostingStatus(true) });
+  }
+
+  /**
+   * Live status for the dashboard. The connector is probed on every call; the slower
+   * Railway build facts are cached so a 30s poll stays well inside rate limits.
+   */
+  private async hostingStatus(force = false): Promise<HostingStatus> {
+    const probe = await this.probeConnector();
+    const history = this.kvGet<HealthSample[]>("healthHistory", []);
+    const uptime = this.uptimeFrom(history);
+    const cached = this.kvGet<HostingFacts | null>("hostingFacts", null);
+    const stale = !cached || Date.now() - cached.refreshedAt > HOSTING_CACHE_MS;
+
+    let facts = cached;
+    if ((force || stale) && this.railwayToken()) {
+      facts = await this.readHostingFacts().catch(() => facts);
+      if (facts) this.kvPut("hostingFacts", facts);
+    }
+
+    const repair = this.kvGet<AutoRepairState>("autoRepair", EMPTY_REPAIR);
+    return {
+      probe,
+      uptimePct: uptime.uptimePct,
+      windowMs: uptime.windowMs,
+      sampleCount: history.length,
+      onlineSince: uptime.onlineSince,
+      lastDownAt: uptime.lastDownAt,
+      history: history.slice(-60),
+      build: { serviceName: facts?.serviceName ?? null, status: facts?.status ?? null, at: facts?.at ?? null, refreshedAt: facts?.refreshedAt ?? null, failure: facts?.failure ?? null },
+      autoDeploy: facts?.autoDeploy ?? EMPTY_AUTODEPLOY,
+      repair: {
+        attempts: repair.attempts,
+        lastAt: repair.lastAt,
+        nextAt: repair.nextAt,
+        lastDetail: repair.lastDetail,
+        exhausted: repair.attempts >= AUTO_REPAIR_MAX_ATTEMPTS,
+      },
+      checkedAt: Date.now(),
+    };
+  }
+
+  private async readHostingFacts(): Promise<HostingFacts> {
+    let scope: RailwayScope;
+    try {
+      scope = await this.railwayScope();
+    } catch (failure) {
+      const detail = failure instanceof Error ? failure.message : "The hosting token could not be verified.";
+      return { serviceName: null, status: null, at: null, autoDeploy: { ...EMPTY_AUTODEPLOY, detail }, refreshedAt: Date.now(), tokenOk: false, serviceCount: 0, failure: null, sourceKind: null, rootDirectory: null, buildLogLines: 0 };
+    }
+    const nodes = await this.railwayServices(scope);
+    const target = nodes.find((node) => /connector|reply|telego/i.test(node.name)) ?? nodes[0];
+    if (!target) {
+      return {
+        serviceName: null,
+        status: null,
+        at: null,
+        autoDeploy: { ...EMPTY_AUTODEPLOY, detail: "This project has no service yet." },
+        refreshedAt: Date.now(),
+        tokenOk: true,
+        serviceCount: 0,
+        failure: null,
+        sourceKind: null,
+        rootDirectory: null,
+        buildLogLines: 0,
+      };
+    }
+    const triggers = await this.railwayTriggers(scope);
+    const mounts = await this.railwayMounts(scope);
+    const report = await this.hostingServiceReport(scope, target, mounts, triggers);
+    const diagnosis = await this.buildFailureFor(scope, target.id, report.latestStatus);
+    return {
+      serviceName: report.name,
+      status: report.latestStatus,
+      at: report.latestAt,
+      autoDeploy: report.autoDeploy,
+      refreshedAt: Date.now(),
+      tokenOk: true,
+      serviceCount: nodes.length,
+      failure: diagnosis.failure,
+      sourceKind: report.source === null ? null : /\//.test(report.source) && !report.source.includes(":") ? "repo" : "image",
+      rootDirectory: report.rootDirectory,
+      buildLogLines: diagnosis.lines,
+    };
+  }
+
+  /** Read-only Railway refresh used by the watchdog so status stays current unattended. */
+  private async refreshHostingFacts(): Promise<void> {
+    if (!this.railwayToken()) return;
+    const cached = this.kvGet<HostingFacts | null>("hostingFacts", null);
+    if (cached && Date.now() - cached.refreshedAt < HOSTING_CACHE_MS) return;
+    const facts = await this.readHostingFacts().catch(() => null);
+    if (facts) this.kvPut("hostingFacts", facts);
+  }
+
+  /**
+   * Unattended recovery: when the connector is unreachable and a hosting token is
+   * stored, re-apply the configuration and redeploy. Backed off exponentially and
+   * capped, so a genuinely broken build is never redeployed in a loop.
+   */
+  private async autoRepairHosting(probe: ConnectorProbe): Promise<void> {
+    const state = this.kvGet<AutoRepairState>("autoRepair", EMPTY_REPAIR);
+    if (probe.reachable) {
+      if (state.attempts !== 0) this.kvPut("autoRepair", EMPTY_REPAIR);
+      return;
+    }
+    if (!this.railwayToken() || !this.presetCredentials()) return;
+    const now = Date.now();
+    if (state.nextAt !== null && now < state.nextAt) return;
+    if (state.attempts >= AUTO_REPAIR_MAX_ATTEMPTS) return;
+
+    const attempts = state.attempts + 1;
+    const result = await this.applyHostingConfig().catch((failure: unknown) => {
+      const error = failure instanceof Error ? failure.message : "unknown error";
+      return { ok: false, applied: [], error, code: "settings_rejected" } satisfies HostingApplyResult;
+    });
+    const detail = result.ok ? (result.applied[result.applied.length - 1] ?? "Redeploy started.") : (result.error ?? "unknown error");
+    // Exponential backoff leaves room for a build to finish before the next attempt.
+    const nextAt = now + AUTO_REPAIR_COOLDOWN_MS * 2 ** (attempts - 1);
+    this.kvPut("autoRepair", { attempts, lastAt: now, nextAt, lastDetail: detail, lastCode: result.code } satisfies AutoRepairState);
+    this.log(
+      result.ok ? "warn" : "error",
+      "hosting.autorepair",
+      result.ok
+        ? `Connector was unreachable, so a redeploy was started automatically (attempt ${attempts} of ${AUTO_REPAIR_MAX_ATTEMPTS}).`
+        : `Automatic repair attempt ${attempts} failed: ${detail}`,
+    );
+    if (attempts >= AUTO_REPAIR_MAX_ATTEMPTS) {
+      this.log("error", "hosting.autorepair", "Automatic repair has given up. Open the Hosting inspector and read the build log.");
+      this.ctx.waitUntil(this.sendOperationalAlert("ReplyFlow: automatic hosting repair gave up after repeated failures."));
+    }
   }
 
   private async refreshConnectorHealth(): Promise<void> {

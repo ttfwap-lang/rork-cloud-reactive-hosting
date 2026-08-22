@@ -54,7 +54,17 @@ export default {
       return new Response(null, { status: 204, headers: corsHeaders(request, env) });
     }
 
-    if (path === "/ping") return withCors(Response.json({ ok: true, now: new Date().toISOString() }), request, env);
+    // Doubles as a keep-alive: it guarantees the engine's heartbeat alarm exists so
+    // automation keeps running with no console open. Returns no state of any kind.
+    // Value-free operational summary: booleans, counts and engine-generated codes only.
+    if (path === "/status") {
+      return withCors(await env.DO.fetch(toEngine(request, "/status/public", publicOrigin)), request, env);
+    }
+
+    if (path === "/ping") {
+      await env.DO.fetch(toEngine(request, "/wake", publicOrigin)).catch(() => undefined);
+      return withCors(Response.json({ ok: true, now: new Date().toISOString() }), request, env);
+    }
 
     if (path.startsWith("/tg/") && request.method === "POST") {
       const secret = path.slice("/tg/".length);

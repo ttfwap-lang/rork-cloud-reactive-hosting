@@ -177,7 +177,34 @@ export type ConversationAnalysis = {
   }>;
 };
 
-export type ConnectorProbe = { reachable: boolean; detail: string; checkedAt: number | null; workerAgeSeconds: number | null };
+export type ConnectorProbe = { reachable: boolean; detail: string; checkedAt: number | null; workerAgeSeconds: number | null; latencyMs: number | null };
+
+export type HostingAutoDeploy = {
+  enabled: boolean;
+  repository: string | null;
+  branch: string | null;
+  watchPatterns: string[];
+  detail: string;
+};
+
+export type HealthSample = { t: number; up: boolean; ms: number | null };
+
+/** Plain-language cause of a failed build, derived from the log but never quoting it. */
+export type BuildFailure = { code: string; hint: string };
+
+export type HostingStatus = {
+  probe: ConnectorProbe;
+  uptimePct: number | null;
+  windowMs: number;
+  sampleCount: number;
+  onlineSince: number | null;
+  lastDownAt: number | null;
+  history: HealthSample[];
+  build: { serviceName: string | null; status: string | null; at: number | null; refreshedAt: number | null; failure: BuildFailure | null };
+  autoDeploy: HostingAutoDeploy;
+  repair: { attempts: number; lastAt: number | null; nextAt: number | null; lastDetail: string | null; exhausted: boolean };
+  checkedAt: number;
+};
 
 export type HostingServiceReport = {
   id: string;
@@ -190,6 +217,7 @@ export type HostingServiceReport = {
   domains: Array<{ domain: string; targetPort: number | null }>;
   variableKeys: string[];
   volumeMounts: string[];
+  autoDeploy: HostingAutoDeploy;
 };
 
 export type HostingReport = {
@@ -268,6 +296,9 @@ export const api = {
   checkConnector: () => call<{ probe: ConnectorProbe }>("/connector/check", {}),
   diagnoseHosting: () => call<{ report: HostingReport }>("/hosting/diagnose", {}),
   applyHosting: () => call<{ applied: string[]; report: HostingReport }>("/hosting/apply", {}),
+  hostingStatus: () => call<{ status: HostingStatus }>("/hosting/status", {}),
+  setAutoDeploy: (input: { enabled: boolean; repository?: string; branch?: string }) =>
+    call<{ applied: string[]; status: HostingStatus }>("/hosting/autodeploy", input),
   reconnect: () => call<{ link: LinkState }>("/link/reconnect", {}),
   disconnect: () => call<{ link: LinkState }>("/link/disconnect", {}),
   forgetConnection: () => call<{ link: LinkState }>("/link/forget", {}),
