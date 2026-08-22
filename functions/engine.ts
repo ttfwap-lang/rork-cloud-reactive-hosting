@@ -25,6 +25,14 @@ const CONNECTOR_ROOT_DIRECTORY = "connector";
 /** Only connector changes should trigger a rebuild; console-only pushes must not. */
 const CONNECTOR_WATCH_PATTERNS = ["connector/**"];
 const DEFAULT_BRANCH = "main";
+/** The repository this connector is built from. Verified before every rebuild. */
+const CONNECTOR_REPOSITORY = "ttfwap-lang/rork-cloud-reactive-hosting";
+const GITHUB_API = "https://api.github.com";
+const GITHUB_RAW = "https://raw.githubusercontent.com";
+/** The source check is cheap but rate limited, so a decisive answer is cached. */
+const SOURCE_CHECK_CACHE_MS = 10 * 60_000;
+/** An inconclusive answer is a transient failure, so it is retried far sooner. */
+const SOURCE_CHECK_RETRY_MS = 60_000;
 /** ~4 hours of one-minute samples. */
 const HEALTH_HISTORY_MAX = 240;
 /** Railway facts are refreshed at most this often, so 30s polling stays cheap. */
@@ -86,6 +94,21 @@ export type HostingAutoDeploy = {
   detail: string;
 };
 
+/**
+ * Whether the repository the platform is told to build actually exists, on that
+ * branch, with the connector folder in it.
+ */
+export type SourceCheckState = "ok" | "missing_connector" | "not_found" | "unverified";
+export type SourceCheck = {
+  repository: string;
+  branch: string;
+  state: SourceCheckState;
+  commitSha: string | null;
+  detail: string;
+  checkedAt: number;
+};
+const EMPTY_SOURCE: SourceCheck = { repository: CONNECTOR_REPOSITORY, branch: DEFAULT_BRANCH, state: "unverified", commitSha: null, detail: "Not checked yet.", checkedAt: 0 };
+
 export type HealthSample = { t: number; up: boolean; ms: number | null };
 
 /** Everything the live status dashboard renders, refreshed on a 30s poll. */
@@ -99,6 +122,7 @@ export type HostingStatus = {
   history: HealthSample[];
   build: { serviceName: string | null; status: string | null; at: number | null; refreshedAt: number | null; failure: BuildFailure | null };
   autoDeploy: HostingAutoDeploy;
+  source: SourceCheck;
   repair: { attempts: number; lastAt: number | null; nextAt: number | null; lastDetail: string | null; exhausted: boolean };
   checkedAt: number;
 };
@@ -133,8 +157,13 @@ export type HostingApplyCode =
   | "no_service"
   | "settings_rejected";
 type HostingApplyResult = { ok: boolean; applied: string[]; error: string | null; code: HostingApplyCode };
-type AutoRepairState = { attempts: number; lastAt: number | null; nextAt: number | null; lastDetail: string | null; lastCode: HostingApplyCode | null };
-const EMPTY_REPAIR: AutoRepairState = { attempts: 0, lastAt: null, nextAt: null, lastDetail: null, lastCode: null };
+type AutoRepairState = { attempts: number; lastAt: number | null; nextAt: number | null; lastDetail: string | null; lastCode: HostingApplyCode | null; version: number };
+/**
+ * Bumped whenever the repair routine itself changes. A stored count of failures
+ * from an older routine says nothing about the new one, so it is discarded.
+ */
+const REPAIR_LOGIC_VERSION = 2;
+const EMPTY_REPAIR: AutoRepairState = { attempts: 0, lastAt: null, nextAt: null, lastDetail: null, lastCode: null, version: REPAIR_LOGIC_VERSION };
 
 /**
  * Unauthenticated status summary. Deliberately carries no project, service,
@@ -152,6 +181,7 @@ export type PublicStatus = {
   rootDirectory: string | null;
   buildLogLines: number | null;
   buildFailure: BuildFailure | null;
+  sourceState: SourceCheckState | null;
   repair: { attempts: number; exhausted: boolean; code: HostingApplyCode | null };
   checkedAt: number;
 };
@@ -2243,6 +2273,93 @@ export class AutomationEngine extends DurableObject<Env> {
     return this.hmac(material, "replyflow/connector/session-key");
   }
 
+  /**
+   * Confirms the repository exists, on that branch, with the connector folder in
+   * it. A build log cannot tell "the platform could not fetch the source" apart
+   * from "there was nothing there to fetch"; this check settles which it is.
+   */
+  private async verifySource(repository: string, branch: string, force = false): Promise<SourceCheck> {
+    const cached = this.kvGet<SourceCheck | null>("sourceCheck", null);
+    // A failed check must not be held as long as a real answer, or one rate-limited
+    // moment would be reported as the truth for the next ten minutes.
+    const ttl = cached?.state === "unverified" ? SOURCE_CHECK_RETRY_MS : SOURCE_CHECK_CACHE_MS;
+    if (!force && cached !== null && cached.repository === repository && cached.branch === branch && Date.now() - cached.checkedAt < ttl) {
+      return cached;
+    }
+
+    const finish = (state: SourceCheckState, detail: string, commitSha: string | null): SourceCheck => {
+      const check: SourceCheck = { repository, branch, state, commitSha, detail, checkedAt: Date.now() };
+      this.kvPut("sourceCheck", check);
+      return check;
+    };
+
+    // The raw file host is used rather than the code host's API because the API
+    // rate limits by source address, and this engine shares its outbound address
+    // with everything else on the same edge network.
+    const raw = (path: string): Promise<Response | null> =>
+      fetch(`${GITHUB_RAW}/${repository}/${encodeURIComponent(branch)}/${path}`, {
+        headers: { "User-Agent": "ReplyFlow-Engine" },
+        cf: { cacheTtl: 60, cacheEverything: false },
+      }).catch(() => null);
+
+    const dockerfile = await raw(`${CONNECTOR_ROOT_DIRECTORY}/Dockerfile`);
+    if (dockerfile === null) return finish("unverified", "The code host could not be reached, so the source could not be checked.", null);
+
+    const sha = await this.sourceCommit(repository, branch);
+    if (dockerfile.ok) {
+      return finish("ok", `${repository} has the connector folder on ${branch}, so the source itself is sound.`, sha);
+    }
+    if (dockerfile.status !== 404) {
+      return finish("unverified", `The code host answered with status ${dockerfile.status}, so the source could not be confirmed.`, sha);
+    }
+
+    // A 404 is ambiguous on its own: the branch may be missing, or the branch may
+    // be fine and only the connector folder absent. A root file settles it.
+    const marker = await raw("rork.json");
+    if (marker !== null && marker.ok) {
+      return finish("missing_connector", `${repository} has no ${CONNECTOR_ROOT_DIRECTORY} folder on ${branch}, so there is nothing to build.`, sha);
+    }
+    return finish("not_found", `No branch "${branch}" was found in ${repository}, or the repository is private.`, sha);
+  }
+
+  /** Best-effort short commit id. Never fatal: the source verdict does not depend on it. */
+  private async sourceCommit(repository: string, branch: string): Promise<string | null> {
+    const response = await fetch(`${GITHUB_API}/repos/${repository}/commits/${encodeURIComponent(branch)}`, {
+      headers: { "User-Agent": "ReplyFlow-Engine", Accept: "application/vnd.github+json" },
+    }).catch(() => null);
+    if (response === null || !response.ok) return null;
+    const commit = (await response.json().catch(() => null)) as { sha?: string } | null;
+    return typeof commit?.sha === "string" ? commit.sha.slice(0, 12) : null;
+  }
+
+  /**
+   * Re-establishes the link between the service and the repository. Re-issuing the
+   * connection is the one repair available from here when the platform can see the
+   * name of a source but cannot pull from it, which is what a build that produces
+   * no output means. The source is verified first so a genuinely absent folder is
+   * reported rather than silently reconnected.
+   */
+  private async ensureSource(scope: RailwayScope, serviceId: string, branch: string): Promise<string[]> {
+    const applied: string[] = [];
+    const check = await this.verifySource(CONNECTOR_REPOSITORY, branch, true);
+    if (check.state === "not_found" || check.state === "missing_connector") {
+      applied.push(check.detail);
+      return applied;
+    }
+
+    try {
+      await this.railwayQuery(
+        scope.kind,
+        "mutation connect($id: String!, $input: ServiceConnectInput!) { serviceConnect(id: $id, input: $input) { id } }",
+        { id: serviceId, input: { repo: CONNECTOR_REPOSITORY, branch } },
+      );
+      applied.push(`Reconnected the service to ${CONNECTOR_REPOSITORY} on ${branch}.`);
+    } catch (failure) {
+      applied.push(`Could not reconnect the repository: ${failure instanceof Error ? failure.message : "unknown error"}`);
+    }
+    return applied;
+  }
+
   private async handleHostingApply(): Promise<Response> {
     const result = await this.applyHostingConfig();
     if (!result.ok) return Response.json({ error: result.error ?? "The hosting fix could not be applied." }, { status: 502 });
@@ -2321,6 +2438,10 @@ export class AutomationEngine extends DurableObject<Env> {
     } catch (failure) {
       applied.push(`Could not set the build folder: ${failure instanceof Error ? failure.message : "unknown error"}`);
     }
+
+    // A build that produced no output never fetched the source, so re-establish
+    // that link before spending another build on it.
+    applied.push(...(await this.ensureSource(scope, target.id, DEFAULT_BRANCH)));
 
     const mounts = await this.railwayMounts(scope);
     const hasDisk = mounts.some((mount) => mount.serviceId === target.id && mount.mountPath === CONNECTOR_MOUNT_PATH);
@@ -2491,6 +2612,8 @@ export class AutomationEngine extends DurableObject<Env> {
     if (!target) return Response.json({ error: "This project has no service to rebuild." }, { status: 409 });
 
     const applied: string[] = [];
+    const branch = requestedBranch.length > 0 ? requestedBranch : DEFAULT_BRANCH;
+    applied.push(...(await this.ensureSource(scope, target.id, branch)));
     if (requestedBranch.length > 0) applied.push(...(await this.pinBranch(scope, target.id, requestedBranch)));
 
     try {
@@ -2523,6 +2646,7 @@ export class AutomationEngine extends DurableObject<Env> {
       rootDirectory: facts?.rootDirectory ?? null,
       buildLogLines: facts?.buildLogLines ?? null,
       buildFailure: facts?.failure ?? null,
+      sourceState: this.kvGet<SourceCheck | null>("sourceCheck", null)?.state ?? null,
       repair: { attempts: repair.attempts, exhausted: repair.attempts >= AUTO_REPAIR_MAX_ATTEMPTS, code: repair.lastCode ?? null },
       checkedAt: Date.now(),
     };
@@ -2674,6 +2798,7 @@ export class AutomationEngine extends DurableObject<Env> {
       history: history.slice(-60),
       build: { serviceName: facts?.serviceName ?? null, status: facts?.status ?? null, at: facts?.at ?? null, refreshedAt: facts?.refreshedAt ?? null, failure: facts?.failure ?? null },
       autoDeploy: facts?.autoDeploy ?? EMPTY_AUTODEPLOY,
+      source: await this.verifySource(CONNECTOR_REPOSITORY, facts?.autoDeploy.branch ?? DEFAULT_BRANCH, force).catch(() => EMPTY_SOURCE),
       repair: {
         attempts: repair.attempts,
         lastAt: repair.lastAt,
@@ -2736,6 +2861,8 @@ export class AutomationEngine extends DurableObject<Env> {
     if (cached && Date.now() - cached.refreshedAt < HOSTING_CACHE_MS) return;
     const facts = await this.readHostingFacts().catch(() => null);
     if (facts) this.kvPut("hostingFacts", facts);
+    // Keeps the unauthenticated summary honest without anyone opening the console.
+    await this.verifySource(CONNECTOR_REPOSITORY, facts?.autoDeploy.branch ?? DEFAULT_BRANCH).catch(() => undefined);
   }
 
   /**
@@ -2744,7 +2871,11 @@ export class AutomationEngine extends DurableObject<Env> {
    * capped, so a genuinely broken build is never redeployed in a loop.
    */
   private async autoRepairHosting(probe: ConnectorProbe): Promise<void> {
-    const state = this.kvGet<AutoRepairState>("autoRepair", EMPTY_REPAIR);
+    const stored = this.kvGet<AutoRepairState>("autoRepair", EMPTY_REPAIR);
+    // The routine now reconnects the repository before building, so attempts made
+    // by the previous routine no longer predict whether this one will succeed.
+    const state = stored.version === REPAIR_LOGIC_VERSION ? stored : { ...EMPTY_REPAIR };
+    if (stored.version !== REPAIR_LOGIC_VERSION) this.kvPut("autoRepair", state);
     if (probe.reachable) {
       if (state.attempts !== 0) this.kvPut("autoRepair", EMPTY_REPAIR);
       return;
@@ -2762,7 +2893,7 @@ export class AutomationEngine extends DurableObject<Env> {
     const detail = result.ok ? (result.applied[result.applied.length - 1] ?? "Redeploy started.") : (result.error ?? "unknown error");
     // Exponential backoff leaves room for a build to finish before the next attempt.
     const nextAt = now + AUTO_REPAIR_COOLDOWN_MS * 2 ** (attempts - 1);
-    this.kvPut("autoRepair", { attempts, lastAt: now, nextAt, lastDetail: detail, lastCode: result.code } satisfies AutoRepairState);
+    this.kvPut("autoRepair", { attempts, lastAt: now, nextAt, lastDetail: detail, lastCode: result.code, version: REPAIR_LOGIC_VERSION } satisfies AutoRepairState);
     this.log(
       result.ok ? "warn" : "error",
       "hosting.autorepair",

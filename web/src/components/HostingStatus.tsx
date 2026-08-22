@@ -1,12 +1,12 @@
 import { useEffect, useMemo, useState } from "react";
-import { Activity, GitBranch, Hammer, Loader2, RefreshCw, Rocket, ShieldAlert, Timer } from "lucide-react";
+import { Activity, FolderGit2, GitBranch, Hammer, Loader2, RefreshCw, Rocket, ShieldAlert, Timer } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Switch } from "@/components/ui/switch";
 import { cn } from "@/lib/utils";
 import { useEngine } from "@/lib/engine-store";
-import type { HealthSample } from "@/lib/api";
+import type { HealthSample, SourceCheckState } from "@/lib/api";
 
 const POLL_MS = 30_000;
 
@@ -18,6 +18,13 @@ function buildTone(status: string | null): { label: string; className: string; d
   if (status === "SUCCESS") return { label: "build passed", className: "bg-primary/12 text-primary ring-primary/25", dot: "bg-primary" };
   if (BUSY_STATES.includes(status)) return { label: status.toLowerCase(), className: "bg-accent/12 text-accent ring-accent/25", dot: "bg-accent" };
   return { label: status.toLowerCase(), className: "bg-destructive/12 text-destructive ring-destructive/25", dot: "bg-destructive" };
+}
+
+/** How the pre-flight source check reads to someone who is not a developer. */
+function sourceTone(state: SourceCheckState | undefined): { label: string; className: string; dot: string } {
+  if (state === "ok") return { label: "source found", className: "bg-primary/12 text-primary ring-primary/25", dot: "bg-primary" };
+  if (state === "not_found" || state === "missing_connector") return { label: "source missing", className: "bg-destructive/12 text-destructive ring-destructive/25", dot: "bg-destructive" };
+  return { label: "not confirmed", className: "bg-secondary/60 text-muted-foreground ring-white/10", dot: "bg-muted-foreground" };
 }
 
 function duration(ms: number): string {
@@ -73,12 +80,17 @@ export function HostingStatus() {
   const build = buildTone(hostingStatus?.build.status ?? null);
   const autoDeploy = hostingStatus?.autoDeploy;
   const repair = hostingStatus?.repair;
+  const source = hostingStatus?.source;
+  const sourceState = sourceTone(source?.state);
   const needsRepo = autoDeploy !== undefined && autoDeploy.repository === null;
+  // The engine already knows which repository this connector is built from, so the
+  // field only has to be filled in to override it.
+  const repoValue = repository.trim().length > 0 ? repository.trim() : (source?.repository ?? "");
 
   const toggleAutoDeploy = (enabled: boolean): void => {
     setBusy(true);
     const payload = enabled && needsRepo
-      ? { enabled, repository: repository.trim(), branch: branch.trim() || undefined }
+      ? { enabled, repository: repoValue, branch: branch.trim() || undefined }
       : { enabled };
     setAutoDeploy(payload).catch(() => undefined).finally(() => setBusy(false));
   };
@@ -191,7 +203,7 @@ export function HostingStatus() {
           </div>
           <Switch
             checked={autoDeploy?.enabled ?? false}
-            disabled={busy || autoDeploy === undefined || (needsRepo && repository.trim().length === 0)}
+            disabled={busy || autoDeploy === undefined || (needsRepo && repoValue.length === 0)}
             onCheckedChange={toggleAutoDeploy}
             aria-label="Rebuild the service whenever the repository receives a push"
           />
@@ -199,12 +211,40 @@ export function HostingStatus() {
 
         {needsRepo ? (
           <div className="mt-3 grid gap-2 sm:grid-cols-[1.6fr_1fr]">
-            <Input value={repository} onChange={(event) => setRepository(event.target.value)} placeholder="owner/repository" className="h-9 font-mono text-xs" />
-            <Input value={branch} onChange={(event) => setBranch(event.target.value)} placeholder="main" className="h-9 font-mono text-xs" />
+            <Input value={repository} onChange={(event) => setRepository(event.target.value)} placeholder={source?.repository ?? "owner/repository"} className="h-9 font-mono text-xs" />
+            <Input value={branch} onChange={(event) => setBranch(event.target.value)} placeholder={source?.branch ?? "main"} className="h-9 font-mono text-xs" />
             <p className="text-[10px] text-muted-foreground sm:col-span-2">
-              No repository is attached to this service yet. Name it here and the switch will connect it, then arm the build.
+              No repository is attached to this service yet. The one shown is the repository this connector is built from, so leaving these blank is usually right.
             </p>
           </div>
+        ) : null}
+      </div>
+
+      <div className="border-t border-white/[0.06] p-5">
+        <div className="flex flex-wrap items-center gap-3">
+          <div className="grid h-10 w-10 shrink-0 place-items-center rounded-xl bg-secondary/60 ring-1 ring-white/10">
+            <FolderGit2 className={cn("h-4 w-4", source?.state === "ok" ? "text-primary" : "text-muted-foreground")} />
+          </div>
+          <div className="min-w-0 flex-1">
+            <div className="flex flex-wrap items-center gap-2">
+              <p className="text-sm font-semibold">Code to build</p>
+              <span className={cn("inline-flex items-center gap-1.5 rounded-full px-2 py-0.5 font-mono text-[9px] uppercase ring-1", sourceState.className)}>
+                <span className={cn("h-1.5 w-1.5 rounded-full", sourceState.dot)} />
+                {sourceState.label}
+              </span>
+            </div>
+            <p className="mt-0.5 text-[11px] leading-relaxed text-muted-foreground">{source?.detail ?? "Waiting for the first check."}</p>
+            {source?.commitSha ? (
+              <p className="mt-1 truncate font-mono text-[10px] text-muted-foreground">
+                {source.repository} · {source.branch} · {source.commitSha}
+              </p>
+            ) : null}
+          </div>
+        </div>
+        {source?.state === "ok" && hostingStatus?.build.failure?.code === "no_build_output" ? (
+          <p className="mt-3 rounded-lg bg-amber-400/[0.06] px-2.5 py-2 text-[11px] leading-relaxed text-muted-foreground">
+            The code is definitely there, yet the build fetched nothing. That points at the hosting platform's permission to read this repository rather than at the code. A rebuild re-establishes that link and is worth trying first.
+          </p>
         ) : null}
       </div>
 
@@ -238,7 +278,7 @@ export function HostingStatus() {
             aria-label="Branch to build"
           />
           <p className="self-center text-[10px] leading-relaxed text-muted-foreground">
-            Naming a branch makes it the only one this service builds from, and clears triggers left on any other branch.
+            Every rebuild reconnects the repository first, then builds. Naming a branch also makes it the only one this service builds from.
           </p>
         </div>
 

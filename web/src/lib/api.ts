@@ -192,6 +192,17 @@ export type HealthSample = { t: number; up: boolean; ms: number | null };
 /** Plain-language cause of a failed build, derived from the log but never quoting it. */
 export type BuildFailure = { code: string; hint: string };
 
+/** Whether the repository the platform builds actually exists, with the connector in it. */
+export type SourceCheckState = "ok" | "missing_connector" | "not_found" | "unverified";
+export type SourceCheck = {
+  repository: string;
+  branch: string;
+  state: SourceCheckState;
+  commitSha: string | null;
+  detail: string;
+  checkedAt: number;
+};
+
 export type HostingStatus = {
   probe: ConnectorProbe;
   uptimePct: number | null;
@@ -202,6 +213,7 @@ export type HostingStatus = {
   history: HealthSample[];
   build: { serviceName: string | null; status: string | null; at: number | null; refreshedAt: number | null; failure: BuildFailure | null };
   autoDeploy: HostingAutoDeploy;
+  source: SourceCheck;
   repair: { attempts: number; lastAt: number | null; nextAt: number | null; lastDetail: string | null; exhausted: boolean };
   checkedAt: number;
 };
