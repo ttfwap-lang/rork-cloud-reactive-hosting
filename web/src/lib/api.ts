@@ -299,6 +299,8 @@ export const api = {
   hostingStatus: () => call<{ status: HostingStatus }>("/hosting/status", {}),
   setAutoDeploy: (input: { enabled: boolean; repository?: string; branch?: string }) =>
     call<{ applied: string[]; status: HostingStatus }>("/hosting/autodeploy", input),
+  forceRebuild: (input: { branch?: string } = {}) =>
+    call<{ applied: string[]; status: HostingStatus }>("/hosting/rebuild", input),
   reconnect: () => call<{ link: LinkState }>("/link/reconnect", {}),
   disconnect: () => call<{ link: LinkState }>("/link/disconnect", {}),
   forgetConnection: () => call<{ link: LinkState }>("/link/forget", {}),

@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { Activity, GitBranch, Hammer, Loader2, RefreshCw, ShieldAlert, Timer } from "lucide-react";
+import { Activity, GitBranch, Hammer, Loader2, RefreshCw, Rocket, ShieldAlert, Timer } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -54,11 +54,13 @@ function Sparkline({ history }: { history: HealthSample[] }) {
 }
 
 export function HostingStatus() {
-  const { hostingStatus, hostingStatusUpdatedAt, refreshHostingStatus, setAutoDeploy } = useEngine();
+  const { hostingStatus, hostingStatusUpdatedAt, refreshHostingStatus, setAutoDeploy, forceRebuild } = useEngine();
   const [now, setNow] = useState<number>(() => Date.now());
   const [repository, setRepository] = useState<string>("");
   const [branch, setBranch] = useState<string>("");
+  const [rebuildBranch, setRebuildBranch] = useState<string>("");
   const [busy, setBusy] = useState<boolean>(false);
+  const [rebuilding, setRebuilding] = useState<boolean>(false);
 
   useEffect(() => {
     const handle = setInterval(() => setNow(Date.now()), 1000);
@@ -79,6 +81,15 @@ export function HostingStatus() {
       ? { enabled, repository: repository.trim(), branch: branch.trim() || undefined }
       : { enabled };
     setAutoDeploy(payload).catch(() => undefined).finally(() => setBusy(false));
+  };
+
+  const startRebuild = (): void => {
+    setRebuilding(true);
+    const target = rebuildBranch.trim();
+    forceRebuild(target.length > 0 ? { branch: target } : {})
+      .then(() => setRebuildBranch(""))
+      .catch(() => undefined)
+      .finally(() => setRebuilding(false));
   };
 
   return (
@@ -194,6 +205,47 @@ export function HostingStatus() {
               No repository is attached to this service yet. Name it here and the switch will connect it, then arm the build.
             </p>
           </div>
+        ) : null}
+      </div>
+
+      <div className="border-t border-white/[0.06] bg-secondary/20 p-5">
+        <div className="flex flex-wrap items-center gap-3">
+          <div className="grid h-10 w-10 shrink-0 place-items-center rounded-xl bg-accent/10 text-accent ring-1 ring-accent/20">
+            {rebuilding ? <Loader2 className="h-4 w-4 animate-spin" /> : <Rocket className="h-4 w-4" />}
+          </div>
+          <div className="min-w-0 flex-1">
+            <p className="text-sm font-semibold">Force rebuild</p>
+            <p className="mt-0.5 text-[11px] leading-relaxed text-muted-foreground">
+              Builds and redeploys straight away, whether or not anything changed. Use it after fixing something on the hosting side.
+            </p>
+          </div>
+          <Button
+            className="rounded-full"
+            disabled={rebuilding || hostingStatus === undefined}
+            onClick={startRebuild}
+          >
+            {rebuilding ? <Loader2 className="mr-1.5 h-3.5 w-3.5 animate-spin" /> : <Rocket className="mr-1.5 h-3.5 w-3.5" />}
+            {rebuilding ? "Starting…" : "Rebuild now"}
+          </Button>
+        </div>
+
+        <div className="mt-3 grid gap-2 sm:grid-cols-[1fr_auto]">
+          <Input
+            value={rebuildBranch}
+            onChange={(event) => setRebuildBranch(event.target.value)}
+            placeholder={autoDeploy?.branch ?? "leave blank to keep the current branch"}
+            className="h-9 font-mono text-xs"
+            aria-label="Branch to build"
+          />
+          <p className="self-center text-[10px] leading-relaxed text-muted-foreground">
+            Naming a branch makes it the only one this service builds from, and clears triggers left on any other branch.
+          </p>
+        </div>
+
+        {repair?.exhausted ? (
+          <p className="mt-3 text-[10px] leading-relaxed text-muted-foreground">
+            Automatic repair has stopped trying. A rebuild by hand clears that, so the engine resumes watching afterwards.
+          </p>
         ) : null}
       </div>
     </section>

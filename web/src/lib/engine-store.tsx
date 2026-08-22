@@ -45,6 +45,7 @@ type EngineContextValue = {
   hostingStatusUpdatedAt: number;
   refreshHostingStatus: () => void;
   setAutoDeploy: (input: { enabled: boolean; repository?: string; branch?: string }) => Promise<void>;
+  forceRebuild: (input?: { branch?: string }) => Promise<void>;
   reconnect: () => Promise<void>;
   disconnect: () => void;
   forgetConnection: () => Promise<void>;
@@ -199,6 +200,14 @@ export function EngineProvider({ children }: { children: ReactNode }) {
     },
     onError: (error: Error) => toast.error(error.message),
   });
+  const forceRebuildMutation = useMutation({
+    mutationFn: api.forceRebuild,
+    onSuccess: (result) => {
+      queryClient.setQueryData<HostingStatus>(HOSTING_KEY, result.status);
+      toast.success("Rebuild started", { description: result.applied[result.applied.length - 1] ?? "Railway is building the connector now." });
+    },
+    onError: (error: Error) => toast.error(error.message),
+  });
   const reconnectMutation = useMutation({
     mutationFn: api.reconnect,
     onSuccess: () => { invalidate(); toast.success("Reconnect requested"); },
@@ -270,6 +279,7 @@ export function EngineProvider({ children }: { children: ReactNode }) {
     hostingStatusUpdatedAt: hostingQuery.dataUpdatedAt,
     refreshHostingStatus: () => { queryClient.invalidateQueries({ queryKey: HOSTING_KEY }); },
     setAutoDeploy: async (input) => { await autoDeployMutation.mutateAsync(input); },
+    forceRebuild: async (input) => { await forceRebuildMutation.mutateAsync(input ?? {}); },
     reconnect: async () => { await reconnectMutation.mutateAsync(); },
     disconnect: () => disconnectMutation.mutate(),
     forgetConnection: async () => { await forgetMutation.mutateAsync(); },

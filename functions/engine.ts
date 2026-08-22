@@ -744,6 +744,7 @@ export class AutomationEngine extends DurableObject<Env> {
       case "/hosting/apply": return this.handleHostingApply();
       case "/hosting/status": return Response.json({ status: await this.hostingStatus() });
       case "/hosting/autodeploy": return this.handleAutoDeploy(request);
+      case "/hosting/rebuild": return this.handleForceRebuild(request);
       case "/link/reconnect": return this.handleReconnect();
       case "/link/disconnect": return this.handleDisconnect(false);
       case "/link/forget": return this.handleDisconnect(true);
@@ -2369,18 +2370,139 @@ export class AutomationEngine extends DurableObject<Env> {
     }
 
     try {
-      await this.railwayQuery(
-        scope.kind,
-        "mutation redeploy($serviceId: String!, $environmentId: String!) { serviceInstanceRedeploy(serviceId: $serviceId, environmentId: $environmentId) }",
-        { serviceId: target.id, environmentId: scope.environmentId },
-      );
-      applied.push("Started a fresh deployment. It usually takes two to four minutes.");
+      applied.push(`${await this.startDeployment(scope, target.id)} It usually takes two to four minutes.`);
     } catch (failure) {
       applied.push(`Could not start a deployment: ${failure instanceof Error ? failure.message : "unknown error"}`);
     }
 
     this.log("info", "hosting.apply", `Applied hosting configuration to "${target.name}".`);
     return { ok: true, applied, error: null, code: "ok" };
+  }
+
+  /**
+   * Starts a build by hand, independent of any repository change. Railway offers
+   * three escalating ways to do this and a given service will not accept all of
+   * them, so they are tried strongest first and the first that lands wins.
+   */
+  private async startDeployment(scope: RailwayScope, serviceId: string): Promise<string> {
+    const errors: string[] = [];
+
+    try {
+      await this.railwayQuery(
+        scope.kind,
+        "mutation deploy($serviceId: String!, $environmentId: String!) { serviceInstanceDeploy(serviceId: $serviceId, environmentId: $environmentId, latestCommit: true) }",
+        { serviceId, environmentId: scope.environmentId },
+      );
+      return "Started a fresh build from the latest commit.";
+    } catch (failure) {
+      errors.push(failure instanceof Error ? failure.message : "unknown error");
+    }
+
+    try {
+      await this.railwayQuery(
+        scope.kind,
+        "mutation redeploy($serviceId: String!, $environmentId: String!) { serviceInstanceRedeploy(serviceId: $serviceId, environmentId: $environmentId) }",
+        { serviceId, environmentId: scope.environmentId },
+      );
+      return "Redeployed the service from its current source.";
+    } catch (failure) {
+      errors.push(failure instanceof Error ? failure.message : "unknown error");
+    }
+
+    // Last resort: rebuild the most recent deployment by its own id.
+    const instance = await this.railwayQuery<{ serviceInstance: { latestDeployment: { id: string } | null } | null }>(
+      scope.kind,
+      "query instance($serviceId: String!, $environmentId: String!) { serviceInstance(serviceId: $serviceId, environmentId: $environmentId) { latestDeployment { id } } }",
+      { serviceId, environmentId: scope.environmentId },
+    ).catch(() => null);
+    const deploymentId = instance?.serviceInstance?.latestDeployment?.id ?? null;
+    if (deploymentId !== null) {
+      await this.railwayQuery(
+        scope.kind,
+        "mutation redeployOne($id: String!) { deploymentRedeploy(id: $id) { id } }",
+        { id: deploymentId },
+      );
+      return "Rebuilt the most recent deployment.";
+    }
+
+    throw new Error(errors[0] ?? "Railway refused every way of starting a build.");
+  }
+
+  /**
+   * Makes one branch the only branch this service builds from: the source is
+   * repointed at it and every push trigger on any other branch is removed, so a
+   * stale branch cannot keep firing builds behind your back.
+   */
+  private async pinBranch(scope: RailwayScope, serviceId: string, branch: string): Promise<string[]> {
+    const applied: string[] = [];
+    const instance = await this.railwayQuery<{ serviceInstance: { source: { repo: string | null } | null } | null }>(
+      scope.kind,
+      "query instance($serviceId: String!, $environmentId: String!) { serviceInstance(serviceId: $serviceId, environmentId: $environmentId) { source { repo } } }",
+      { serviceId, environmentId: scope.environmentId },
+    ).catch(() => null);
+
+    const repository = instance?.serviceInstance?.source?.repo ?? null;
+    if (repository === null) {
+      applied.push("No repository is attached, so the branch could not be changed.");
+      return applied;
+    }
+
+    try {
+      await this.railwayQuery(
+        scope.kind,
+        "mutation connect($id: String!, $input: ServiceConnectInput!) { serviceConnect(id: $id, input: $input) { id } }",
+        { id: serviceId, input: { repo: repository, branch } },
+      );
+      applied.push(`Pointed the service at ${branch}, replacing whatever branch it built from before.`);
+    } catch (failure) {
+      applied.push(`Could not point the service at ${branch}: ${failure instanceof Error ? failure.message : "unknown error"}`);
+      return applied;
+    }
+
+    const stale = (await this.railwayTriggers(scope)).filter((entry) => entry.serviceId === serviceId && entry.branch !== branch);
+    for (const trigger of stale) {
+      await this.railwayQuery(scope.kind, "mutation removeTrigger($id: String!) { deploymentTriggerDelete(id: $id) }", { id: trigger.id }).catch(() => undefined);
+    }
+    if (stale.length > 0) applied.push(`Removed ${stale.length} push trigger${stale.length === 1 ? "" : "s"} pointing at other branches.`);
+    return applied;
+  }
+
+  /**
+   * Starts a deployment on demand, whether or not the repository changed. An
+   * optional branch is pinned first, becoming the only branch this service builds.
+   */
+  private async handleForceRebuild(request: Request): Promise<Response> {
+    const body = (await request.json().catch(() => ({}))) as { branch?: string };
+    const requestedBranch = (body.branch ?? "").trim();
+    if (requestedBranch.length > 0 && !/^[\w.\/-]{1,120}$/.test(requestedBranch)) {
+      return Response.json({ error: "That branch name contains characters Git does not allow." }, { status: 400 });
+    }
+    if (!this.railwayToken()) return Response.json({ error: "No hosting token is stored yet." }, { status: 400 });
+
+    let scope: RailwayScope;
+    try {
+      scope = await this.railwayScope();
+    } catch (failure) {
+      return Response.json({ error: failure instanceof Error ? failure.message : "The hosting token could not be verified." }, { status: 502 });
+    }
+
+    const nodes = await this.railwayServices(scope);
+    const target = nodes.find((node) => /connector|reply|telego/i.test(node.name)) ?? nodes[0];
+    if (!target) return Response.json({ error: "This project has no service to rebuild." }, { status: 409 });
+
+    const applied: string[] = [];
+    if (requestedBranch.length > 0) applied.push(...(await this.pinBranch(scope, target.id, requestedBranch)));
+
+    try {
+      applied.push(await this.startDeployment(scope, target.id));
+    } catch (failure) {
+      return Response.json({ error: `Could not start a build: ${failure instanceof Error ? failure.message : "unknown error"}` }, { status: 502 });
+    }
+
+    // A rebuild by hand is a clean slate, so let the watchdog resume self-healing.
+    this.kvPut("autoRepair", EMPTY_REPAIR);
+    this.log("info", "hosting.rebuild", `Manual rebuild started for "${target.name}".`);
+    return Response.json({ applied, status: await this.hostingStatus(true) });
   }
 
   /** Cached-only snapshot; performs no outbound calls so it is safe to leave open. */
