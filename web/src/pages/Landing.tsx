@@ -6,6 +6,7 @@ import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import { fetchPublicStats, type PublicStats } from "@/lib/api";
 import { SourceOffer } from "@/components/SourceOffer";
+import { FlowDemo } from "@/components/FlowDemo";
 
 const CAPABILITIES = [
   {
@@ -74,16 +75,20 @@ export default function Landing() {
       </header>
 
       <main className="mx-auto w-full max-w-6xl flex-1 px-5">
-        <section className="py-12 sm:py-20">
-          <div className="max-w-3xl">
-            <span className="inline-flex items-center gap-2 rounded-full bg-primary/10 px-3 py-1.5 font-mono text-[10px] uppercase tracking-widest text-primary ring-1 ring-primary/25">
+        <section className="grid items-center gap-10 py-12 sm:py-16 lg:grid-cols-[minmax(0,1fr)_26rem] lg:gap-12">
+          <div>
+            <span className="inline-flex items-center gap-2 rounded-full bg-primary/10 px-3 py-1.5 font-mono text-[10px] uppercase tracking-[0.18em] text-primary ring-1 ring-primary/25">
               <Zap className="h-3 w-3" />always-on telegram automation
             </span>
-            <h1 className="text-balance mt-6 text-4xl font-semibold leading-[1.08] tracking-tight sm:text-6xl">
+            <h1 className="text-balance mt-6 text-4xl font-semibold leading-[1.05] tracking-tight sm:text-5xl">
               Your Telegram bot conversations,{" "}
-              <span className="bg-gradient-to-r from-primary via-accent to-primary bg-clip-text text-transparent">answered for you.</span>
+              <span className="relative whitespace-nowrap text-primary">
+                answered for you
+                <span aria-hidden className="absolute inset-x-0 -bottom-1 h-[3px] rounded-full bg-gradient-to-r from-primary/80 to-accent/40" />
+              </span>
+              .
             </h1>
-            <p className="text-balance mt-5 max-w-2xl text-base leading-relaxed text-muted-foreground sm:text-lg">
+            <p className="text-balance mt-6 max-w-xl text-base leading-relaxed text-muted-foreground">
               Build a reply flow once — what the bot says, what you send back, which button gets pressed —
               and it runs on our servers around the clock. No scripts, no laptop left open.
             </p>
@@ -101,6 +106,14 @@ export default function Landing() {
               <StatPill label="connected right now" value={stats ? String(stats.connected) : "—"} tone={stats && stats.connected > 0 ? "live" : "default"} />
               <StatPill label={spotsLeft === 0 ? "queue open" : "live slots free"} value={spotsLeft === null ? "—" : spotsLeft === 0 ? String(stats?.queued ?? 0) : String(spotsLeft)} />
             </div>
+          </div>
+
+          <div className="relative">
+            <div aria-hidden className="pointer-events-none absolute -inset-6 -z-10 rounded-[2rem] bg-[radial-gradient(closest-side,hsl(168_82%_44%/0.16),transparent)]" />
+            <FlowDemo />
+            <p className="mt-3 text-center font-mono text-[10px] uppercase tracking-[0.18em] text-muted-foreground">
+              a flow answering a bot, on repeat
+            </p>
           </div>
         </section>
 

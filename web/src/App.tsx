@@ -1,10 +1,11 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { BrowserRouter, Navigate, Route, Routes } from "react-router-dom";
+import { BrowserRouter, Navigate, Route, Routes, useLocation } from "react-router-dom";
 
 import { Toaster } from "@/components/ui/sonner";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { EngineProvider, useEngine } from "@/lib/engine-store";
 import { Shell } from "@/components/Shell";
+import { AuthChecking, ServiceUnreachable } from "@/components/AuthGate";
 import Landing from "./pages/Landing";
 import SignIn from "./pages/SignIn";
 import SignUp from "./pages/SignUp";
@@ -20,18 +21,36 @@ import NotFound from "./pages/NotFound";
 
 const queryClient = new QueryClient({ defaultOptions: { queries: { refetchOnWindowFocus: false } } });
 
-function Routed() {
-  const { authed, isOwner } = useEngine();
+/** Console routes. Following one while signed out remembers it through sign-in. */
+const CONSOLE_PATHS = ["/connection", "/workflows", "/import", "/logs", "/jobs", "/settings", "/owner"] as const;
 
-  // Signed out: the public front door. Signed in: the console, with the marketing
-  // routes redirecting straight through so nobody lands back on a sales page.
-  if (!authed) {
+/**
+ * Sends someone who asked for a console page to the sign-in form carrying where
+ * they were headed, so signing in resumes the journey instead of dumping them on
+ * the overview. Anything else is not a real page, so it goes to the front door.
+ */
+function PublicFallback() {
+  const location = useLocation();
+  const wanted = CONSOLE_PATHS.some((path) => location.pathname === path || location.pathname.startsWith(`${path}/`));
+  if (!wanted) return <Navigate to="/" replace />;
+  return <Navigate to="/signin" replace state={{ from: `${location.pathname}${location.search}` }} />;
+}
+
+function Routed() {
+  const { authStatus, isOwner, retryAuth, signOut } = useEngine();
+
+  // A saved token is not proof. Until the service has vouched for it, neither the
+  // console nor the sign-in form is correct to show, so neither is rendered.
+  if (authStatus === "checking") return <AuthChecking />;
+  if (authStatus === "offline") return <ServiceUnreachable onRetry={retryAuth} onSignOut={signOut} />;
+
+  if (authStatus === "anonymous") {
     return (
       <Routes>
         <Route path="/" element={<Landing />} />
         <Route path="/signin" element={<SignIn />} />
         <Route path="/signup" element={<SignUp />} />
-        <Route path="*" element={<Navigate to="/" replace />} />
+        <Route path="*" element={<PublicFallback />} />
       </Routes>
     );
   }

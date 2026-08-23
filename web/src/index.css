@@ -134,6 +134,54 @@
   }
 }
 
+/* Slow parallax drift for the entrance backdrop: never fast enough to distract
+   from the form sitting on top of it. */
+@keyframes aurora-drift {
+  0% {
+    transform: translate3d(-4%, -2%, 0) scale(1.05);
+  }
+  50% {
+    transform: translate3d(4%, 3%, 0) scale(1.14);
+  }
+  100% {
+    transform: translate3d(-4%, -2%, 0) scale(1.05);
+  }
+}
+
+@keyframes bubble-in {
+  from {
+    opacity: 0;
+    transform: translateY(8px) scale(0.97);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+@keyframes press-flash {
+  0%,
+  100% {
+    background-color: hsl(168 82% 44% / 0.12);
+    border-color: hsl(168 82% 44% / 0.3);
+  }
+  40% {
+    background-color: hsl(168 82% 44% / 0.42);
+    border-color: hsl(168 82% 44% / 0.85);
+  }
+}
+
+@keyframes caret-blink {
+  0%,
+  45% {
+    opacity: 1;
+  }
+  55%,
+  100% {
+    opacity: 0.15;
+  }
+}
+
 .animate-signal {
   animation: signal-pulse 2.2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
 }
@@ -148,4 +196,31 @@
   inset: 0;
   background: linear-gradient(90deg, transparent, hsl(168 82% 44% / 0.28), transparent);
   animation: sweep 2.4s ease-in-out infinite;
+}
+
+.animate-aurora {
+  animation: aurora-drift 26s ease-in-out infinite;
+}
+
+.animate-bubble-in {
+  animation: bubble-in 0.34s cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+
+.animate-press-flash {
+  animation: press-flash 0.62s ease-in-out;
+}
+
+.animate-caret {
+  animation: caret-blink 1.1s steps(1, end) infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .animate-aurora,
+  .animate-bubble-in,
+  .animate-press-flash,
+  .animate-caret,
+  .animate-signal,
+  .animate-sweep::after {
+    animation: none;
+  }
 }

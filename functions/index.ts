@@ -180,6 +180,13 @@ export default {
       return withCors(Response.json({ error: "not found" }, { status: 404 }), request, env);
     }
 
+    // Lets the create-account form say "that name is free" while it is being typed.
+    // Unauthenticated by necessity, and the registry caps how often it can be asked.
+    if (inner === "/account/available") {
+      const body = (await request.json().catch(() => ({}))) as Record<string, unknown>;
+      const result = await directory<unknown>(env, "/availability", { username: body.username });
+      return withCors(Response.json(result.data, { status: result.status }), request, env);
+    }
     if (inner === "/account/signup") return withCors(await handleSignup(request, env, publicOrigin), request, env);
     if (inner === "/account/signin") {
       const body = await request.json().catch(() => ({}));

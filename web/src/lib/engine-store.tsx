@@ -4,6 +4,7 @@ import { toast } from "sonner";
 
 import {
   api,
+  ApiError,
   getToken,
   setToken,
   streamUrl,
@@ -23,8 +24,20 @@ import {
   type WorkflowStep,
 } from "./api";
 
+/**
+ * `checking` is the moment a saved token is being verified. Rendering the console
+ * during it is what caused a half-loaded dashboard to flash before bouncing to the
+ * sign-in form, so it is now a state of its own rather than an optimistic guess.
+ */
+export type AuthStatus = "checking" | "authed" | "anonymous" | "offline";
+
 type EngineContextValue = {
   authed: boolean;
+  authStatus: AuthStatus;
+  /** True when a session ended on its own, so the sign-in form can say why. */
+  sessionExpired: boolean;
+  dismissExpiry: () => void;
+  retryAuth: () => void;
   account: AccountView | undefined;
   isOwner: boolean;
   signUp: (input: { username: string; password: string; claimPasscode?: string }) => Promise<void>;
@@ -80,24 +93,39 @@ const HOSTING_POLL_MS = 30_000;
 
 export function EngineProvider({ children }: { children: ReactNode }) {
   const queryClient = useQueryClient();
-  const [authed, setAuthed] = useState<boolean>(() => getToken() !== null);
+  const [tokenPresent, setTokenPresent] = useState<boolean>(() => getToken() !== null);
+  const [sessionExpired, setSessionExpired] = useState<boolean>(false);
   const [liveEvents, setLiveEvents] = useState<EngineEvent[]>([]);
   const [streamOnline, setStreamOnline] = useState<boolean>(false);
   const socketRef = useRef<WebSocket | null>(null);
 
+  // Fetching starts as soon as a token exists so nothing waits in series, but the
+  // console is only rendered once this call has actually vouched for the session.
   const accountQuery = useQuery({
     queryKey: ACCOUNT_KEY,
     queryFn: () => api.me().then((result) => result.account),
-    enabled: authed,
+    enabled: tokenPresent,
     refetchInterval: 120_000,
     retry: 1,
   });
   const isOwner = accountQuery.data?.role === "owner";
 
+  const accountFailure = accountQuery.error instanceof ApiError ? accountQuery.error : null;
+  const authStatus: AuthStatus = !tokenPresent
+    ? "anonymous"
+    : accountQuery.data
+      ? "authed"
+      // A rejected session is about to be cleared by the effect below, so it stays
+      // "checking" for that one render rather than flashing an unreachable screen.
+      : accountQuery.isError && accountFailure?.status !== 401
+        ? "offline"
+        : "checking";
+  const authed = authStatus === "authed";
+
   const query = useQuery({
     queryKey: QUERY_KEY,
     queryFn: () => api.state(),
-    enabled: authed,
+    enabled: tokenPresent,
     refetchInterval: 60_000,
     retry: 1,
   });
@@ -122,21 +150,22 @@ export function EngineProvider({ children }: { children: ReactNode }) {
   const templateQuery = useQuery({
     queryKey: TEMPLATE_KEY,
     queryFn: () => api.templates().then((result) => result.templates),
-    enabled: authed,
+    enabled: tokenPresent,
     staleTime: 10 * 60_000,
     retry: 1,
   });
 
-  const clearSession = useCallback((): void => {
+  const clearSession = useCallback((expired: boolean): void => {
     setToken(null);
-    setAuthed(false);
+    setTokenPresent(false);
+    setSessionExpired(expired);
     setLiveEvents([]);
     queryClient.clear();
   }, [queryClient]);
 
   useEffect(() => {
     const failure = (query.error ?? accountQuery.error) as { status?: number } | null;
-    if (failure?.status === 401) clearSession();
+    if (failure?.status === 401) clearSession(true);
   }, [query.error, accountQuery.error, clearSession]);
 
   useEffect(() => {
@@ -315,7 +344,8 @@ export function EngineProvider({ children }: { children: ReactNode }) {
   const adopt = useCallback((token: string, account: AccountView, welcome: string): void => {
     setToken(token);
     queryClient.setQueryData<AccountView>(ACCOUNT_KEY, account);
-    setAuthed(true);
+    setSessionExpired(false);
+    setTokenPresent(true);
     invalidate();
     toast.success(welcome);
   }, [invalidate, queryClient]);
@@ -336,11 +366,22 @@ export function EngineProvider({ children }: { children: ReactNode }) {
 
   const signOut = useCallback((): void => {
     void api.signOutServer().catch(() => undefined);
-    clearSession();
+    clearSession(false);
   }, [clearSession]);
+
+  const retryAuth = useCallback((): void => {
+    void accountQuery.refetch();
+    void query.refetch();
+  }, [accountQuery, query]);
+
+  const dismissExpiry = useCallback((): void => setSessionExpired(false), []);
 
   const value = useMemo<EngineContextValue>(() => ({
     authed,
+    authStatus,
+    sessionExpired,
+    dismissExpiry,
+    retryAuth,
     account: accountQuery.data,
     isOwner,
     signUp,
@@ -387,7 +428,8 @@ export function EngineProvider({ children }: { children: ReactNode }) {
     previewWorkflow: async (step, text) => api.previewWorkflow(step, text),
     analyzeConversation: async (input) => (await analysisMutation.mutateAsync(input)).analysis,
   }), [
-    authed, accountQuery.data, isOwner, signUp, signIn, signOut, query.data, query.isLoading, query.error, liveEvents, streamOnline, queryClient,
+    authed, authStatus, sessionExpired, dismissExpiry, retryAuth,
+    accountQuery.data, isOwner, signUp, signIn, signOut, query.data, query.isLoading, query.error, liveEvents, streamOnline, queryClient,
     settingsMutation, workflowMutation, deleteMutation, importMutation, botMutation, personalMutation, submitPersonalMutation,
     hostingQuery.data, hostingQuery.dataUpdatedAt, autoDeployMutation, forceRebuildMutation, templateQuery.data, templateMutation,
     ownerQuery.data, suspendMutation, removeMutation, passwordMutation,

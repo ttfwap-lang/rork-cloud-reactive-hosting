@@ -288,6 +288,14 @@ export type OwnerOverview = {
   }>;
 };
 
+/**
+ * The answer to "can I have this name?" while it is being typed. `reserved` is the
+ * unclaimed owner name; `unknown` means the service declined to answer, so the form
+ * stays quiet rather than showing a guess.
+ */
+export type AvailabilityState = "available" | "taken" | "reserved" | "invalid" | "unknown";
+export type AvailabilityView = { state: AvailabilityState; detail: string };
+
 /** Counts only, safe to show before anyone signs in. */
 export type PublicStats = {
   accounts: number;
@@ -334,10 +342,13 @@ export type Snapshot = {
 
 class ApiError extends Error {
   readonly status: number;
-  constructor(message: string, status: number) {
+  /** Present on a rate-limited reply, so a form can count down instead of guessing. */
+  readonly retryAfterSeconds: number | null;
+  constructor(message: string, status: number, retryAfterSeconds: number | null = null) {
     super(message);
     this.name = "ApiError";
     this.status = status;
+    this.retryAfterSeconds = retryAfterSeconds;
   }
 }
 
@@ -349,7 +360,13 @@ async function call<T>(path: string, body?: unknown): Promise<T> {
     body: body === undefined ? undefined : JSON.stringify(body),
   });
   const payload = (await response.json().catch(() => ({}))) as Record<string, unknown>;
-  if (!response.ok) throw new ApiError(typeof payload.error === "string" ? payload.error : "Request failed.", response.status);
+  if (!response.ok) {
+    throw new ApiError(
+      typeof payload.error === "string" ? payload.error : "Request failed.",
+      response.status,
+      typeof payload.retryAfterSeconds === "number" ? payload.retryAfterSeconds : null,
+    );
+  }
   return payload as T;
 }
 
@@ -362,6 +379,7 @@ export type PersonalStartInput = {
 };
 
 export const api = {
+  checkUsername: (username: string) => call<AvailabilityView>("/account/available", { username }),
   signUp: (input: { username: string; password: string; claimPasscode?: string }) =>
     call<{ token: string; account: AccountView; created: boolean }>("/account/signup", input),
   signIn: (input: { username: string; password: string }) =>

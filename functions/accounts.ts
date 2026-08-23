@@ -14,6 +14,8 @@ const AI_IMPORTS_PER_MONTH = 20;
 /** A live slot is surrendered when its account has not been seen for this long. */
 const SLOT_STALE_MS = 7 * 86_400_000;
 const MAX_SIGNUPS_PER_HOUR = 12;
+/** Name lookups are cheap, but not free: a sweep of the whole namespace is refused. */
+const MAX_LOOKUPS_PER_HOUR = 600;
 /** The most this runtime accepts in a single PBKDF2 call. */
 const PBKDF2_ITERATIONS = 100_000;
 /** Chained rounds, so the total cost is 200k without exceeding the per-call cap. */
@@ -30,6 +32,15 @@ export type AccountIdentity = {
   tenantId: string;
   createdAt: number;
 };
+
+/**
+ * The answer to "can I have this name?". `reserved` means the owner name is still
+ * unclaimed and can be taken by proving the old console passcode; once claimed it
+ * reads as `taken` like any other. `unknown` is returned when the lookup budget is
+ * spent, so the form simply stays quiet rather than guessing.
+ */
+export type AvailabilityState = "available" | "taken" | "reserved" | "invalid" | "unknown";
+export type AvailabilityView = { state: AvailabilityState; detail: string };
 
 export type AllowanceView = { used: number; limit: number; remaining: number; period: string };
 export type CapacityView = {
@@ -225,6 +236,7 @@ export class AccountRegistry {
   async handle(path: string, body: Record<string, unknown>): Promise<Response> {
     switch (path) {
       case "/signup": return this.handleSignup(body);
+      case "/availability": return this.handleAvailability(body);
       case "/signin": return this.handleSignin(body);
       case "/signout": return this.handleSignout(body);
       case "/resolve": return this.handleResolve(body);
@@ -247,6 +259,42 @@ export class AccountRegistry {
       return { error: "Usernames are 3-20 characters: letters, numbers and underscores." };
     }
     return { username };
+  }
+
+  /**
+   * Answers whether a name can be taken, so the form can say so while it is being
+   * typed instead of failing at the final step. It reveals no more than pressing
+   * the button would, and the lookup budget stops it being used to enumerate names.
+   */
+  private handleAvailability(body: Record<string, unknown>): Response {
+    const now = Date.now();
+    const raw = String(body.username ?? "").trim();
+    if (raw.length === 0) return Response.json({ state: "invalid", detail: "Pick a username." } satisfies AvailabilityView);
+
+    const window = this.guardGet<{ since: number; count: number }>("lookupWindow", { since: now, count: 0 });
+    const fresh = now - window.since > 3_600_000 ? { since: now, count: 0 } : window;
+    if (fresh.count >= MAX_LOOKUPS_PER_HOUR) {
+      return Response.json({ state: "unknown", detail: "" } satisfies AvailabilityView);
+    }
+    this.guardPut("lookupWindow", { since: fresh.since, count: fresh.count + 1 });
+
+    const parsed = this.validateUsername(raw);
+    if ("error" in parsed) return Response.json({ state: "invalid", detail: parsed.error } satisfies AvailabilityView);
+
+    const lower = parsed.username.toLowerCase();
+    const existing = this.accountByUsername(lower);
+    if (lower === OWNER_USERNAME) {
+      return Response.json(
+        existing
+          ? ({ state: "taken", detail: "The owner account has already been claimed." } satisfies AvailabilityView)
+          : ({ state: "reserved", detail: "Reserved for the console owner — claimable with the existing passcode." } satisfies AvailabilityView),
+      );
+    }
+    return Response.json(
+      existing
+        ? ({ state: "taken", detail: "That username is already taken." } satisfies AvailabilityView)
+        : ({ state: "available", detail: "That name is free." } satisfies AvailabilityView),
+    );
   }
 
   private async handleSignup(body: Record<string, unknown>): Promise<Response> {
@@ -303,7 +351,11 @@ export class AccountRegistry {
     const guardKey = `fail:${username}`;
     const guard = this.guardGet<{ fails: number; lockedUntil: number }>(guardKey, { fails: 0, lockedUntil: 0 });
     if (guard.lockedUntil > now) {
-      return Response.json({ error: `Too many attempts. Try again in ${Math.ceil((guard.lockedUntil - now) / 1000)}s.` }, { status: 429 });
+      const retryAfterSeconds = Math.ceil((guard.lockedUntil - now) / 1000);
+      return Response.json(
+        { error: `Too many attempts. Try again in ${retryAfterSeconds}s.`, retryAfterSeconds },
+        { status: 429 },
+      );
     }
     const row = username ? this.accountByUsername(username) : null;
     // Always spend the hashing cost so a missing username is not measurably faster.
