@@ -164,7 +164,7 @@ type AutoRepairState = { attempts: number; lastAt: number | null; nextAt: number
  * Bumped whenever the repair routine itself changes. A stored count of failures
  * from an older routine says nothing about the new one, so it is discarded.
  */
-const REPAIR_LOGIC_VERSION = 2;
+const REPAIR_LOGIC_VERSION = 3;
 const EMPTY_REPAIR: AutoRepairState = { attempts: 0, lastAt: null, nextAt: null, lastDetail: null, lastCode: null, version: REPAIR_LOGIC_VERSION };
 
 /**
@@ -2341,12 +2341,23 @@ export class AutomationEngine extends DurableObject<Env> {
    * Maps a failed build log onto a known cause. Only engine-authored text is
    * returned, so the log itself never leaves the authenticated console.
    */
-  private classifyBuildFailure(log: string[]): BuildFailure | null {
+  private classifyBuildFailure(log: string[], source: SourceCheckState | null): BuildFailure | null {
     if (log.length === 0) return null;
     const text = log.join("\n").toLowerCase();
     // A handful of lines means Docker never really started: the source could not be
-    // fetched, so there was nothing to build.
+    // fetched, so there was nothing to build. Which side failed is decided by the
+    // independent source check rather than guessed at, because "no output" alone
+    // cannot tell an absent repository apart from one the platform may not read.
     if (log.length <= 6) {
+      if (source === "ok") {
+        return {
+          code: "source_unreadable_by_platform",
+          hint: "The repository answers publicly and the connector folder is on the branch, so the source is sound. A build with no output therefore means the hosting platform's own code-host connection cannot read the repository: its GitHub app has to be granted access to it.",
+        };
+      }
+      if (source === "not_found" || source === "missing_connector") {
+        return { code: "source_missing", hint: "The build produced no output and the source check cannot find the connector folder on that branch, so there is nothing to build." };
+      }
       return { code: "no_build_output", hint: "The build stopped almost immediately with no Docker output, which means the platform could not fetch the source it was told to build." };
     }
     const rules: Array<{ test: RegExp; code: string; hint: string }> = [
@@ -2377,7 +2388,8 @@ export class AutomationEngine extends DurableObject<Env> {
     const deploymentId = instance?.serviceInstance?.latestDeployment?.id;
     if (!deploymentId) return { failure: null, lines: 0 };
     const log = await this.hostingBuildLog(scope, deploymentId);
-    return { failure: this.classifyBuildFailure(log), lines: log.length };
+    const source = this.kvGet<SourceCheck | null>("sourceCheck", null)?.state ?? null;
+    return { failure: this.classifyBuildFailure(log, source), lines: log.length };
   }
 
   /** Turns raw Railway facts into plain-language reasons the address is not serving. */
@@ -3047,6 +3059,26 @@ export class AutomationEngine extends DurableObject<Env> {
     };
   }
 
+  /**
+   * Notices that the stored hosting token has been replaced. The attempts recorded
+   * against the previous one were spent proving *that* token could not get a build
+   * out; they predict nothing about a new one. So a rotation hands the repair budget
+   * back, otherwise a fixed account would stay permanently given-up. Only a keyed
+   * digest is kept, never the token.
+   */
+  private async noteTokenRotation(): Promise<void> {
+    const token = this.railwayToken();
+    if (!token) return;
+    const fingerprint = (await this.hmac(token, "replyflow/hosting/token-fingerprint")).slice(0, 32);
+    const stored = this.kvGet<string | null>("hostingTokenFingerprint", null);
+    if (stored === fingerprint) return;
+    this.kvPut("hostingTokenFingerprint", fingerprint);
+    // First sighting is not a rotation, so it records the mark and changes nothing.
+    if (stored === null) return;
+    this.kvPut("autoRepair", EMPTY_REPAIR);
+    this.log("info", "hosting.token", "A replacement hosting token was stored, so automatic repair may try again.");
+  }
+
   /** Read-only Railway refresh used by the watchdog so status stays current unattended. */
   private async refreshHostingFacts(): Promise<void> {
     if (!this.railwayToken()) return;
@@ -3064,6 +3096,7 @@ export class AutomationEngine extends DurableObject<Env> {
    * capped, so a genuinely broken build is never redeployed in a loop.
    */
   private async autoRepairHosting(probe: ConnectorProbe): Promise<void> {
+    await this.noteTokenRotation();
     const stored = this.kvGet<AutoRepairState>("autoRepair", EMPTY_REPAIR);
     // The routine now reconnects the repository before building, so attempts made
     // by the previous routine no longer predict whether this one will succeed.
