@@ -1,5 +1,7 @@
 import { DurableObject } from "cloudflare:workers";
 
+import { AccountRegistry } from "./accounts";
+
 type Env = {
   DO: Fetcher & {
     setAlarm(className: string, id: string, scheduledTime: number | Date): Promise<void>;
@@ -397,6 +399,20 @@ const AI_MODEL = "openai/gpt-5.4-mini";
 
 const HARDWIRED_ID = "hardwired-joefortune";
 const HARDWIRED_NAME = "Joe Fortune (hardwired)";
+/** The engine that already holds the original owner's flows, logs and connection. */
+const OWNER_TENANT_ID = "primary";
+
+/** The signed-in account a request belongs to, established by the gateway worker. */
+type Actor = { accountId: string; username: string; role: "owner" | "member" };
+
+/** A starting point anyone can copy into their own account and point at any bot. */
+export type FlowTemplate = {
+  id: string;
+  name: string;
+  summary: string;
+  targetHint: string;
+  steps: WorkflowStep[];
+};
 /** Effectively never expires — the hardwired flow waits indefinitely for the next bot reply. */
 const NEVER_EXPIRES = 8_640_000_000_000;
 
@@ -447,6 +463,8 @@ function hardwiredSteps(): WorkflowStep[] {
 
 /** Strongly consistent, always-on control plane for ReplyFlow. */
 export class AutomationEngine extends DurableObject<Env> {
+  private accountRegistry: AccountRegistry | null = null;
+
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
     const sql = this.ctx.storage.sql;
@@ -474,11 +492,30 @@ export class AutomationEngine extends DurableObject<Env> {
     )`);
     sql.exec("CREATE TABLE IF NOT EXISTS dedupe (h TEXT PRIMARY KEY, ts INTEGER NOT NULL)");
     sql.exec("CREATE TABLE IF NOT EXISTS sends (id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL)");
-    this.seedHardwired();
   }
 
-  /** Re-creates the permanent Joe Fortune flow whenever it is missing. */
+  /** Lazily created so ordinary tenant engines never build the registry tables. */
+  private registry(): AccountRegistry {
+    if (!this.accountRegistry) this.accountRegistry = new AccountRegistry(this.ctx.storage.sql);
+    return this.accountRegistry;
+  }
+
+  /** Which account's world this engine instance is. Set by the gateway on every hop. */
+  private tenantId(): string {
+    return this.kvGet<string>("tenantId", this.ctx.id.name ?? OWNER_TENANT_ID);
+  }
+
+  /** True only for the original engine, which keeps the permanent flow and hosting controls. */
+  private isOwnerTenant(): boolean {
+    return this.tenantId() === OWNER_TENANT_ID;
+  }
+
+  /**
+   * Re-creates the permanent Joe Fortune flow whenever it is missing. Only the owner
+   * tenant has one; every other account gets it as a template it can copy and edit.
+   */
   private seedHardwired(): void {
+    if (!this.isOwnerTenant()) return;
     const existing = this.ctx.storage.sql
       .exec<{ id: string }>("SELECT id FROM workflows WHERE id = ?", HARDWIRED_ID)
       .toArray()[0];
@@ -597,7 +634,8 @@ export class AutomationEngine extends DurableObject<Env> {
         const envelope = Array.isArray(parsed) ? null : parsed;
         const rawSteps = Array.isArray(parsed) ? parsed : (parsed.steps ?? []);
         const status = envelope?.status ?? (row.enabled === 1 ? "enabled" : "paused");
-        const pinned = row.id === HARDWIRED_ID || Boolean(envelope?.pinned);
+        // Permanent only in the owner's engine; everywhere else it is an ordinary flow.
+        const pinned = (row.id === HARDWIRED_ID || Boolean(envelope?.pinned)) && this.isOwnerTenant();
         return {
           version: 2,
           id: row.id,
@@ -668,21 +706,47 @@ export class AutomationEngine extends DurableObject<Env> {
     return Uint8Array.from(binary, (char) => char.charCodeAt(0));
   }
 
-  private async passwordHash(passcode: string, salt: Uint8Array): Promise<string> {
-    const key = await crypto.subtle.importKey("raw", new TextEncoder().encode(passcode), "PBKDF2", false, ["deriveBits"]);
-    const bits = await crypto.subtle.deriveBits(
-      { name: "PBKDF2", salt: salt.buffer, iterations: 210_000, hash: "SHA-256" },
-      key,
-      256,
-    );
-    return this.hex(new Uint8Array(bits));
+  /**
+   * Runs PBKDF2 at a given cost. This runtime rejects more than 100k iterations in
+   * one call, so anything heavier has to be chained rather than requested outright.
+   */
+  private async pbkdf2(passcode: string, salt: Uint8Array, iterations: number, rounds: number): Promise<string> {
+    let material = new TextEncoder().encode(passcode) as Uint8Array;
+    for (let round = 0; round < rounds; round += 1) {
+      const key = await crypto.subtle.importKey("raw", material, "PBKDF2", false, ["deriveBits"]);
+      const bits = await crypto.subtle.deriveBits({ name: "PBKDF2", salt, iterations, hash: "SHA-256" }, key, 256);
+      material = new Uint8Array(bits);
+    }
+    return this.hex(material);
   }
 
-  private tokenValid(request: Request): boolean {
-    const record = this.kvGet<{ token: string; expiresAt: number } | null>("ownerSession", null);
-    if (!record || record.expiresAt <= Date.now()) return false;
-    const header = request.headers.get("Authorization") ?? "";
-    return this.safeEqual(header, `Bearer ${record.token}`);
+  private async passwordHash(passcode: string, salt: Uint8Array): Promise<string> {
+    return this.pbkdf2(passcode, salt, 100_000, 2);
+  }
+
+  /**
+   * The original single 210k-iteration scheme. Newer runtimes refuse that many
+   * rounds in one call, in which case the stored hash simply cannot be recomputed.
+   */
+  private async legacyPasswordHash(passcode: string, salt: Uint8Array): Promise<string | null> {
+    try {
+      return await this.pbkdf2(passcode, salt, 210_000, 1);
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * The account behind this request. The gateway worker resolves the session and
+   * rewrites these headers on every hop, stripping anything a browser sent, so an
+   * engine can only ever be reached as the account that owns it.
+   */
+  private actorFrom(request: Request): Actor | null {
+    const accountId = request.headers.get("X-Account-Id") ?? "";
+    const username = request.headers.get("X-Account-Name") ?? "";
+    const role = request.headers.get("X-Account-Role") ?? "";
+    if (!accountId || !username || (role !== "owner" && role !== "member")) return null;
+    return { accountId, username, role };
   }
 
   private async secretKey(): Promise<CryptoKey> {
@@ -731,9 +795,21 @@ export class AutomationEngine extends DurableObject<Env> {
     const publicOrigin = request.headers.get("X-Public-Origin");
     if (publicOrigin && this.kvGet<string | null>("publicOrigin", null) !== publicOrigin) this.kvPut("publicOrigin", publicOrigin);
 
+    // One dedicated instance carries the account registry instead of a tenant's
+    // flows, so the platform only has a single Durable Object class to know about.
+    // Checked before any tenant setup: this instance is nobody's engine.
+    if (path.startsWith("/registry/")) {
+      const body = (await request.json().catch(() => ({}))) as Record<string, unknown>;
+      return this.registry().handle(path.slice("/registry".length), body);
+    }
+
+    const tenantHeader = request.headers.get("X-Tenant-Id");
+    if (tenantHeader && this.kvGet<string | null>("tenantId", null) !== tenantHeader) this.kvPut("tenantId", tenantHeader);
+    this.seedHardwired();
+
     if (path === "/webhook" && request.method === "POST") return this.handleWebhook(request);
     if (path === "/connector/event" && request.method === "POST") return this.handleConnectorEvent(request);
-    if (path === "/auth" && request.method === "POST") return this.handleAuth(request);
+    if (path === "/internal/owner-claim" && request.method === "POST") return this.handleOwnerClaim(request);
 
     // Unauthenticated on purpose and deliberately value-free: it only guarantees the
     // heartbeat alarm exists so the engine keeps running with no console open.
@@ -755,10 +831,19 @@ export class AutomationEngine extends DurableObject<Env> {
       return new Response(null, { status: 101, webSocket: client });
     }
 
-    if (!this.tokenValid(request)) return Response.json({ error: "unauthorized" }, { status: 401 });
+    const actor = this.actorFrom(request);
+    if (!actor) return Response.json({ error: "unauthorized" }, { status: 401 });
+    // Belt and braces: the gateway already refuses these, and so does the engine.
+    if (path.startsWith("/hosting/") && actor.role !== "owner") {
+      return Response.json({ error: "Hosting controls belong to the console owner." }, { status: 403 });
+    }
 
     switch (path) {
-      case "/state": return Response.json(await this.snapshot());
+      case "/state": return Response.json(await this.snapshot(actor));
+      case "/account/risk": return this.handleRiskAck(request);
+      case "/workflow/templates": return Response.json({ templates: this.templates() });
+      case "/workflow/template": return this.handleTemplateApply(request);
+      case "/workflow/run": return this.handleWorkflowRun(request, actor);
       case "/stream/ticket": return this.handleStreamTicket();
       case "/settings": return this.handleSettings(request);
       case "/workflow": return this.handleWorkflow(request);
@@ -768,7 +853,7 @@ export class AutomationEngine extends DurableObject<Env> {
       case "/link/personal/start": return this.handlePersonalStart(request);
       case "/link/personal/submit": return this.handlePersonalSubmit(request);
       case "/link/personal/poll": return this.handlePersonalPoll();
-      case "/hardwired/run": return this.handleHardwiredRun(request);
+      case "/hardwired/run": return this.handleWorkflowRun(request, actor);
       case "/connector/check": return Response.json({ probe: await this.probeConnector() });
       case "/hosting/diagnose": return Response.json({ report: await this.hostingDiagnose() });
       case "/hosting/apply": return this.handleHostingApply();
@@ -778,8 +863,8 @@ export class AutomationEngine extends DurableObject<Env> {
       case "/link/reconnect": return this.handleReconnect();
       case "/link/disconnect": return this.handleDisconnect(false);
       case "/link/forget": return this.handleDisconnect(true);
-      case "/job/retry": return this.handleRetry(request);
-      case "/job/status": return this.handleJobStatus(request);
+      case "/job/retry": return this.handleRetry(request, actor);
+      case "/job/status": return this.handleJobStatus(request, actor);
       case "/simulate": return this.handleSimulate(request);
       case "/workflow/preview": return this.handleWorkflowPreview(request);
       case "/ai/conversation": return this.handleConversationAnalysis(request);
@@ -793,51 +878,60 @@ export class AutomationEngine extends DurableObject<Env> {
   override webSocketClose(): void { /* hibernation managed */ }
   override webSocketError(): void { /* hibernation managed */ }
 
-  private async handleAuth(request: Request): Promise<Response> {
+  /**
+   * One-time proof, during sign-up, that the caller is the person who has been using
+   * this console: they know the passcode that used to open it. Reachable only from the
+   * gateway worker, never from a browser, and it never issues a session by itself.
+   */
+  private async handleOwnerClaim(request: Request): Promise<Response> {
     const now = Date.now();
+    if (!this.isOwnerTenant()) return Response.json({ ok: false }, { status: 404 });
     const guard = this.kvGet<{ fails: number; lockedUntil: number }>("authGuard", { fails: 0, lockedUntil: 0 });
-    if (guard.lockedUntil > now) {
-      return Response.json({ error: `Too many attempts. Try again in ${Math.ceil((guard.lockedUntil - now) / 1000)}s.` }, { status: 429 });
-    }
+    if (guard.lockedUntil > now) return Response.json({ ok: false, error: "Too many attempts." }, { status: 429 });
     const body = (await request.json().catch(() => ({}))) as { passcode?: string };
     const passcode = (body.passcode ?? "").trim();
-    if (passcode.length < 8) return Response.json({ error: "Passcode must be at least 8 characters." }, { status: 400 });
+    if (passcode.length < 8) return Response.json({ ok: false }, { status: 400 });
 
-    let record = this.kvGet<{ salt: string; hash: string } | null>("passcodeV2", null);
+    const record = this.kvGet<{ salt: string; hash: string } | null>("passcodeV2", null);
     const legacy = this.kvGet<string | null>("passcode", null);
     let valid = false;
-    let claimed = false;
-    if (!record && !legacy) {
-      const salt = crypto.getRandomValues(new Uint8Array(16));
-      record = { salt: this.base64(salt), hash: await this.passwordHash(passcode, salt) };
-      this.kvPut("passcodeV2", record);
-      claimed = true;
-      valid = true;
-    } else if (record) {
-      valid = this.safeEqual(record.hash, await this.passwordHash(passcode, this.fromBase64(record.salt)));
+    if (record) {
+      const salt = this.fromBase64(record.salt);
+      const candidate = await this.legacyPasswordHash(passcode, salt);
+      valid = candidate !== null && this.safeEqual(record.hash, candidate);
+      if (!valid) valid = this.safeEqual(record.hash, await this.passwordHash(passcode, salt));
     } else if (legacy) {
       valid = this.safeEqual(legacy, await this.hash(passcode));
-      if (valid) {
-        const salt = crypto.getRandomValues(new Uint8Array(16));
-        this.kvPut("passcodeV2", { salt: this.base64(salt), hash: await this.passwordHash(passcode, salt) });
-        this.kvDelete("passcode");
-      }
+    } else {
+      // A console that was never claimed has no secret to prove, so the first namer wins.
+      valid = true;
     }
 
     if (!valid) {
       const fails = guard.fails + 1;
-      const lockedUntil = fails >= 5 ? now + 60_000 : 0;
-      this.kvPut("authGuard", { fails: lockedUntil ? 0 : fails, lockedUntil });
-      this.log("warn", "console.denied", "Rejected sign-in attempt.");
-      return Response.json({ error: "Incorrect passcode." }, { status: 403 });
+      this.kvPut("authGuard", fails >= 5 ? { fails: 0, lockedUntil: now + 60_000 } : { fails, lockedUntil: 0 });
+      this.log("warn", "console.denied", "Rejected owner-claim attempt.");
+      return Response.json({ ok: false }, { status: 403 });
     }
-
     this.kvPut("authGuard", { fails: 0, lockedUntil: 0 });
-    const token = crypto.randomUUID().replace(/-/g, "") + crypto.randomUUID().replace(/-/g, "");
-    this.kvPut("ownerSession", { token, expiresAt: now + 30 * 86_400_000 });
-    this.log("success", claimed ? "console.claim" : "console.login", claimed ? "Console claimed by its owner." : "Owner signed in.");
+    this.kvPut("ownerClaimedAt", now);
+    this.kvDelete("ownerSession");
+    this.log("success", "console.claim", "Owner account claimed this console with the existing passcode.");
     await this.ensureWatchdog();
-    return Response.json({ token, claimed });
+    return Response.json({ ok: true });
+  }
+
+  /** Records that this account understands what automating a personal account risks. */
+  private async handleRiskAck(request: Request): Promise<Response> {
+    const body = (await request.json().catch(() => ({}))) as { accepted?: boolean };
+    if (body.accepted !== true) {
+      this.kvDelete("riskAckAt");
+      return Response.json({ riskAckAt: null });
+    }
+    const now = Date.now();
+    this.kvPut("riskAckAt", now);
+    this.log("info", "account.risk", "Telegram monitoring and account-ban risk acknowledged.");
+    return Response.json({ riskAckAt: now });
   }
 
   private handleStreamTicket(): Response {
@@ -857,7 +951,7 @@ export class AutomationEngine extends DurableObject<Env> {
       .map((row) => ({ ts: row.ts, level: row.level, type: row.type, workflowId: row.workflow_id, chatKey: row.chat_key, detail: row.detail }));
   }
 
-  private async snapshot(): Promise<unknown> {
+  private async snapshot(actor?: Actor): Promise<unknown> {
     const workflows = this.workflows();
     const dayAgo = Date.now() - 86_400_000;
     const sentToday = this.ctx.storage.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM sends WHERE ts > ?", dayAgo).toArray()[0]?.n ?? 0;
@@ -887,6 +981,13 @@ export class AutomationEngine extends DurableObject<Env> {
       .toArray()
       .map((row) => ({ chatKey: row.chat_key, stepIndex: row.step_index }));
     return {
+      account: {
+        username: actor?.username ?? null,
+        role: actor?.role ?? "member",
+        isOwner: actor?.role === "owner",
+        tenantId: this.tenantId(),
+        riskAckAt: this.kvGet<number | null>("riskAckAt", null),
+      },
       link: this.link(),
       hardwired: {
         id: HARDWIRED_ID,
@@ -979,7 +1080,7 @@ export class AutomationEngine extends DurableObject<Env> {
     }
     const now = Date.now();
     const id = raw.id?.trim() || crypto.randomUUID();
-    const pinned = id === HARDWIRED_ID;
+    const pinned = id === HARDWIRED_ID && this.isOwnerTenant();
     const existing = this.ctx.storage.sql.exec<{ created_at: number }>("SELECT created_at FROM workflows WHERE id = ?", id).toArray()[0];
     const statusValues: WorkflowStatus[] = ["draft", "test", "enabled", "paused", "attention"];
     const status = statusValues.includes(raw.status as WorkflowStatus) ? (raw.status as WorkflowStatus) : (raw.enabled ? "enabled" : "paused");
@@ -1012,7 +1113,7 @@ export class AutomationEngine extends DurableObject<Env> {
   private async handleWorkflowDelete(request: Request): Promise<Response> {
     const { id } = (await request.json().catch(() => ({}))) as { id?: string };
     if (!id) return Response.json({ error: "Missing id." }, { status: 400 });
-    if (id === HARDWIRED_ID) {
+    if (id === HARDWIRED_ID && this.isOwnerTenant()) {
       return Response.json({ error: "The hardwired Joe Fortune flow is permanent and cannot be deleted." }, { status: 409 });
     }
     this.ctx.storage.sql.exec("DELETE FROM workflows WHERE id = ?", id);
@@ -1151,7 +1252,7 @@ export class AutomationEngine extends DurableObject<Env> {
     const hook = await fetch(`https://api.telegram.org/bot${token}/setWebhook`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ url: `${origin}/tg/${secret}`, allowed_updates: ["message", "edited_message"], drop_pending_updates: true }),
+      body: JSON.stringify({ url: `${origin}/tg/${this.tenantId()}/${secret}`, allowed_updates: ["message", "edited_message"], drop_pending_updates: true }),
     }).then((response) => response.json() as Promise<{ ok: boolean; description?: string }>).catch(() => null);
     if (!hook?.ok) return this.linkFailure(hook?.description ?? "Telegram would not accept the webhook address.");
     this.kvPut("botTokenSealed", await this.seal(token));
@@ -1186,7 +1287,9 @@ export class AutomationEngine extends DurableObject<Env> {
     if (!base || !secret) throw new Error("The Railway connector is not configured yet.");
     const timestamp = String(Date.now());
     const nonce = crypto.randomUUID();
-    const payload = JSON.stringify(body);
+    // Every connector call names its tenant, so one container can supervise many
+    // isolated Telegram sessions without any of them seeing another's.
+    const payload = JSON.stringify({ ...(body as Record<string, unknown>), tenant: this.tenantId() });
     const signature = await this.hmac(secret, `POST\n${path}\n${timestamp}\n${nonce}\n${payload}`);
     const response = await fetch(`${base}${path}`, {
       method: "POST",
@@ -1195,6 +1298,7 @@ export class AutomationEngine extends DurableObject<Env> {
         "X-ReplyFlow-Timestamp": timestamp,
         "X-ReplyFlow-Nonce": nonce,
         "X-ReplyFlow-Signature": signature,
+        "X-ReplyFlow-Tenant": this.tenantId(),
       },
       body: payload,
     });
@@ -1207,8 +1311,13 @@ export class AutomationEngine extends DurableObject<Env> {
     return result;
   }
 
-  /** Server-only MTProto app credentials, never returned to the browser. */
+  /**
+   * Server-only MTProto app credentials, never returned to the browser. Only the
+   * owner inherits the project's own credentials: every other account must bring
+   * their own, so one flagged account can never take the whole service down.
+   */
   private presetCredentials(): { apiId: string; apiHash: string } | null {
+    if (!this.isOwnerTenant()) return null;
     const apiId = this.env.TELEGRAM_API_ID?.trim() ?? "";
     const apiHash = this.env.TELEGRAM_API_HASH?.trim() ?? "";
     if (!/^\d{4,12}$/.test(apiId) || !/^[a-fA-F0-9]{32}$/.test(apiHash)) return null;
@@ -1221,7 +1330,14 @@ export class AutomationEngine extends DurableObject<Env> {
     const preset = this.presetCredentials();
     const body = { ...raw, apiId: raw.apiId?.trim() || preset?.apiId, apiHash: raw.apiHash?.trim() || preset?.apiHash };
     if (!body.riskAccepted) return Response.json({ error: "Acknowledge Telegram's monitoring and account-ban risk first." }, { status: 400 });
-    if (!/^\d{4,12}$/.test(body.apiId ?? "") || !/^[a-fA-F0-9]{32}$/.test(body.apiHash ?? "")) return Response.json({ error: "Enter a valid Telegram API ID and 32-character API hash." }, { status: 400 });
+    this.kvPut("riskAckAt", Date.now());
+    if (!/^\d{4,12}$/.test(body.apiId ?? "") || !/^[a-fA-F0-9]{32}$/.test(body.apiHash ?? "")) {
+      return Response.json({
+        error: preset
+          ? "Enter a valid Telegram API ID and 32-character API hash."
+          : "Create your own Telegram API ID and hash at my.telegram.org, then paste both here. Your own keys keep your account separate from everyone else's.",
+      }, { status: 400 });
+    }
     if (body.method === "phone" && !(body.phone ?? "").trim()) return Response.json({ error: "Enter a phone number including country code." }, { status: 400 });
     this.setLink({ ...EMPTY_LINK, mode: "personal", status: "connecting", detail: "Starting encrypted personal-account login…" });
     this.broadcast({ kind: "link", link: this.link() });
@@ -1293,25 +1409,101 @@ export class AutomationEngine extends DurableObject<Env> {
     }
   }
 
-  /** Fires the hardwired flow into a chosen chat without waiting for a trigger message. */
-  private async handleHardwiredRun(request: Request): Promise<Response> {
-    const body = (await request.json().catch(() => ({}))) as { chatKey?: string };
+  /** Fires any saved flow into a chosen chat without waiting for a trigger message. */
+  private async handleWorkflowRun(request: Request, actor: Actor): Promise<Response> {
+    const body = (await request.json().catch(() => ({}))) as { chatKey?: string; workflowId?: string };
     const chatKey = String(body.chatKey ?? "").trim().slice(0, 120);
     if (!chatKey) return Response.json({ error: "Enter the chat or bot username to run the flow in." }, { status: 400 });
     if (this.settings().killSwitch) return Response.json({ error: "Release the emergency stop before running the flow." }, { status: 409 });
     if (this.link().status !== "online") return Response.json({ error: "Connect Telegram before running the flow." }, { status: 409 });
-    const hardwired = this.workflows().find((workflow) => workflow.id === HARDWIRED_ID);
-    if (!hardwired || hardwired.steps.length === 0) return Response.json({ error: "The hardwired flow is unavailable." }, { status: 409 });
+    const workflowId = String(body.workflowId ?? HARDWIRED_ID).trim().slice(0, 80);
+    const flow = this.workflows().find((workflow) => workflow.id === workflowId);
+    if (!flow || flow.steps.length === 0) return Response.json({ error: "That flow is unavailable." }, { status: 409 });
     this.ctx.storage.sql.exec("DELETE FROM runtime WHERE chat_key = ?", chatKey);
-    this.log("info", "hardwired.run", "Manual run started for the hardwired flow.", HARDWIRED_ID, chatKey);
+    this.log("info", "workflow.run", `Manual run started for "${flow.name}".`, flow.id, chatKey);
     await this.ingest(
       this.normalizeMessage({
-        chatKey, sender: "console", text: hardwired.steps[0].trigger, direction: "outgoing",
+        chatKey, sender: "console", text: flow.steps[0].trigger, direction: "outgoing",
         chatType: "private", isBot: false, messageId: null,
       }),
-      { forceWorkflowId: HARDWIRED_ID },
+      { forceWorkflowId: flow.id },
     );
-    return Response.json(await this.snapshot());
+    return Response.json(await this.snapshot(actor));
+  }
+
+  /**
+   * Starting points anyone can copy into their own account and aim at any bot.
+   * The Joe Fortune sequence is one of them rather than a product-level special case.
+   */
+  private templates(): FlowTemplate[] {
+    const generic = (id: string, trigger: string, mode: TriggerMode, action: Partial<WorkflowStep>): WorkflowStep =>
+      this.normalizeStep({ id, trigger, mode, conditionLogic: "and", conditions: [], delayMs: 0, timeoutMs: 86_400_000, maxLoops: 20, ...action });
+    return [
+      {
+        id: "bot-sequence",
+        name: "Bot-to-bot sequence",
+        summary: "Sends an opening command, then answers each of the bot's replies in order. The pattern behind the Joe Fortune flow, ready to point at any bot.",
+        targetHint: "@yourbot",
+        steps: hardwiredSteps().map((step, index) => ({
+          ...step,
+          id: `template-sequence-${index}`,
+          trigger: index === 0 ? "start" : step.trigger,
+          reply: index === 0 ? "/start" : step.reply,
+        })),
+      },
+      {
+        id: "joefortune",
+        name: "Joe Fortune keywords",
+        summary: "The exact five-step keyword run: /start, Get rows, Keyword, the keyword list, then the numbers.",
+        targetHint: "@joefortune_bot",
+        steps: hardwiredSteps().map((step, index) => ({ ...step, id: `template-joefortune-${index}` })),
+      },
+      {
+        id: "auto-reply",
+        name: "Keyword auto-reply",
+        summary: "Watches for one word in any message and answers with a fixed line. The simplest useful flow.",
+        targetHint: "@anybot",
+        steps: [generic("template-reply-0", "hello", "contains", { actionType: "sendText", reply: "Hi — thanks for the message, I will get back to you shortly." })],
+      },
+      {
+        id: "menu-walkthrough",
+        name: "Menu walkthrough",
+        summary: "Opens a bot, presses a named button when the menu appears, then confirms. Good for bots driven by inline keyboards.",
+        targetHint: "@anybot",
+        steps: [
+          generic("template-menu-0", "start", "exact", { actionType: "sendText", reply: "/start" }),
+          generic("template-menu-1", ".*", "regex", { actionType: "pressButton", buttonTarget: "Menu", conditions: botReplyConditions("template-menu-1") }),
+          generic("template-menu-2", ".*", "regex", { actionType: "sendText", reply: "Confirm", conditions: botReplyConditions("template-menu-2") }),
+        ],
+      },
+    ];
+  }
+
+  /** Copies a template into this account as a disabled draft, ready to edit. */
+  private async handleTemplateApply(request: Request): Promise<Response> {
+    const body = (await request.json().catch(() => ({}))) as { templateId?: string; target?: string };
+    const template = this.templates().find((item) => item.id === body.templateId);
+    if (!template) return Response.json({ error: "No such template." }, { status: 404 });
+    const targets = String(body.target ?? "").trim() ? [String(body.target).trim().slice(0, 80)] : [];
+    const now = Date.now();
+    const id = crypto.randomUUID();
+    const envelope = {
+      version: 2,
+      status: "draft" as WorkflowStatus,
+      targets,
+      cooldownMs: 0,
+      maxRunsPerChat: 0,
+      pinned: false,
+      bypassLimits: true,
+      steps: template.steps,
+    };
+    this.ctx.storage.sql.exec(
+      "INSERT INTO workflows (id, name, target, enabled, steps, created_at, updated_at) VALUES (?, ?, ?, 0, ?, ?, ?)",
+      id, template.name, targets[0] ?? "", JSON.stringify(envelope), now, now,
+    );
+    this.log("info", "workflow.template", `Template "${template.name}" copied in as a disabled draft.`, id);
+    this.broadcast({ kind: "workflows", workflows: this.workflows() });
+    return Response.json({ id, workflows: this.workflows() });
   }
 
   private async handleReconnect(): Promise<Response> {
@@ -1716,7 +1908,7 @@ export class AutomationEngine extends DurableObject<Env> {
     this.ctx.storage.sql.exec("INSERT INTO failed_jobs (id, ts, workflow_id, chat_key, reason, payload, attempts, status) VALUES (?, ?, ?, ?, ?, ?, 0, 'pending')", crypto.randomUUID(), Date.now(), workflowId, chatKey, reason.slice(0, 300), JSON.stringify(payload));
   }
 
-  private async handleRetry(request: Request): Promise<Response> {
+  private async handleRetry(request: Request, actor: Actor): Promise<Response> {
     const { id } = (await request.json().catch(() => ({}))) as { id?: string };
     if (!id) return Response.json({ error: "Missing id." }, { status: 400 });
     const job = this.ctx.storage.sql.exec<{ id: string; workflow_id: string | null; chat_key: string; payload: string; attempts: number; status: string }>("SELECT * FROM failed_jobs WHERE id = ?", id).toArray()[0];
@@ -1729,15 +1921,15 @@ export class AutomationEngine extends DurableObject<Env> {
     const ok = await this.sendAction(job.chat_key, job.workflow_id ?? "", slot.id, { actionType: payload.actionType ?? "sendText", text: payload.text, buttonTarget: payload.buttonTarget, reaction: payload.reaction, messageId: payload.messageId, idempotencyKey: payload.idempotencyKey ?? job.id });
     this.ctx.storage.sql.exec("UPDATE failed_jobs SET attempts = ?, status = ? WHERE id = ?", job.attempts + 1, ok ? "resolved" : "pending", id);
     this.log(ok ? "success" : "error", "job.retry", ok ? "Queued action replayed successfully." : "Queued action failed again.", job.workflow_id, job.chat_key);
-    return Response.json(await this.snapshot());
+    return Response.json(await this.snapshot(actor));
   }
 
-  private async handleJobStatus(request: Request): Promise<Response> {
+  private async handleJobStatus(request: Request, actor: Actor): Promise<Response> {
     const body = (await request.json().catch(() => ({}))) as { id?: string; status?: "cancelled" | "dismissed" };
     if (!body.id || !["cancelled", "dismissed"].includes(body.status ?? "")) return Response.json({ error: "Invalid job update." }, { status: 400 });
     this.ctx.storage.sql.exec("UPDATE failed_jobs SET status = ? WHERE id = ? AND status = 'pending'", body.status, body.id);
     this.log("info", "job.update", `Failed job ${body.status}.`);
-    return Response.json(await this.snapshot());
+    return Response.json(await this.snapshot(actor));
   }
 
   private async sendOperationalAlert(text: string): Promise<void> {
@@ -1800,13 +1992,14 @@ export class AutomationEngine extends DurableObject<Env> {
   }
 
   private async ensureWatchdog(): Promise<void> {
-    const pending = await this.env.DO.getAlarm("AutomationEngine", this.ctx.id.name ?? "primary").catch(() => null);
-    if (pending === null || pending === undefined) await this.env.DO.setAlarm("AutomationEngine", this.ctx.id.name ?? "primary", Date.now() + WATCHDOG_MS).catch(() => undefined);
+    const name = this.tenantId();
+    const pending = await this.env.DO.getAlarm("AutomationEngine", name).catch(() => null);
+    if (pending === null || pending === undefined) await this.env.DO.setAlarm("AutomationEngine", name, Date.now() + WATCHDOG_MS).catch(() => undefined);
   }
 
   /** Brings the single shared alarm forward when work is due before the next watchdog tick. */
   private async scheduleAlarm(at: number): Promise<void> {
-    const name = this.ctx.id.name ?? "primary";
+    const name = this.tenantId();
     const target = Math.max(Date.now() + 1_000, at);
     const pending = await this.env.DO.getAlarm("AutomationEngine", name).catch(() => null);
     if (pending === null || pending === undefined || pending > target) {
@@ -1855,7 +2048,7 @@ export class AutomationEngine extends DurableObject<Env> {
     try {
       await this.runWatchdogTick();
     } finally {
-      await this.env.DO.setAlarm("AutomationEngine", this.ctx.id.name ?? "primary", Date.now() + WATCHDOG_MS).catch(() => undefined);
+      await this.env.DO.setAlarm("AutomationEngine", this.tenantId(), Date.now() + WATCHDOG_MS).catch(() => undefined);
     }
   }
 

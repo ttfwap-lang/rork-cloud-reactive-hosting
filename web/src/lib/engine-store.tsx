@@ -7,11 +7,14 @@ import {
   getToken,
   setToken,
   streamUrl,
+  type AccountView,
   type ConversationAnalysis,
   type EngineEvent,
   type FlowImportPreview,
+  type FlowTemplate,
   type HostingReport,
   type HostingStatus,
+  type OwnerOverview,
   type PersonalStartInput,
   type Settings,
   type Snapshot,
@@ -22,7 +25,10 @@ import {
 
 type EngineContextValue = {
   authed: boolean;
-  signIn: (passcode: string) => Promise<void>;
+  account: AccountView | undefined;
+  isOwner: boolean;
+  signUp: (input: { username: string; password: string; claimPasscode?: string }) => Promise<void>;
+  signIn: (input: { username: string; password: string }) => Promise<void>;
   signOut: () => void;
   snapshot: Snapshot | undefined;
   isLoading: boolean;
@@ -33,11 +39,13 @@ type EngineContextValue = {
   saveWorkflow: (workflow: Partial<Workflow>) => Promise<void>;
   deleteWorkflow: (id: string) => void;
   importFlow: (flow: unknown, commit: boolean) => Promise<{ id?: string; name: string; preview: FlowImportPreview[]; note?: string }>;
+  templates: FlowTemplate[] | undefined;
+  applyTemplate: (input: { templateId: string; target?: string }) => Promise<void>;
   connectBot: (botToken: string) => Promise<void>;
   startPersonal: (input: PersonalStartInput) => Promise<void>;
   submitPersonal: (kind: "code" | "password", value: string) => Promise<void>;
   pollPersonal: () => Promise<void>;
-  runHardwired: (chatKey: string) => Promise<void>;
+  runWorkflow: (input: { chatKey: string; workflowId?: string }) => Promise<void>;
   checkConnector: () => Promise<void>;
   diagnoseHosting: () => Promise<HostingReport>;
   applyHosting: () => Promise<{ applied: string[]; report: HostingReport }>;
@@ -46,6 +54,11 @@ type EngineContextValue = {
   refreshHostingStatus: () => void;
   setAutoDeploy: (input: { enabled: boolean; repository?: string; branch?: string }) => Promise<void>;
   forceRebuild: (input?: { branch?: string }) => Promise<void>;
+  ownerOverview: OwnerOverview | undefined;
+  refreshOwnerOverview: () => void;
+  suspendAccount: (accountId: string, suspended: boolean) => Promise<void>;
+  removeAccount: (accountId: string) => Promise<void>;
+  changePassword: (input: { currentPassword: string; newPassword: string }) => Promise<void>;
   reconnect: () => Promise<void>;
   disconnect: () => void;
   forgetConnection: () => Promise<void>;
@@ -58,7 +71,10 @@ type EngineContextValue = {
 
 const EngineContext = createContext<EngineContextValue | null>(null);
 const QUERY_KEY = ["engine-state"] as const;
+const ACCOUNT_KEY = ["account"] as const;
 const HOSTING_KEY = ["hosting-status"] as const;
+const OWNER_KEY = ["owner-overview"] as const;
+const TEMPLATE_KEY = ["flow-templates"] as const;
 /** The status dashboard refreshes on this cadence, awake or in a background tab. */
 const HOSTING_POLL_MS = 30_000;
 
@@ -68,6 +84,15 @@ export function EngineProvider({ children }: { children: ReactNode }) {
   const [liveEvents, setLiveEvents] = useState<EngineEvent[]>([]);
   const [streamOnline, setStreamOnline] = useState<boolean>(false);
   const socketRef = useRef<WebSocket | null>(null);
+
+  const accountQuery = useQuery({
+    queryKey: ACCOUNT_KEY,
+    queryFn: () => api.me().then((result) => result.account),
+    enabled: authed,
+    refetchInterval: 120_000,
+    retry: 1,
+  });
+  const isOwner = accountQuery.data?.role === "owner";
 
   const query = useQuery({
     queryKey: QUERY_KEY,
@@ -80,19 +105,39 @@ export function EngineProvider({ children }: { children: ReactNode }) {
   const hostingQuery = useQuery({
     queryKey: HOSTING_KEY,
     queryFn: () => api.hostingStatus().then((result) => result.status),
-    enabled: authed,
+    enabled: authed && isOwner,
     refetchInterval: HOSTING_POLL_MS,
     refetchIntervalInBackground: true,
     retry: 1,
   });
 
+  const ownerQuery = useQuery({
+    queryKey: OWNER_KEY,
+    queryFn: () => api.ownerOverview().then((result) => result.overview),
+    enabled: authed && isOwner,
+    refetchInterval: 60_000,
+    retry: 1,
+  });
+
+  const templateQuery = useQuery({
+    queryKey: TEMPLATE_KEY,
+    queryFn: () => api.templates().then((result) => result.templates),
+    enabled: authed,
+    staleTime: 10 * 60_000,
+    retry: 1,
+  });
+
+  const clearSession = useCallback((): void => {
+    setToken(null);
+    setAuthed(false);
+    setLiveEvents([]);
+    queryClient.clear();
+  }, [queryClient]);
+
   useEffect(() => {
-    const failure = query.error as { status?: number } | null;
-    if (failure?.status === 401) {
-      setToken(null);
-      setAuthed(false);
-    }
-  }, [query.error]);
+    const failure = (query.error ?? accountQuery.error) as { status?: number } | null;
+    if (failure?.status === 401) clearSession();
+  }, [query.error, accountQuery.error, clearSession]);
 
   useEffect(() => {
     if (!authed) return;
@@ -149,6 +194,11 @@ export function EngineProvider({ children }: { children: ReactNode }) {
     onSuccess: () => { invalidate(); toast.success("Workflow deleted"); },
     onError: (error: Error) => toast.error(error.message),
   });
+  const templateMutation = useMutation({
+    mutationFn: api.applyTemplate,
+    onSuccess: () => { invalidate(); toast.success("Template copied in as a draft"); },
+    onError: (error: Error) => toast.error(error.message),
+  });
   const botMutation = useMutation({
     mutationFn: api.connectBot,
     onSuccess: () => { invalidate(); toast.success("Bot link is live"); },
@@ -156,7 +206,7 @@ export function EngineProvider({ children }: { children: ReactNode }) {
   });
   const personalMutation = useMutation({
     mutationFn: api.startPersonal,
-    onSuccess: () => invalidate(),
+    onSuccess: () => { invalidate(); queryClient.invalidateQueries({ queryKey: ACCOUNT_KEY }); },
     onError: (error: Error) => toast.error(error.message),
   });
   const submitPersonalMutation = useMutation({
@@ -164,9 +214,9 @@ export function EngineProvider({ children }: { children: ReactNode }) {
     onSuccess: () => invalidate(),
     onError: (error: Error) => toast.error(error.message),
   });
-  const runHardwiredMutation = useMutation({
-    mutationFn: api.runHardwired,
-    onSuccess: () => { invalidate(); toast.success("Hardwired flow started"); },
+  const runWorkflowMutation = useMutation({
+    mutationFn: api.runWorkflow,
+    onSuccess: () => { invalidate(); toast.success("Flow started"); },
     onError: (error: Error) => toast.error(error.message),
   });
   const checkConnectorMutation = useMutation({
@@ -208,6 +258,27 @@ export function EngineProvider({ children }: { children: ReactNode }) {
     },
     onError: (error: Error) => toast.error(error.message),
   });
+  const suspendMutation = useMutation({
+    mutationFn: ({ accountId, suspended }: { accountId: string; suspended: boolean }) => api.suspendAccount(accountId, suspended),
+    onSuccess: (result) => {
+      queryClient.setQueryData<OwnerOverview>(OWNER_KEY, result.overview);
+      toast.success("Account updated");
+    },
+    onError: (error: Error) => toast.error(error.message),
+  });
+  const removeMutation = useMutation({
+    mutationFn: api.removeAccount,
+    onSuccess: (result) => {
+      queryClient.setQueryData<OwnerOverview>(OWNER_KEY, result.overview);
+      toast.success("Account removed");
+    },
+    onError: (error: Error) => toast.error(error.message),
+  });
+  const passwordMutation = useMutation({
+    mutationFn: api.changePassword,
+    onSuccess: (result) => { setToken(result.token); toast.success("Password changed", { description: "Every other signed-in device was signed out." }); },
+    onError: (error: Error) => toast.error(error.message),
+  });
   const reconnectMutation = useMutation({
     mutationFn: api.reconnect,
     onSuccess: () => { invalidate(); toast.success("Reconnect requested"); },
@@ -215,12 +286,12 @@ export function EngineProvider({ children }: { children: ReactNode }) {
   });
   const disconnectMutation = useMutation({
     mutationFn: api.disconnect,
-    onSuccess: () => { invalidate(); toast("Link disconnected", { description: "Workflows and logs were kept." }); },
+    onSuccess: () => { invalidate(); queryClient.invalidateQueries({ queryKey: ACCOUNT_KEY }); toast("Link disconnected", { description: "Workflows and logs were kept." }); },
     onError: (error: Error) => toast.error(error.message),
   });
   const forgetMutation = useMutation({
     mutationFn: api.forgetConnection,
-    onSuccess: () => { invalidate(); toast.success("Credentials and session removed"); },
+    onSuccess: () => { invalidate(); queryClient.invalidateQueries({ queryKey: ACCOUNT_KEY }); toast.success("Credentials and session removed"); },
     onError: (error: Error) => toast.error(error.message),
   });
   const importMutation = useMutation({
@@ -235,24 +306,44 @@ export function EngineProvider({ children }: { children: ReactNode }) {
     onError: (error: Error) => toast.error(error.message),
   });
   const simulateMutation = useMutation({ mutationFn: api.simulate, onSuccess: invalidate, onError: (error: Error) => toast.error(error.message) });
-  const analysisMutation = useMutation({ mutationFn: api.analyzeConversation, onError: (error: Error) => toast.error(error.message) });
+  const analysisMutation = useMutation({
+    mutationFn: api.analyzeConversation,
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ACCOUNT_KEY }),
+    onError: (error: Error) => toast.error(error.message),
+  });
 
-  const signIn = useCallback(async (passcode: string): Promise<void> => {
-    const result = await api.authenticate(passcode);
-    setToken(result.token);
+  const adopt = useCallback((token: string, account: AccountView, welcome: string): void => {
+    setToken(token);
+    queryClient.setQueryData<AccountView>(ACCOUNT_KEY, account);
     setAuthed(true);
     invalidate();
-    toast.success(result.claimed ? "Console claimed — you are the owner" : "Welcome back");
-  }, [invalidate]);
+    toast.success(welcome);
+  }, [invalidate, queryClient]);
+
+  const signIn = useCallback(async (input: { username: string; password: string }): Promise<void> => {
+    const result = await api.signIn(input);
+    adopt(result.token, result.account, `Welcome back, ${result.account.username}`);
+  }, [adopt]);
+
+  const signUp = useCallback(async (input: { username: string; password: string; claimPasscode?: string }): Promise<void> => {
+    const result = await api.signUp(input);
+    adopt(
+      result.token,
+      result.account,
+      result.account.role === "owner" ? `Owner account ${result.account.username} claimed` : `Account ${result.account.username} created`,
+    );
+  }, [adopt]);
 
   const signOut = useCallback((): void => {
-    setToken(null);
-    setAuthed(false);
-    setLiveEvents([]);
-  }, []);
+    void api.signOutServer().catch(() => undefined);
+    clearSession();
+  }, [clearSession]);
 
   const value = useMemo<EngineContextValue>(() => ({
     authed,
+    account: accountQuery.data,
+    isOwner,
+    signUp,
     signIn,
     signOut,
     snapshot: query.data,
@@ -264,6 +355,8 @@ export function EngineProvider({ children }: { children: ReactNode }) {
     saveWorkflow: async (workflow) => { await workflowMutation.mutateAsync(workflow); },
     deleteWorkflow: (id) => deleteMutation.mutate(id),
     importFlow: async (flow, commit) => importMutation.mutateAsync({ flow, commit }),
+    templates: templateQuery.data,
+    applyTemplate: async (input) => { await templateMutation.mutateAsync(input); },
     connectBot: async (botToken) => { await botMutation.mutateAsync(botToken); },
     startPersonal: async (input) => { await personalMutation.mutateAsync(input); },
     submitPersonal: async (kind, inputValue) => { await submitPersonalMutation.mutateAsync({ kind, value: inputValue }); },
@@ -271,7 +364,7 @@ export function EngineProvider({ children }: { children: ReactNode }) {
       const result = await api.pollPersonal();
       queryClient.setQueryData<Snapshot>(QUERY_KEY, (previous) => (previous ? { ...previous, link: result.link } : previous));
     },
-    runHardwired: async (chatKey) => { await runHardwiredMutation.mutateAsync(chatKey); },
+    runWorkflow: async (input) => { await runWorkflowMutation.mutateAsync(input); },
     checkConnector: async () => { await checkConnectorMutation.mutateAsync(); },
     diagnoseHosting: async () => (await diagnoseHostingMutation.mutateAsync()).report,
     applyHosting: async () => applyHostingMutation.mutateAsync(),
@@ -280,6 +373,11 @@ export function EngineProvider({ children }: { children: ReactNode }) {
     refreshHostingStatus: () => { queryClient.invalidateQueries({ queryKey: HOSTING_KEY }); },
     setAutoDeploy: async (input) => { await autoDeployMutation.mutateAsync(input); },
     forceRebuild: async (input) => { await forceRebuildMutation.mutateAsync(input ?? {}); },
+    ownerOverview: ownerQuery.data,
+    refreshOwnerOverview: () => { queryClient.invalidateQueries({ queryKey: OWNER_KEY }); },
+    suspendAccount: async (accountId, suspended) => { await suspendMutation.mutateAsync({ accountId, suspended }); },
+    removeAccount: async (accountId) => { await removeMutation.mutateAsync(accountId); },
+    changePassword: async (input) => { await passwordMutation.mutateAsync(input); },
     reconnect: async () => { await reconnectMutation.mutateAsync(); },
     disconnect: () => disconnectMutation.mutate(),
     forgetConnection: async () => { await forgetMutation.mutateAsync(); },
@@ -289,10 +387,11 @@ export function EngineProvider({ children }: { children: ReactNode }) {
     previewWorkflow: async (step, text) => api.previewWorkflow(step, text),
     analyzeConversation: async (input) => (await analysisMutation.mutateAsync(input)).analysis,
   }), [
-    authed, signIn, signOut, query.data, query.isLoading, query.error, liveEvents, streamOnline, queryClient,
+    authed, accountQuery.data, isOwner, signUp, signIn, signOut, query.data, query.isLoading, query.error, liveEvents, streamOnline, queryClient,
     settingsMutation, workflowMutation, deleteMutation, importMutation, botMutation, personalMutation, submitPersonalMutation,
-    hostingQuery.data, hostingQuery.dataUpdatedAt, autoDeployMutation,
-    runHardwiredMutation, checkConnectorMutation, diagnoseHostingMutation, applyHostingMutation,
+    hostingQuery.data, hostingQuery.dataUpdatedAt, autoDeployMutation, forceRebuildMutation, templateQuery.data, templateMutation,
+    ownerQuery.data, suspendMutation, removeMutation, passwordMutation,
+    runWorkflowMutation, checkConnectorMutation, diagnoseHostingMutation, applyHostingMutation,
     reconnectMutation, disconnectMutation, forgetMutation, retryMutation, jobMutation, simulateMutation, analysisMutation,
   ]);
 

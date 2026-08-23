@@ -19,14 +19,24 @@ $path = parse_url($_SERVER['REQUEST_URI'] ?? '/', PHP_URL_PATH) ?: '/';
 // Liveness must never touch Telegram or the session: the host restarts the
 // service if this is slow, which would otherwise interrupt a login in progress.
 if ($path === '/health') {
-    $status = 'offline';
+    $sessions = 0;
     try {
-        $status = (string) (StateStore::read()['status'] ?? 'offline');
+        foreach (StateStore::tenants() as $tenant) {
+            if ((string) (StateStore::read($tenant)['status'] ?? 'offline') === 'online') {
+                $sessions++;
+            }
+        }
     } catch (Throwable) {
-        $status = 'attention';
+        $sessions = 0;
     }
     http_response_code(200);
-    echo json_encode(['ok' => true, 'status' => $status, 'worker' => StateStore::heartbeatAge()], JSON_THROW_ON_ERROR);
+    // Counts only: which accounts exist is never exposed on an open route.
+    echo json_encode([
+        'ok' => true,
+        'status' => $sessions > 0 ? 'online' : 'offline',
+        'sessions' => $sessions,
+        'worker' => StateStore::supervisorAge(),
+    ], JSON_THROW_ON_ERROR);
     exit;
 }
 
@@ -51,7 +61,12 @@ try {
     if (!is_array($input)) {
         $input = [];
     }
-    $service = new TelegramService();
+    // Every signed call names the account it acts for. The signature is what makes
+    // this trustworthy: only the control plane can produce it, so a tenant handle
+    // can never be forged from outside.
+    $tenant = StateStore::normalize((string) ($input['tenant'] ?? StateStore::OWNER_TENANT));
+    StateStore::use($tenant);
+    $service = new TelegramService($tenant);
     $result = match ($path) {
         '/v1/login/start' => $service->startLogin($input),
         '/v1/login/qr/wait' => $service->waitForQr(),

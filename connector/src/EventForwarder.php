@@ -16,14 +16,19 @@ final class EventForwarder
 {
     private const PATH = '/connector/event';
 
-    public static function post(array $payload): void
+    /**
+     * Delivers to the engine belonging to one account. The tenant defaults to the
+     * one this process was started for, so a child can only ever report as itself.
+     */
+    public static function post(array $payload, ?string $tenant = null): void
     {
         $controlPlane = rtrim(getenv('CONTROL_PLANE_URL') ?: '', '/');
         if ($controlPlane === '') {
             return;
         }
+        $resolved = StateStore::normalize($tenant ?? StateStore::tenant());
         try {
-            $body = json_encode($payload, JSON_THROW_ON_ERROR | JSON_UNESCAPED_SLASHES);
+            $body = json_encode($payload + ['tenant' => $resolved], JSON_THROW_ON_ERROR | JSON_UNESCAPED_SLASHES);
         } catch (Throwable) {
             return;
         }
@@ -34,7 +39,7 @@ final class EventForwarder
         curl_setopt_array($curl, [
             CURLOPT_POST => true,
             CURLOPT_POSTFIELDS => $body,
-            CURLOPT_HTTPHEADER => Signature::outboundHeaders(self::PATH, $body),
+            CURLOPT_HTTPHEADER => Signature::outboundHeaders(self::PATH, $body, $resolved),
             CURLOPT_RETURNTRANSFER => true,
             CURLOPT_TIMEOUT => 10,
             CURLOPT_CONNECTTIMEOUT => 5,
@@ -44,12 +49,12 @@ final class EventForwarder
     }
 
     /** Announces a session-level state change (never carries message content). */
-    public static function status(string $status, string $detail, ?string $identity = null): void
+    public static function status(string $status, string $detail, ?string $identity = null, ?string $tenant = null): void
     {
         $payload = ['type' => 'status', 'status' => $status, 'detail' => $detail];
         if ($identity !== null) {
             $payload['identity'] = $identity;
         }
-        self::post($payload);
+        self::post($payload, $tenant);
     }
 }

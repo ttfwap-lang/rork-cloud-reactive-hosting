@@ -1,6 +1,6 @@
 import { useMemo, useRef, useState } from "react";
 import { Link } from "react-router-dom";
-import { ArrowDown, Bot, Braces, FileJson, GitBranch, ImagePlus, Infinity as InfinityIcon, Pin, Play, Plus, RotateCw, Sparkles, Timer, Trash2, X, Zap } from "lucide-react";
+import { ArrowDown, Bot, Braces, FileJson, GitBranch, ImagePlus, Infinity as InfinityIcon, LayoutTemplate, Pin, Play, Plus, RotateCw, Sparkles, Timer, Trash2, X, Zap } from "lucide-react";
 import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
@@ -170,7 +170,9 @@ function statusTone(status: WorkflowStatus): string {
 }
 
 export default function Workflows() {
-  const { snapshot, saveWorkflow, deleteWorkflow, importFlow, runHardwired } = useEngine();
+  const { snapshot, saveWorkflow, deleteWorkflow, importFlow, runWorkflow, templates, applyTemplate } = useEngine();
+  const [templateTarget, setTemplateTarget] = useState<Record<string, string>>({});
+  const [applyingTemplate, setApplyingTemplate] = useState<string | null>(null);
   const [draft, setDraft] = useState<Workflow | null>(null);
   const [saving, setSaving] = useState<boolean>(false);
   const [pendingFlow, setPendingFlow] = useState<{ flow: unknown; name: string; preview: FlowImportPreview[] } | null>(null);
@@ -248,8 +250,50 @@ export default function Workflows() {
           link={snapshot?.link}
           killSwitch={snapshot?.settings.killSwitch ?? false}
           onEdit={() => setDraft(structuredClone(pinned))}
-          onRun={runHardwired}
+          onRun={(chatKey) => runWorkflow({ chatKey, workflowId: pinned.id })}
         />
+      ) : null}
+
+      {(templates?.length ?? 0) > 0 ? (
+        <section className="panel overflow-hidden">
+          <div className="flex items-center gap-2.5 border-b border-white/[0.06] px-4 py-3">
+            <LayoutTemplate className="h-4 w-4 text-accent" />
+            <div>
+              <h2 className="text-sm font-semibold">Start from a template</h2>
+              <p className="text-[11px] text-muted-foreground">Name the bot, copy it in as a draft, then edit every step. Nothing is sent until you enable it.</p>
+            </div>
+          </div>
+          <div className="grid gap-2.5 p-4 sm:grid-cols-2">
+            {(templates ?? []).map((template) => (
+              <div key={template.id} className="flex flex-col rounded-xl bg-secondary/30 p-3.5">
+                <p className="text-xs font-semibold">{template.name}</p>
+                <p className="mt-1 flex-1 text-[11px] leading-relaxed text-muted-foreground">{template.summary}</p>
+                <p className="mt-2 font-mono text-[10px] text-muted-foreground">{template.steps.length} step{template.steps.length === 1 ? "" : "s"}</p>
+                <div className="mt-2.5 flex gap-2">
+                  <Input
+                    value={templateTarget[template.id] ?? ""}
+                    placeholder={template.targetHint}
+                    onChange={(event) => setTemplateTarget((current) => ({ ...current, [template.id]: event.target.value }))}
+                    className="h-8 flex-1 rounded-lg bg-background/60 font-mono text-[11px]"
+                  />
+                  <Button
+                    size="sm"
+                    variant="secondary"
+                    className="h-8 shrink-0 rounded-lg text-[11px]"
+                    disabled={applyingTemplate !== null}
+                    onClick={() => {
+                      setApplyingTemplate(template.id);
+                      void applyTemplate({ templateId: template.id, target: (templateTarget[template.id] ?? "").trim() || undefined })
+                        .finally(() => setApplyingTemplate(null));
+                    }}
+                  >
+                    {applyingTemplate === template.id ? "Adding…" : "Use"}
+                  </Button>
+                </div>
+              </div>
+            ))}
+          </div>
+        </section>
       ) : null}
 
       {others.length === 0 ? (

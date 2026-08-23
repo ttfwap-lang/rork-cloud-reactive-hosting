@@ -244,7 +244,77 @@ export type HostingReport = {
   checkedAt: number;
 };
 
+export type AccountRole = "owner" | "member";
+export type AccountStatus = "active" | "suspended";
+
+export type AllowanceView = { used: number; limit: number; remaining: number; period: string };
+export type CapacityView = {
+  live: boolean;
+  granted: boolean;
+  position: number | null;
+  activeCount: number;
+  limit: number;
+  queueLength: number;
+};
+
+export type AccountView = {
+  id: string;
+  username: string;
+  role: AccountRole;
+  status: AccountStatus;
+  tenantId: string;
+  createdAt: number;
+  allowance: AllowanceView;
+  capacity: CapacityView;
+};
+
+export type OwnerOverview = {
+  accounts: number;
+  active: number;
+  suspended: number;
+  connected: number;
+  queued: number;
+  capacityLimit: number;
+  rows: Array<{
+    id: string;
+    username: string;
+    role: AccountRole;
+    status: AccountStatus;
+    createdAt: number;
+    lastSeenAt: number | null;
+    live: boolean;
+    queued: boolean;
+    aiUsed: number;
+  }>;
+};
+
+/** Counts only, safe to show before anyone signs in. */
+export type PublicStats = {
+  accounts: number;
+  connected: number;
+  queued: number;
+  capacityLimit: number;
+  spotsLeft: number;
+  ownerClaimed: boolean;
+};
+
+/** A starting point that can be copied into an account and pointed at any bot. */
+export type FlowTemplate = {
+  id: string;
+  name: string;
+  summary: string;
+  targetHint: string;
+  steps: WorkflowStep[];
+};
+
 export type Snapshot = {
+  account: {
+    username: string | null;
+    role: AccountRole;
+    isOwner: boolean;
+    tenantId: string;
+    riskAckAt: number | null;
+  };
   link: LinkState;
   hardwired: HardwiredState;
   connector: { configured: boolean; deployment: string; credentialsPreset: boolean; probe: ConnectorProbe };
@@ -292,7 +362,22 @@ export type PersonalStartInput = {
 };
 
 export const api = {
-  authenticate: (passcode: string) => call<{ token: string; claimed: boolean }>("/auth", { passcode }),
+  signUp: (input: { username: string; password: string; claimPasscode?: string }) =>
+    call<{ token: string; account: AccountView; created: boolean }>("/account/signup", input),
+  signIn: (input: { username: string; password: string }) =>
+    call<{ token: string; account: AccountView; created: boolean }>("/account/signin", input),
+  signOutServer: () => call<{ ok: boolean }>("/account/signout", {}),
+  me: () => call<{ account: AccountView }>("/account/me", {}),
+  changePassword: (input: { currentPassword: string; newPassword: string }) =>
+    call<{ token: string }>("/account/password", input),
+  ownerOverview: () => call<{ overview: OwnerOverview }>("/owner/overview", {}),
+  suspendAccount: (accountId: string, suspended: boolean) =>
+    call<{ overview: OwnerOverview }>("/owner/suspend", { accountId, suspended }),
+  removeAccount: (accountId: string) => call<{ overview: OwnerOverview }>("/owner/remove", { accountId }),
+  acknowledgeRisk: (accepted: boolean) => call<{ riskAckAt: number | null }>("/account/risk", { accepted }),
+  templates: () => call<{ templates: FlowTemplate[] }>("/workflow/templates", {}),
+  applyTemplate: (input: { templateId: string; target?: string }) =>
+    call<{ id: string; workflows: Workflow[] }>("/workflow/template", input),
   state: () => call<Snapshot>("/state"),
   streamTicket: () => call<{ ticket: string; expiresAt: number }>("/stream/ticket", {}),
   saveSettings: (patch: Partial<Settings>) => call<{ settings: Settings }>("/settings", patch),
@@ -304,7 +389,7 @@ export const api = {
   startPersonal: (input: PersonalStartInput) => call<{ link: LinkState }>("/link/personal/start", input),
   submitPersonal: (kind: "code" | "password", value: string) => call<{ link: LinkState }>("/link/personal/submit", { kind, value }),
   pollPersonal: () => call<{ link: LinkState; warning?: string }>("/link/personal/poll", {}),
-  runHardwired: (chatKey: string) => call<Snapshot>("/hardwired/run", { chatKey }),
+  runWorkflow: (input: { chatKey: string; workflowId?: string }) => call<Snapshot>("/workflow/run", input),
   checkConnector: () => call<{ probe: ConnectorProbe }>("/connector/check", {}),
   diagnoseHosting: () => call<{ report: HostingReport }>("/hosting/diagnose", {}),
   applyHosting: () => call<{ applied: string[]; report: HostingReport }>("/hosting/apply", {}),
@@ -326,6 +411,17 @@ export const api = {
 
 export function streamUrl(ticket: string): string {
   return `${API_BASE.replace(/^http/, "ws")}/api/stream?ticket=${encodeURIComponent(ticket)}`;
+}
+
+/** Unauthenticated landing-page counters. Failure is silent: the page still renders. */
+export async function fetchPublicStats(): Promise<PublicStats | null> {
+  try {
+    const response = await fetch(`${API_BASE}/public/stats`);
+    if (!response.ok) return null;
+    return (await response.json()) as PublicStats;
+  } catch {
+    return null;
+  }
 }
 
 export { ApiError };

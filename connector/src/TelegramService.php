@@ -21,29 +21,43 @@ final class TelegramService
 
     private API $api;
 
-    public function __construct()
+    private string $tenant;
+
+    public function __construct(string $tenant = StateStore::OWNER_TENANT)
     {
-        $credentials = self::credentials();
+        $this->tenant = StateStore::normalize($tenant);
+        StateStore::use($this->tenant);
+        $credentials = self::credentials($this->tenant);
         if ($credentials === null) {
-            throw new ConnectorException('Telegram API credentials are not configured on the connector.', null, 503);
+            throw new ConnectorException(
+                'No Telegram API credentials are stored for this account. Add your own API ID and hash from my.telegram.org.',
+                null,
+                503,
+            );
         }
         $this->api = new API(
-            StateStore::sessionPath(),
+            StateStore::sessionPath($this->tenant),
             self::buildSettings($credentials['apiId'], $credentials['apiHash']),
         );
     }
 
     /**
-     * App credentials resolved from the connector's own environment first, so the
-     * api_id/api_hash pair never has to travel from the control plane or browser.
+     * App credentials for one account. Only the original owner inherits the
+     * connector's own environment pair; every other account brings its own, so a
+     * single flagged api_id can never take the whole service down with it.
      */
-    public static function credentials(): ?array
+    public static function credentials(string $tenant = StateStore::OWNER_TENANT): ?array
     {
-        $apiId = trim((string) (getenv('TELEGRAM_API_ID') ?: ''));
-        $apiHash = trim((string) (getenv('TELEGRAM_API_HASH') ?: ''));
+        $resolved = StateStore::normalize($tenant);
+        $apiId = '';
+        $apiHash = '';
+        if ($resolved === StateStore::OWNER_TENANT) {
+            $apiId = trim((string) (getenv('TELEGRAM_API_ID') ?: ''));
+            $apiHash = trim((string) (getenv('TELEGRAM_API_HASH') ?: ''));
+        }
         if ($apiId === '' || $apiHash === '') {
             try {
-                $state = StateStore::read();
+                $state = StateStore::read($resolved);
             } catch (Throwable) {
                 return null;
             }
@@ -74,14 +88,12 @@ final class TelegramService
         $state = StateStore::read();
         $state['disabled'] = false;
         $state['loginLockUntil'] = time() + self::LOGIN_LOCK_SECONDS;
-        // Only persisted when the environment does not already carry them.
-        if (getenv('TELEGRAM_API_ID') === false || getenv('TELEGRAM_API_ID') === '') {
-            if (isset($input['apiId'])) {
-                $state['apiId'] = (int) $input['apiId'];
-            }
-            if (isset($input['apiHash'])) {
-                $state['apiHash'] = (string) $input['apiHash'];
-            }
+        // Sealed alongside the session, in this account's folder only.
+        if (isset($input['apiId'])) {
+            $state['apiId'] = (int) $input['apiId'];
+        }
+        if (isset($input['apiHash'])) {
+            $state['apiHash'] = (string) $input['apiHash'];
         }
         StateStore::write($state);
 

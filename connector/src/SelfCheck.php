@@ -108,7 +108,8 @@ final class SelfCheck
         $apiId = trim((string) (getenv('TELEGRAM_API_ID') ?: ''));
         $apiHash = trim((string) (getenv('TELEGRAM_API_HASH') ?: ''));
         if ($apiId === '' && $apiHash === '') {
-            return self::result('Telegram app credentials', 'fail', 'TELEGRAM_API_ID and TELEGRAM_API_HASH are not set. Get them from my.telegram.org.');
+            // Optional now: every account may bring its own pair from my.telegram.org.
+            return self::result('Telegram app credentials', 'warn', 'No connector-wide pair is set. Each account supplies its own API ID and hash.');
         }
         if (preg_match('/^\d{4,12}$/', $apiId) !== 1) {
             return self::result('Telegram app credentials', 'fail', 'TELEGRAM_API_ID should be digits only.');
@@ -137,29 +138,40 @@ final class SelfCheck
 
     private static function worker(): array
     {
-        $age = StateStore::heartbeatAge();
+        $age = StateStore::supervisorAge();
         if ($age === null) {
-            return self::result('Always-on process', 'fail', 'No heartbeat yet. The background process has not started.');
+            return self::result('Always-on supervisor', 'fail', 'No heartbeat yet. The background process has not started.');
         }
 
         return $age <= 60
-            ? self::result('Always-on process', 'pass', "Alive — last heartbeat {$age}s ago.")
-            : self::result('Always-on process', 'fail', "Stalled — last heartbeat {$age}s ago.");
+            ? self::result('Always-on supervisor', 'pass', "Alive — last heartbeat {$age}s ago.")
+            : self::result('Always-on supervisor', 'fail', "Stalled — last heartbeat {$age}s ago.");
     }
 
+    /** Counts across every account folder, and never names one. */
     private static function session(): array
     {
-        if (!StateStore::sessionExists()) {
-            return self::result('Telegram login', 'warn', 'Not logged in yet. Start a QR login from the ReplyFlow console.');
+        $online = 0;
+        $saved = 0;
+        foreach (StateStore::tenants() as $tenant) {
+            if (!StateStore::sessionExists($tenant)) {
+                continue;
+            }
+            $saved++;
+            try {
+                if ((string) (StateStore::read($tenant)['status'] ?? 'offline') === 'online') {
+                    $online++;
+                }
+            } catch (Throwable) {
+                return self::result('Telegram sessions', 'fail', 'Saved state could not be decrypted — SESSION_ENCRYPTION_KEY likely changed.');
+            }
         }
-        try {
-            $status = (string) (StateStore::read()['status'] ?? 'offline');
-        } catch (Throwable) {
-            return self::result('Telegram login', 'fail', 'Saved state could not be decrypted — SESSION_ENCRYPTION_KEY likely changed.');
+        if ($saved === 0) {
+            return self::result('Telegram sessions', 'warn', 'No account has completed a login yet. Start a QR login from the console.');
         }
 
-        return $status === 'online'
-            ? self::result('Telegram login', 'pass', 'A personal session is saved and online.')
-            : self::result('Telegram login', 'warn', "A session exists but is currently {$status}.");
+        return $online > 0
+            ? self::result('Telegram sessions', 'pass', "{$online} of {$saved} saved session(s) online.")
+            : self::result('Telegram sessions', 'warn', "{$saved} session(s) saved, none currently online.");
     }
 }

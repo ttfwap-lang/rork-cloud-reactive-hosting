@@ -18,7 +18,9 @@ final class Signature
         if (abs((int) round(microtime(true) * 1000) - (int) $timestamp) > 60000) {
             return false;
         }
-        $nonceFile = StateStore::path('nonce_'.hash('sha256', $nonce));
+        // Replay protection is global, not per account: a nonce is spent once for
+        // the whole connector, whichever tenant the request claims to be for.
+        $nonceFile = self::noncePath(hash('sha256', $nonce));
         if (is_file($nonceFile)) {
             return false;
         }
@@ -27,7 +29,7 @@ final class Signature
             return false;
         }
         file_put_contents($nonceFile, (string) time(), LOCK_EX);
-        foreach (glob(StateStore::path('nonce_*')) ?: [] as $file) {
+        foreach (glob(self::noncePath('*')) ?: [] as $file) {
             if (filemtime($file) !== false && filemtime($file) < time() - 120) {
                 @unlink($file);
             }
@@ -35,17 +37,30 @@ final class Signature
         return true;
     }
 
-    public static function outboundHeaders(string $path, string $body): array
+    public static function outboundHeaders(string $path, string $body, ?string $tenant = null): array
     {
         $secret = getenv('CONNECTOR_SHARED_SECRET') ?: '';
         $timestamp = (string) round(microtime(true) * 1000);
         $nonce = bin2hex(random_bytes(16));
         $signature = hash_hmac('sha256', "POST\n{$path}\n{$timestamp}\n{$nonce}\n{$body}", $secret);
+
         return [
             'Content-Type: application/json',
             'X-ReplyFlow-Timestamp: '.$timestamp,
             'X-ReplyFlow-Nonce: '.$nonce,
             'X-ReplyFlow-Signature: '.$signature,
+            // Tells the control plane which account's engine this event belongs to.
+            'X-ReplyFlow-Tenant: '.StateStore::normalize($tenant ?? StateStore::tenant()),
         ];
+    }
+
+    private static function noncePath(string $name): string
+    {
+        $directory = StateStore::root().'/nonces';
+        if (!is_dir($directory)) {
+            @mkdir($directory, 0700, true);
+        }
+
+        return $directory.'/nonce_'.$name;
     }
 }

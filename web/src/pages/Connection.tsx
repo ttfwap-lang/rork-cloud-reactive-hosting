@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState, type FormEvent } from "react";
 import { QRCodeSVG } from "qrcode.react";
-import { AlertTriangle, Bot, CheckCircle2, KeyRound, Loader2, Phone, PlugZap, QrCode, RefreshCw, Send, Server, ShieldAlert, Trash2, TrainFront, UserRound, Wrench } from "lucide-react";
+import { AlertTriangle, Bot, CheckCircle2, ExternalLink, KeyRound, Loader2, Phone, PlugZap, QrCode, RefreshCw, Send, Server, ShieldAlert, Trash2, TrainFront, Users, UserRound, Wrench } from "lucide-react";
 import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
@@ -17,7 +17,7 @@ import { HostingStatus } from "@/components/HostingStatus";
 import type { HostingReport } from "@/lib/api";
 
 export default function Connection() {
-  const { snapshot, connectBot, startPersonal, submitPersonal, pollPersonal, checkConnector, diagnoseHosting, applyHosting, reconnect, forgetConnection, simulate } = useEngine();
+  const { snapshot, account, isOwner, connectBot, startPersonal, submitPersonal, pollPersonal, checkConnector, diagnoseHosting, applyHosting, reconnect, forgetConnection, simulate } = useEngine();
   const [mode, setMode] = useState<"personal" | "bot">("personal");
   const [loginMethod, setLoginMethod] = useState<"qr" | "phone">("qr");
   const [apiId, setApiId] = useState<string>("");
@@ -35,6 +35,8 @@ export default function Connection() {
 
   const link = snapshot?.link;
   const connector = snapshot?.connector;
+  const capacity = account?.capacity;
+  const queued = capacity ? !capacity.live && capacity.position !== null : false;
   const presetCredentials = connector?.credentialsPreset ?? false;
   const serviceUp = connector?.probe.reachable ?? false;
   const isPersonalFlow = link?.mode === "personal" && ["awaiting_qr", "awaiting_code", "awaiting_password", "connecting"].includes(link.status);
@@ -103,6 +105,20 @@ export default function Connection() {
           </div>
         ) : null}
       </header>
+
+      {queued ? (
+        <div className="panel flex flex-wrap items-center gap-3 border-amber-400/20 bg-amber-400/[0.04] p-4">
+          <Users className="h-4 w-4 shrink-0 text-amber-400" />
+          <div className="min-w-0 flex-1">
+            <p className="text-sm font-semibold text-amber-300">You are number {capacity?.position} in the queue</p>
+            <p className="mt-0.5 text-[11px] leading-relaxed text-muted-foreground">
+              All {capacity?.limit} live connection slots are in use. Every connected account is a real process on the
+              always-on service, so we hold the line rather than overload it. You will be let in automatically — you can
+              keep building flows in the meantime.
+            </p>
+          </div>
+        </div>
+      ) : null}
 
       <div className="grid gap-2 rounded-2xl bg-secondary/40 p-1.5 sm:grid-cols-2">
         <button onClick={() => setMode("personal")} className={cn("flex items-center gap-3 rounded-xl p-3 text-left transition-all", mode === "personal" ? "bg-card shadow-lg ring-1 ring-primary/25" : "text-muted-foreground hover:text-foreground")}>
@@ -175,9 +191,27 @@ export default function Connection() {
                   <p className="text-[11px] leading-relaxed text-muted-foreground">Your Telegram app ID and hash are stored as server-only secrets. They go straight to the isolated connector and are never sent to this browser.</p>
                 </div>
               ) : (
-                <div className="grid gap-3 sm:grid-cols-2">
-                  <div><label className="mb-1.5 block text-xs font-medium text-muted-foreground">Telegram API ID</label><Input inputMode="numeric" value={apiId} onChange={(event) => setApiId(event.target.value.replace(/\D/g, ""))} placeholder="12345678" className="h-11 rounded-xl bg-input/60 font-mono" /></div>
-                  <div><label className="mb-1.5 block text-xs font-medium text-muted-foreground">Telegram API hash</label><Input type="password" value={apiHash} onChange={(event) => setApiHash(event.target.value)} placeholder="32-character hash" className="h-11 rounded-xl bg-input/60 font-mono" /></div>
+                <div className="space-y-3 rounded-2xl border border-white/[0.07] bg-secondary/25 p-4">
+                  <div className="flex items-start gap-3">
+                    <KeyRound className="mt-0.5 h-4 w-4 shrink-0 text-primary" />
+                    <div className="min-w-0">
+                      <p className="text-sm font-semibold">Bring your own Telegram keys</p>
+                      <p className="mt-1 text-[11px] leading-relaxed text-muted-foreground">
+                        Telegram issues these to you personally, and yours alone are used for your account. That is what keeps
+                        one flagged account from taking down everybody else&apos;s. It takes about a minute.
+                      </p>
+                    </div>
+                  </div>
+                  <ol className="space-y-1.5 pl-1 text-[11px] leading-relaxed text-muted-foreground">
+                    <li><span className="font-mono text-foreground">1.</span> Open <a href="https://my.telegram.org/apps" target="_blank" rel="noreferrer noopener" className="inline-flex items-center gap-1 font-medium text-primary underline-offset-4 hover:underline">my.telegram.org/apps<ExternalLink className="h-3 w-3" /></a> and log in with your phone number.</li>
+                    <li><span className="font-mono text-foreground">2.</span> Fill in any app title and short name — they are only labels.</li>
+                    <li><span className="font-mono text-foreground">3.</span> Copy the <span className="text-foreground">App api_id</span> and <span className="text-foreground">App api_hash</span> it shows you.</li>
+                    <li><span className="font-mono text-foreground">4.</span> Paste both below. They are sealed before storage and never come back to this browser.</li>
+                  </ol>
+                  <div className="grid gap-3 sm:grid-cols-2">
+                    <div><label className="mb-1.5 block text-xs font-medium text-muted-foreground">Telegram API ID</label><Input inputMode="numeric" value={apiId} onChange={(event) => setApiId(event.target.value.replace(/\D/g, ""))} placeholder="12345678" className="h-11 rounded-xl bg-input/60 font-mono" /></div>
+                    <div><label className="mb-1.5 block text-xs font-medium text-muted-foreground">Telegram API hash</label><Input type="password" value={apiHash} onChange={(event) => setApiHash(event.target.value)} placeholder="32-character hash" className="h-11 rounded-xl bg-input/60 font-mono" /></div>
+                  </div>
                 </div>
               )}
               <div className="flex items-center justify-between rounded-xl bg-secondary/40 px-3 py-2.5"><div><p className="text-xs font-medium">Use phone-code fallback</p><p className="text-[10px] text-muted-foreground">QR is recommended and selected by default.</p></div><Switch checked={loginMethod === "phone"} onCheckedChange={(checked) => setLoginMethod(checked ? "phone" : "qr")} /></div>
@@ -195,8 +229,9 @@ export default function Connection() {
         </section>
       )}
 
-      <HostingStatus />
+      {!isOwner ? null : <HostingStatus />}
 
+      {!isOwner ? null : (
       <section className="panel overflow-hidden">
         <div className="flex flex-wrap items-center gap-3 border-b border-white/[0.06] p-5">
           <div className="grid h-10 w-10 shrink-0 place-items-center rounded-xl bg-accent/10 ring-1 ring-accent/20"><Server className="h-5 w-5 text-accent" /></div>
@@ -285,6 +320,7 @@ export default function Connection() {
           </div>
         )}
       </section>
+      )}
 
       <section className="panel p-5">
         <h2 className="text-sm font-semibold">Live engine test</h2><p className="mt-1 text-[11px] text-muted-foreground">Push a synthetic inbound message through matching, captures, variables and safety checks.</p>
