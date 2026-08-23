@@ -2,6 +2,17 @@
  * The reserved owner username. Claiming it requires proof of the existing console
  * passcode, and it inherits the original tenant, so nothing has to be migrated.
  */
+import {
+  availabilityFor,
+  lockoutSecondsRemaining,
+  registerFailure,
+  validateUsername,
+  CLEAR_GUARD,
+  type AvailabilityState,
+  type AvailabilityView,
+  type SigninGuard,
+} from "./account-rules";
+
 export const OWNER_USERNAME = "zuperman";
 /** The Durable Object that already holds every flow, log and setting built so far. */
 export const OWNER_TENANT_ID = "primary";
@@ -39,8 +50,7 @@ export type AccountIdentity = {
  * reads as `taken` like any other. `unknown` is returned when the lookup budget is
  * spent, so the form simply stays quiet rather than guessing.
  */
-export type AvailabilityState = "available" | "taken" | "reserved" | "invalid" | "unknown";
-export type AvailabilityView = { state: AvailabilityState; detail: string };
+export type { AvailabilityState, AvailabilityView };
 
 export type AllowanceView = { used: number; limit: number; remaining: number; period: string };
 export type CapacityView = {
@@ -254,11 +264,7 @@ export class AccountRegistry {
   }
 
   private validateUsername(raw: unknown): { username: string } | { error: string } {
-    const username = String(raw ?? "").trim();
-    if (!/^[a-zA-Z0-9_]{3,20}$/.test(username)) {
-      return { error: "Usernames are 3-20 characters: letters, numbers and underscores." };
-    }
-    return { username };
+    return validateUsername(raw);
   }
 
   /**
@@ -278,23 +284,9 @@ export class AccountRegistry {
     }
     this.guardPut("lookupWindow", { since: fresh.since, count: fresh.count + 1 });
 
-    const parsed = this.validateUsername(raw);
-    if ("error" in parsed) return Response.json({ state: "invalid", detail: parsed.error } satisfies AvailabilityView);
-
-    const lower = parsed.username.toLowerCase();
-    const existing = this.accountByUsername(lower);
-    if (lower === OWNER_USERNAME) {
-      return Response.json(
-        existing
-          ? ({ state: "taken", detail: "The owner account has already been claimed." } satisfies AvailabilityView)
-          : ({ state: "reserved", detail: "Reserved for the console owner — claimable with the existing passcode." } satisfies AvailabilityView),
-      );
-    }
-    return Response.json(
-      existing
-        ? ({ state: "taken", detail: "That username is already taken." } satisfies AvailabilityView)
-        : ({ state: "available", detail: "That name is free." } satisfies AvailabilityView),
-    );
+    const parsed = validateUsername(raw);
+    const exists = "error" in parsed ? false : this.accountByUsername(parsed.username.toLowerCase()) !== null;
+    return Response.json(availabilityFor({ raw, ownerUsername: OWNER_USERNAME, exists }) satisfies AvailabilityView);
   }
 
   private async handleSignup(body: Record<string, unknown>): Promise<Response> {
@@ -349,9 +341,9 @@ export class AccountRegistry {
     const username = String(body.username ?? "").trim().toLowerCase();
     const password = String(body.password ?? "");
     const guardKey = `fail:${username}`;
-    const guard = this.guardGet<{ fails: number; lockedUntil: number }>(guardKey, { fails: 0, lockedUntil: 0 });
-    if (guard.lockedUntil > now) {
-      const retryAfterSeconds = Math.ceil((guard.lockedUntil - now) / 1000);
+    const guard = this.guardGet<SigninGuard>(guardKey, CLEAR_GUARD);
+    const retryAfterSeconds = lockoutSecondsRemaining(guard, now);
+    if (retryAfterSeconds > 0) {
       return Response.json(
         { error: `Too many attempts. Try again in ${retryAfterSeconds}s.`, retryAfterSeconds },
         { status: 429 },
@@ -362,12 +354,11 @@ export class AccountRegistry {
     const salt = row ? this.fromBase64(row.salt) : new Uint8Array(16);
     const candidate = await this.passwordHash(password, salt);
     if (!row || !this.safeEqual(row.hash, candidate)) {
-      const fails = guard.fails + 1;
-      this.guardPut(guardKey, fails >= 5 ? { fails: 0, lockedUntil: now + 60_000 } : { fails, lockedUntil: 0 });
+      this.guardPut(guardKey, registerFailure(guard, now));
       return Response.json({ error: "Incorrect username or password." }, { status: 403 });
     }
     if (row.status === "suspended") return Response.json({ error: "This account is suspended." }, { status: 403 });
-    this.guardPut(guardKey, { fails: 0, lockedUntil: 0 });
+    this.guardPut(guardKey, CLEAR_GUARD);
     this.sql.exec("UPDATE accounts SET last_seen_at = ? WHERE id = ?", now, row.id);
     const token = await this.issueSession(row.id, now);
     return Response.json({ token, account: this.view(row, now), created: false });

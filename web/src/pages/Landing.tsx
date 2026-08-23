@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
-import { Activity, ArrowRight, Bot, GitBranch, ImagePlus, KeyRound, Radio, ShieldAlert, Users, Zap } from "lucide-react";
+import { Activity, ArrowRight, Bot, GitBranch, ImagePlus, KeyRound, PlugZap, Radio, ShieldAlert, Users, Zap } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
@@ -28,6 +28,8 @@ const CAPABILITIES = [
     icon: Radio,
     title: "Runs without you",
     body: "Your flows live on an always-on service. Close the tab, shut the laptop — the automation keeps answering.",
+    /** Stated in the future tense while the service is unreachable, because right now it is not answering. */
+    bodyWhenDown: "Your flows are built to live on an always-on service, so the automation keeps answering with the tab closed. That service is not answering at the moment.",
   },
 ] as const;
 
@@ -51,6 +53,9 @@ export default function Landing() {
   }, []);
 
   const spotsLeft = stats?.spotsLeft ?? null;
+  // Only claim the service is down once the counters have actually arrived, so a
+  // slow first load does not flash a false alarm.
+  const serviceDown = stats !== null && !stats.serviceUp;
 
   return (
     <div className="grid-noise flex min-h-full flex-col">
@@ -75,6 +80,17 @@ export default function Landing() {
       </header>
 
       <main className="mx-auto w-full max-w-6xl flex-1 px-5">
+        {serviceDown ? (
+          <div className="flex items-start gap-3 rounded-2xl bg-amber-400/[0.07] px-4 py-3 ring-1 ring-amber-400/25">
+            <PlugZap className="mt-0.5 h-4 w-4 shrink-0 text-amber-400" />
+            <p className="text-[13px] leading-relaxed text-muted-foreground">
+              <span className="font-semibold text-amber-400">Connections are paused.</span>{" "}
+              The always-on service is not answering right now, so no new Telegram account can be connected. You can
+              still create an account and build flows — they will start running as soon as it is back.
+            </p>
+          </div>
+        ) : null}
+
         <section className="grid items-center gap-10 py-12 sm:py-16 lg:grid-cols-[minmax(0,1fr)_26rem] lg:gap-12">
           <div>
             <span className="inline-flex items-center gap-2 rounded-full bg-primary/10 px-3 py-1.5 font-mono text-[10px] uppercase tracking-[0.18em] text-primary ring-1 ring-primary/25">
@@ -104,7 +120,9 @@ export default function Landing() {
             <div className="mt-8 flex flex-wrap items-center gap-2.5">
               <StatPill label="accounts" value={stats ? String(stats.accounts) : "—"} />
               <StatPill label="connected right now" value={stats ? String(stats.connected) : "—"} tone={stats && stats.connected > 0 ? "live" : "default"} />
-              <StatPill label={spotsLeft === 0 ? "queue open" : "live slots free"} value={spotsLeft === null ? "—" : spotsLeft === 0 ? String(stats?.queued ?? 0) : String(spotsLeft)} />
+              {serviceDown
+                ? <StatPill label="service offline" value="0" />
+                : <StatPill label={spotsLeft === 0 ? "queue open" : "live slots free"} value={spotsLeft === null ? "—" : spotsLeft === 0 ? String(stats?.queued ?? 0) : String(spotsLeft)} />}
             </div>
           </div>
 
@@ -125,7 +143,9 @@ export default function Landing() {
                 <item.icon className="h-4.5 w-4.5 text-primary" />
               </div>
               <h2 className="mt-4 text-base font-semibold">{item.title}</h2>
-              <p className="mt-1.5 text-sm leading-relaxed text-muted-foreground">{item.body}</p>
+              <p className="mt-1.5 text-sm leading-relaxed text-muted-foreground">
+                {serviceDown && "bodyWhenDown" in item ? item.bodyWhenDown : item.body}
+              </p>
             </div>
           ))}
         </section>

@@ -302,8 +302,11 @@ export type PublicStats = {
   connected: number;
   queued: number;
   capacityLimit: number;
+  /** Zero whenever `serviceUp` is false: a slot that cannot be taken is not free. */
   spotsLeft: number;
   ownerClaimed: boolean;
+  /** Whether the always-on service is answering right now. */
+  serviceUp: boolean;
 };
 
 /** A starting point that can be copied into an account and pointed at any bot. */

@@ -1,6 +1,16 @@
 import { DurableObject } from "cloudflare:workers";
 
 import { AccountRegistry } from "./accounts";
+import {
+  compare as compareValue,
+  matchesStep as evaluateStep,
+  substitute as fillTemplate,
+  type ConditionOperator,
+  type MatchResult,
+  type TriggerMode,
+} from "./matching";
+
+export type { ConditionOperator, TriggerMode };
 
 type Env = {
   DO: Fetcher & {
@@ -51,6 +61,13 @@ const REQUIRED_CONNECTOR_VARS = [
 ] as const;
 
 type RailwayTokenKind = "project" | "account";
+/**
+ * Where a service's build input comes from. A service whose source was uploaded
+ * straight to the platform has no repository behind it, so the repair routine must
+ * not try to reconnect one: doing so replaces working uploaded source with a
+ * code-host link and discards the deploy.
+ */
+type ServiceDeployKind = "repo" | "upload";
 type RailwayScope = {
   kind: RailwayTokenKind;
   projectId: string;
@@ -197,7 +214,6 @@ const EMPTY_AUTODEPLOY: HostingAutoDeploy = { enabled: false, repository: null, 
 export type ConnectorProbe = { reachable: boolean; detail: string; checkedAt: number | null; workerAgeSeconds: number | null; latencyMs: number | null };
 const EMPTY_PROBE: ConnectorProbe = { reachable: false, detail: "Not checked yet.", checkedAt: null, workerAgeSeconds: null, latencyMs: null };
 
-export type TriggerMode = "exact" | "contains" | "starts" | "ends" | "regex";
 export type ConditionField =
   | "text"
   | "sender"
@@ -209,7 +225,6 @@ export type ConditionField =
   | "isForwarded"
   | "isBot"
   | "mediaType";
-export type ConditionOperator = TriggerMode | "is" | "isNot";
 export type WorkflowStatus = "draft" | "test" | "enabled" | "paused" | "attention";
 export type WorkflowActionType = "sendText" | "pressButton" | "react" | "markRead" | "end";
 
@@ -359,7 +374,6 @@ type ErrorCategory =
   | "unknown";
 
 type EventLevel = "info" | "success" | "warn" | "error";
-type MatchResult = { matched: boolean; captures: Record<string, string> };
 
 const DEFAULT_SETTINGS: Settings = {
   automationEnabled: true,
@@ -1634,41 +1648,15 @@ export class AutomationEngine extends DurableObject<Env> {
   }
 
   private compare(value: string, expected: string, operator: ConditionOperator, caseSensitive: boolean): MatchResult {
-    const haystack = caseSensitive ? value : value.toLowerCase();
-    const needle = caseSensitive ? expected : expected.toLowerCase();
-    if (operator === "regex") {
-      try {
-        const match = new RegExp(expected, caseSensitive ? "" : "i").exec(value);
-        if (!match) return { matched: false, captures: {} };
-        const captures: Record<string, string> = {};
-        match.forEach((capture, index) => { if (index > 0 && capture !== undefined) captures[String(index)] = capture; });
-        for (const [name, capture] of Object.entries(match.groups ?? {})) if (capture !== undefined) captures[name] = capture;
-        return { matched: true, captures };
-      } catch { return { matched: false, captures: {} }; }
-    }
-    const matched = operator === "exact" || operator === "is"
-      ? haystack.trim() === needle.trim()
-      : operator === "isNot"
-        ? haystack.trim() !== needle.trim()
-        : operator === "contains"
-          ? haystack.includes(needle)
-          : operator === "starts"
-            ? haystack.startsWith(needle)
-            : operator === "ends"
-              ? haystack.endsWith(needle)
-              : false;
-    return { matched, captures: {} };
+    return compareValue(value, expected, operator, caseSensitive);
   }
 
   private matchesStep(step: WorkflowStep, message: MessageContext): MatchResult {
-    const primary = this.compare(message.text, step.trigger, step.mode, step.caseSensitive);
-    const results = [primary, ...step.conditions.map((condition) => {
-      const result = this.compare(this.fieldValue(condition, message), condition.value, condition.operator, condition.caseSensitive);
-      return condition.negate ? { matched: !result.matched, captures: {} } : result;
-    })];
-    const matched = step.conditionLogic === "or" ? results.some((result) => result.matched) : results.every((result) => result.matched);
-    const captures = matched ? Object.assign({}, ...results.filter((result) => result.matched).map((result) => result.captures)) : {};
-    return { matched, captures };
+    return evaluateStep(
+      step,
+      message.text,
+      step.conditions.map((condition) => ({ condition, value: this.fieldValue(condition, message) })),
+    );
   }
 
   private targetsMatch(workflow: Workflow, message: MessageContext): boolean {
@@ -1691,7 +1679,7 @@ export class AutomationEngine extends DurableObject<Env> {
   }
 
   private substitute(template: string, variables: Record<string, string>): string {
-    return template.replace(/\{([a-zA-Z0-9_.-]+)\}/g, (_match, key: string) => variables[key] ?? "").slice(0, MAX_REPLY_CHARS);
+    return fillTemplate(template, variables, MAX_REPLY_CHARS);
   }
 
   private async ingest(message: MessageContext, options?: { forceWorkflowId?: string }): Promise<void> {
@@ -2253,7 +2241,13 @@ export class AutomationEngine extends DurableObject<Env> {
     const trigger = triggers.find((entry) => entry.serviceId === serviceId) ?? null;
     const repository = trigger?.repository ?? repo;
     if (!repository) {
-      return { enabled: false, repository: null, branch: null, watchPatterns, detail: "No repository is connected, so a push cannot start a build." };
+      return {
+        enabled: false,
+        repository: null,
+        branch: null,
+        watchPatterns,
+        detail: "This service builds from source uploaded straight to the platform, so there is no repository for a push to react to. Rebuild-on-push does not apply until one is connected.",
+      };
     }
     if (!trigger) {
       return { enabled: false, repository, branch: null, watchPatterns, detail: "A repository is connected, but no push trigger is armed." };
@@ -2544,6 +2538,21 @@ export class AutomationEngine extends DurableObject<Env> {
    * no output means. The source is verified first so a genuinely absent folder is
    * reported rather than silently reconnected.
    */
+  /**
+   * Reads whether this service builds from a connected repository or from source
+   * uploaded directly to the platform, so the repair routine can tell the two apart
+   * before it tries to reconnect anything.
+   */
+  private async serviceDeployKind(scope: RailwayScope, serviceId: string): Promise<ServiceDeployKind> {
+    const instance = await this.railwayQuery<{ serviceInstance: { source: { repo: string | null } | null } | null }>(
+      scope.kind,
+      "query instance($serviceId: String!, $environmentId: String!) { serviceInstance(serviceId: $serviceId, environmentId: $environmentId) { source { repo } } }",
+      { serviceId, environmentId: scope.environmentId },
+    ).catch(() => null);
+    const repo = instance?.serviceInstance?.source?.repo ?? null;
+    return typeof repo === "string" && repo.trim().length > 0 ? "repo" : "upload";
+  }
+
   private async ensureSource(scope: RailwayScope, serviceId: string, branch: string): Promise<string[]> {
     const applied: string[] = [];
     const check = await this.verifySource(CONNECTOR_REPOSITORY, branch, true);
@@ -2645,8 +2654,15 @@ export class AutomationEngine extends DurableObject<Env> {
     }
 
     // A build that produced no output never fetched the source, so re-establish
-    // that link before spending another build on it.
-    applied.push(...(await this.ensureSource(scope, target.id, DEFAULT_BRANCH)));
+    // that link before spending another build on it. An uploaded service has no
+    // repository to re-establish and reconnecting one would throw the uploaded
+    // source away, so it is deliberately left alone.
+    const deployKind = await this.serviceDeployKind(scope, target.id);
+    if (deployKind === "upload") {
+      applied.push("This service builds from uploaded source, so its source link was left untouched.");
+    } else {
+      applied.push(...(await this.ensureSource(scope, target.id, DEFAULT_BRANCH)));
+    }
 
     const mounts = await this.railwayMounts(scope);
     const hasDisk = mounts.some((mount) => mount.serviceId === target.id && mount.mountPath === CONNECTOR_MOUNT_PATH);
@@ -2696,7 +2712,7 @@ export class AutomationEngine extends DurableObject<Env> {
     }
 
     try {
-      applied.push(`${await this.startDeployment(scope, target.id)} It usually takes two to four minutes.`);
+      applied.push(`${await this.startDeployment(scope, target.id, deployKind)} It usually takes two to four minutes.`);
     } catch (failure) {
       applied.push(`Could not start a deployment: ${failure instanceof Error ? failure.message : "unknown error"}`);
     }
@@ -2710,18 +2726,23 @@ export class AutomationEngine extends DurableObject<Env> {
    * three escalating ways to do this and a given service will not accept all of
    * them, so they are tried strongest first and the first that lands wins.
    */
-  private async startDeployment(scope: RailwayScope, serviceId: string): Promise<string> {
+  private async startDeployment(scope: RailwayScope, serviceId: string, kind: ServiceDeployKind = "repo"): Promise<string> {
     const errors: string[] = [];
 
-    try {
-      await this.railwayQuery(
-        scope.kind,
-        "mutation deploy($serviceId: String!, $environmentId: String!) { serviceInstanceDeploy(serviceId: $serviceId, environmentId: $environmentId, latestCommit: true) }",
-        { serviceId, environmentId: scope.environmentId },
-      );
-      return "Started a fresh build from the latest commit.";
-    } catch (failure) {
-      errors.push(failure instanceof Error ? failure.message : "unknown error");
+    // Building "the latest commit" only means something for a repository-backed
+    // service. On an uploaded one there is no commit to reach for, so the attempt
+    // is skipped rather than allowed to fail its way down the list.
+    if (kind === "repo") {
+      try {
+        await this.railwayQuery(
+          scope.kind,
+          "mutation deploy($serviceId: String!, $environmentId: String!) { serviceInstanceDeploy(serviceId: $serviceId, environmentId: $environmentId, latestCommit: true) }",
+          { serviceId, environmentId: scope.environmentId },
+        );
+        return "Started a fresh build from the latest commit.";
+      } catch (failure) {
+        errors.push(failure instanceof Error ? failure.message : "unknown error");
+      }
     }
 
     try {

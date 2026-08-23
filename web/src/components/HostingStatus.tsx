@@ -83,6 +83,11 @@ export function HostingStatus() {
   const source = hostingStatus?.source;
   const sourceState = sourceTone(source?.state);
   const needsRepo = autoDeploy !== undefined && autoDeploy.repository === null;
+  // The engine names this case directly now; the older code is still honoured so a
+  // status cached before that change keeps rendering the explanation.
+  const failureCode = hostingStatus?.build.failure?.code;
+  const unreadableSource = failureCode === "source_unreadable_by_platform"
+    || (source?.state === "ok" && failureCode === "no_build_output");
   // The engine already knows which repository this connector is built from, so the
   // field only has to be filled in to override it.
   const repoValue = repository.trim().length > 0 ? repository.trim() : (source?.repository ?? "");
@@ -241,7 +246,7 @@ export function HostingStatus() {
             ) : null}
           </div>
         </div>
-        {source?.state === "ok" && hostingStatus?.build.failure?.code === "no_build_output" ? (
+        {unreadableSource ? (
           <p className="mt-3 rounded-lg bg-amber-400/[0.06] px-2.5 py-2 text-[11px] leading-relaxed text-muted-foreground">
             The code is definitely there, yet the build fetched nothing. That points at the hosting platform's permission to read this repository rather than at the code. A rebuild re-establishes that link and is worth trying first.
           </p>

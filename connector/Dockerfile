@@ -26,7 +26,9 @@ RUN chmod +x /app/entrypoint.sh \
 
 ENV SESSION_PATH=/data PORT=8080
 EXPOSE 8080
-VOLUME ["/data"]
+
+# No VOLUME directive: the platform rejects it and supplies its own persistent
+# disk mounted at /data, which is what actually keeps a Telegram login alive.
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=5 \
     CMD php -r '$r=@file_get_contents("http://127.0.0.1:".(getenv("PORT")?:8080)."/health"); exit($r===false?1:0);'

@@ -139,9 +139,31 @@ export default {
     }
 
     // Landing-page counters. Nothing here identifies an account.
+    // The connector's reachability is merged in so the page can say plainly that
+    // nobody can connect while the service is down, rather than advertising free
+    // slots that cannot actually be taken. Both reads are cached-only.
     if (path === "/public/stats") {
-      const stats = await directory<unknown>(env, "/public/stats", {});
-      return withCors(Response.json(stats.data, { status: stats.status }), request, env);
+      const stats = await directory<Record<string, unknown>>(env, "/public/stats", {});
+      let serviceUp = false;
+      try {
+        const health = await env.DO.fetch(toEngine(request, "/status/public", publicOrigin, OWNER_TENANT_ID));
+        const payload = (await health.json()) as { reachable?: unknown };
+        serviceUp = payload.reachable === true;
+      } catch {
+        // An unreachable engine is itself a service that cannot take connections,
+        // so the default of `false` is already the honest answer.
+      }
+      const counts = (stats.data ?? {}) as Record<string, unknown>;
+      const connected = typeof counts.connected === "number" ? counts.connected : 0;
+      const capacityLimit = typeof counts.capacityLimit === "number" ? counts.capacityLimit : 0;
+      return withCors(
+        Response.json(
+          { ...counts, serviceUp, spotsLeft: serviceUp ? Math.max(0, capacityLimit - connected) : 0 },
+          { status: stats.status },
+        ),
+        request,
+        env,
+      );
     }
 
     // Doubles as a keep-alive: it guarantees the heartbeat alarm exists so automation

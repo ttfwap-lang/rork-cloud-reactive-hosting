@@ -21,6 +21,14 @@ attaches a domain on port 8080, waits for the service to answer, and prints the
 readiness report. It is idempotent, so re-running it is safe, and it never
 echoes a secret value.
 
+The source is **uploaded straight from this folder**. No GitHub connection, no
+repository permissions and no deploy keys are involved, so the code-host access
+that normally has to be granted first is simply not part of this path.
+
+It talks to Railway's HTTP API with `curl` rather than the `railway` CLI. The
+CLI's variable and service subcommands have changed shape between releases, and
+a script that shells out to them fails confusingly when they do.
+
 ### Get a project token
 
 1. Open your Railway **project** (not the account avatar menu).
@@ -33,14 +41,15 @@ the avatar menu, reaches every project you own — do not use one here.
 
 ### Run it
 
-```bash
-bash <(curl -fsSL railway.com/install.sh) -y
+Only `curl`, `jq` and `tar` are needed — all three are already present on macOS
+and most Linux systems.
 
+```bash
 export RAILWAY_TOKEN=<the project token>
 export TELEGRAM_API_ID=<from my.telegram.org>
 export TELEGRAM_API_HASH=<from my.telegram.org>
-export SESSION_ENCRYPTION_KEY=0f32f873e33e08445fdb76b2e9a495a5aa7cad7cc61300f93c57d8889ee51a73
-export CONNECTOR_SHARED_SECRET=28231886a62412bbe363c4ba1859398ce12d5f2eb67b75582de2e73c2d8eeffe
+export SESSION_ENCRYPTION_KEY=$(openssl rand -hex 32)
+export CONNECTOR_SHARED_SECRET=<the value already stored on the engine>
 
 ./connector/deploy.sh
 ```
@@ -109,18 +118,22 @@ Replace only the two Telegram lines with your own values from step 1.
 ```
 TELEGRAM_API_ID=paste-your-api-id-here
 TELEGRAM_API_HASH=paste-your-api-hash-here
-SESSION_ENCRYPTION_KEY=0f32f873e33e08445fdb76b2e9a495a5aa7cad7cc61300f93c57d8889ee51a73
-CONNECTOR_SHARED_SECRET=28231886a62412bbe363c4ba1859398ce12d5f2eb67b75582de2e73c2d8eeffe
+SESSION_ENCRYPTION_KEY=paste-64-hex-characters-here
+CONNECTOR_SHARED_SECRET=paste-the-engine-value-here
 CONTROL_PLANE_URL=https://cloud-reactive-hosting-backend.rork.app
 SESSION_PATH=/data
 ```
 
+> **Never commit real values into this file.** It lives in a public repository,
+> so anything written here should be treated as published the moment it is saved.
+> Generate a session key with `openssl rand -hex 32`.
+
 What each one is for:
 
 - `TELEGRAM_API_ID` / `TELEGRAM_API_HASH` — your app credentials from step 1.
-- `SESSION_ENCRYPTION_KEY` — encrypts the saved login on the disk. Generated for
-  you. **If you ever change it, your saved login becomes unreadable and you must
-  log in again.**
+- `SESSION_ENCRYPTION_KEY` — encrypts the saved login on the disk. Generate your
+  own with `openssl rand -hex 32`. **If you ever change it, your saved login
+  becomes unreadable and you must log in again.**
 - `CONNECTOR_SHARED_SECRET` — proves this service and your ReplyFlow engine are
   talking to each other. It must stay identical on both sides.
 - `CONTROL_PLANE_URL` — where this service sends the messages it sees. No
@@ -164,9 +177,9 @@ correctly shaped.
 Back in the ReplyFlow engine, set these server-side values:
 
 ```
-CONNECTOR_BASE_URL=https://replytelego-production.up.railway.app
-CONNECTOR_SHARED_SECRET=28231886a62412bbe363c4ba1859398ce12d5f2eb67b75582de2e73c2d8eeffe
-CREDENTIAL_ENCRYPTION_KEY=6eb2c8778711d19478d672c3bb357c93687eb63ddb96618808ce9db0653d015e
+CONNECTOR_BASE_URL=https://YOUR-SERVICE.up.railway.app
+CONNECTOR_SHARED_SECRET=paste-the-same-value-as-step-4
+CREDENTIAL_ENCRYPTION_KEY=paste-64-hex-characters-here
 ```
 
 `CONNECTOR_SHARED_SECRET` must be byte-identical to the one in step 4.

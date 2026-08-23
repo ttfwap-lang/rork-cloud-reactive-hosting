@@ -70,6 +70,10 @@ export default function ConversationImport() {
       setTestInput(result.workflowSteps[0]?.trigger ?? "");
       setPreview(null);
       toast.success("AI transcript and disabled workflow proposal are ready");
+    } catch (error) {
+      // Redaction and resizing happen here too, and those failures belong to no
+      // request, so without this the spinner would simply stop with nothing said.
+      toast.error(error instanceof Error ? error.message : "The screenshots could not be read.");
     } finally { setBusy(false); }
   };
 
@@ -90,6 +94,8 @@ export default function ConversationImport() {
       const result = await previewWorkflow(buildStep(first), testInput.trim());
       setPreview(result);
       result.matched ? toast.success("Preview matched without sending to Telegram") : toast.error("The test message did not match the first trigger");
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "The preview could not be run.");
     } finally { setBusy(false); }
   };
 
@@ -105,6 +111,10 @@ export default function ConversationImport() {
       await saveWorkflow(workflow);
       toast.success("Disabled draft saved — enable it only after final review");
       navigate("/workflows");
+    } catch (error) {
+      // Staying on the page matters here: the draft is only in memory, so
+      // navigating away on a failed save would lose the whole import.
+      toast.error(error instanceof Error ? error.message : "The draft could not be saved.");
     } finally { setBusy(false); }
   };
 

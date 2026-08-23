@@ -10,22 +10,33 @@
 #   export CONNECTOR_SHARED_SECRET=...
 #   ./connector/deploy.sh
 #
+# This talks to Railway's HTTP API directly rather than through the `railway`
+# CLI. The CLI's variable/service subcommands have changed shape more than once
+# and a script that shells out to them breaks silently when they do; the API
+# calls below are the exact sequence this connector is known to deploy with.
+#
+# Source is uploaded straight from this folder, so no code-host connection and
+# no repository access is involved at any point.
+#
 # Idempotent: safe to re-run. Never prints a secret value.
 
 set -euo pipefail
 
-SERVICE="${SERVICE:-}"
+API="https://backboard.railway.com/graphql/v2"
+SERVICE_NAME="${SERVICE_NAME:-replyflow-connector}"
 MOUNT_PATH="/data"
 PORT="8080"
 CONTROL_PLANE_URL="${CONTROL_PLANE_URL:-https://cloud-reactive-hosting-backend.rork.app}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$(basename "$HERE")"
 
 step() { printf '\n\033[1;36m==> %s\033[0m\n' "$1"; }
 note() { printf '    %s\n' "$1"; }
 fail() { printf '\n\033[1;31mFAILED: %s\033[0m\n' "$1" >&2; exit 1; }
 
-command -v railway >/dev/null || fail "railway CLI not found. Install: bash <(curl -fsSL railway.com/install.sh) -y"
-command -v jq >/dev/null || fail "jq not found. Install it, then re-run."
+command -v curl >/dev/null || fail "curl not found."
+command -v jq   >/dev/null || fail "jq not found. Install it, then re-run."
+command -v tar  >/dev/null || fail "tar not found."
 [ -n "${RAILWAY_TOKEN:-}" ] || fail "RAILWAY_TOKEN is not set. Create a PROJECT token: Railway -> Project Settings -> Tokens."
 
 # Validate every value up front so a typo fails here rather than producing a
@@ -38,70 +49,129 @@ done
 [ "${#SESSION_ENCRYPTION_KEY}" -ge 32 ] || fail "SESSION_ENCRYPTION_KEY must be at least 32 characters."
 [ "${#CONNECTOR_SHARED_SECRET}" -ge 24 ] || fail "CONNECTOR_SHARED_SECRET must be at least 24 characters."
 
-cd "$HERE"
+# One GraphQL call. Arguments: <query> <variables-json>. Fails loudly on an
+# `errors` array, which the API returns with HTTP 200.
+gql() {
+  local out
+  out="$(jq -nc --arg q "$1" --argjson v "$2" '{query:$q,variables:$v}' \
+    | curl -s -m 45 -X POST "$API" \
+        -H "Project-Access-Token: ${RAILWAY_TOKEN}" \
+        -H 'Content-Type: application/json' \
+        --data-binary @-)"
+  if jq -e '.errors' >/dev/null 2>&1 <<<"$out"; then
+    fail "Railway rejected a request: $(jq -r '.errors[0].message // "unknown"' <<<"$out")"
+  fi
+  printf '%s' "$out"
+}
 
 step "Checking project access"
-railway status --json >/tmp/rw-status.json 2>/tmp/rw-status.err \
-  || { cat /tmp/rw-status.err >&2; fail "Token rejected or project unreachable."; }
-note "Project: $(jq -r '.name // "?"' /tmp/rw-status.json)"
-
-# Returns the first service name, or empty when the project has none.
-detect_service() {
-  railway service list --json >/tmp/rw-services.json 2>/dev/null || echo '[]' >/tmp/rw-services.json
-  jq -r '[.. | objects | select(has("name")) | .name] | .[0] // empty' /tmp/rw-services.json
-}
+SCOPE="$(gql 'query { projectToken { projectId environmentId project { name } } }' '{}')"
+PROJECT_ID="$(jq -r '.data.projectToken.projectId' <<<"$SCOPE")"
+ENVIRONMENT_ID="$(jq -r '.data.projectToken.environmentId' <<<"$SCOPE")"
+[ "$PROJECT_ID" != "null" ] || fail "That token is not a project token. Create one under Project Settings -> Tokens."
+note "Project: $(jq -r '.data.projectToken.project.name' <<<"$SCOPE")"
 
 step "Locating the service"
-[ -n "$SERVICE" ] || SERVICE="$(detect_service)"
-if [ -z "$SERVICE" ]; then
-  note "No service in this project yet — creating one from this folder."
-  # Bootstrap only: this build has no variables yet, so it is expected to fail
-  # its health check. We just need the service to exist so we can configure it.
-  railway up --ci --yes >/dev/null 2>&1 || true
-  SERVICE="$(detect_service)"
-  [ -n "$SERVICE" ] || fail "Could not create a service. Create one in the Railway UI, then re-run."
+SERVICES="$(gql 'query($id:String!){ project(id:$id){ services{ edges{ node{ id name } } } } }' \
+  "$(jq -nc --arg id "$PROJECT_ID" '{id:$id}')")"
+SERVICE_ID="$(jq -r --arg n "$SERVICE_NAME" \
+  '[.data.project.services.edges[].node] | (map(select(.name == $n)) + .) | .[0].id // empty' <<<"$SERVICES")"
+if [ -z "$SERVICE_ID" ]; then
+  note "No service in this project yet — creating \"$SERVICE_NAME\"."
+  CREATED="$(gql 'mutation($input:ServiceCreateInput!){ serviceCreate(input:$input){ id } }' \
+    "$(jq -nc --arg p "$PROJECT_ID" --arg n "$SERVICE_NAME" '{input:{projectId:$p,name:$n}}')")"
+  SERVICE_ID="$(jq -r '.data.serviceCreate.id' <<<"$CREATED")"
+  [ -n "$SERVICE_ID" ] && [ "$SERVICE_ID" != "null" ] || fail "Could not create a service."
 fi
-note "Service: $SERVICE"
+note "Service: $SERVICE_ID"
+
+# The tarball keeps the connector/ prefix, so the build folder has to point at it.
+# Without this the platform's language detector inspects the archive root, finds
+# only a directory, and refuses to build at all.
+step "Setting the build folder to \"$ROOT_DIR\" and the health check to /health"
+gql 'mutation($serviceId:String!,$environmentId:String,$input:ServiceInstanceUpdateInput!){ serviceInstanceUpdate(serviceId:$serviceId, environmentId:$environmentId, input:$input) }' \
+  "$(jq -nc --arg s "$SERVICE_ID" --arg e "$ENVIRONMENT_ID" --arg r "$ROOT_DIR" \
+     '{serviceId:$s,environmentId:$e,input:{rootDirectory:$r,healthcheckPath:"/health"}}')" >/dev/null
+note "ok"
 
 step "Writing service variables (values are never echoed)"
-set_var() {
-  printf '%s' "$2" | railway variable set "$1" --stdin --service "$SERVICE" --skip-deploys >/dev/null 2>&1 \
-    || fail "Could not set $1"
-  note "set $1"
-}
-set_var TELEGRAM_API_ID         "$TELEGRAM_API_ID"
-set_var TELEGRAM_API_HASH       "$TELEGRAM_API_HASH"
-set_var SESSION_ENCRYPTION_KEY  "$SESSION_ENCRYPTION_KEY"
-set_var CONNECTOR_SHARED_SECRET "$CONNECTOR_SHARED_SECRET"
-set_var CONTROL_PLANE_URL       "$CONTROL_PLANE_URL"
-set_var SESSION_PATH            "$MOUNT_PATH"
+gql 'mutation($input:VariableCollectionUpsertInput!){ variableCollectionUpsert(input:$input) }' \
+  "$(jq -nc \
+      --arg p "$PROJECT_ID" --arg e "$ENVIRONMENT_ID" --arg s "$SERVICE_ID" \
+      --arg apiId "$TELEGRAM_API_ID" --arg apiHash "$TELEGRAM_API_HASH" \
+      --arg sessionKey "$SESSION_ENCRYPTION_KEY" --arg shared "$CONNECTOR_SHARED_SECRET" \
+      --arg control "$CONTROL_PLANE_URL" --arg mount "$MOUNT_PATH" \
+      '{input:{projectId:$p,environmentId:$e,serviceId:$s,skipDeploys:true,replace:false,variables:{
+         TELEGRAM_API_ID:$apiId, TELEGRAM_API_HASH:$apiHash,
+         SESSION_ENCRYPTION_KEY:$sessionKey, CONNECTOR_SHARED_SECRET:$shared,
+         CONTROL_PLANE_URL:$control, SESSION_PATH:$mount }}}')" >/dev/null
+for name in TELEGRAM_API_ID TELEGRAM_API_HASH SESSION_ENCRYPTION_KEY CONNECTOR_SHARED_SECRET CONTROL_PLANE_URL SESSION_PATH; do
+  note "set $name"
+done
 
 step "Ensuring the persistent disk exists at $MOUNT_PATH"
-railway volume list --json >/tmp/rw-volumes.json 2>/dev/null || echo '[]' >/tmp/rw-volumes.json
-if jq -e --arg m "$MOUNT_PATH" '[.. | objects | .mountPath? // empty] | any(. == $m)' /tmp/rw-volumes.json >/dev/null 2>&1; then
+MOUNTS="$(gql 'query($id:String!){ environment(id:$id){ volumeInstances{ edges{ node{ mountPath serviceId } } } } }' \
+  "$(jq -nc --arg id "$ENVIRONMENT_ID" '{id:$id}')")"
+if jq -e --arg m "$MOUNT_PATH" --arg s "$SERVICE_ID" \
+     '[.data.environment.volumeInstances.edges[].node] | any(.mountPath == $m and .serviceId == $s)' \
+     >/dev/null <<<"$MOUNTS"; then
   note "volume already mounted at $MOUNT_PATH"
 else
-  if railway volume add --service "$SERVICE" --mount-path "$MOUNT_PATH" >/dev/null 2>&1; then
-    note "created volume at $MOUNT_PATH"
-  else
-    note "WARNING: could not create the volume — the Telegram login will not survive a restart."
-  fi
+  gql 'mutation($input:VolumeCreateInput!){ volumeCreate(input:$input){ id } }' \
+    "$(jq -nc --arg p "$PROJECT_ID" --arg e "$ENVIRONMENT_ID" --arg s "$SERVICE_ID" --arg m "$MOUNT_PATH" \
+       '{input:{projectId:$p,environmentId:$e,serviceId:$s,mountPath:$m}}')" >/dev/null
+  note "created volume at $MOUNT_PATH"
 fi
 
-step "Uploading and building (streaming build log)"
-railway up --ci --service "$SERVICE" || {
-  printf '\nBuild failed. Last 80 lines of the build log:\n'
-  railway logs --build --service "$SERVICE" --lines 80 2>/dev/null || true
-  fail "Deploy did not complete."
-}
-
 step "Ensuring a public domain on port $PORT"
-railway domain --service "$SERVICE" --port "$PORT" >/dev/null 2>&1 || true
-railway domain list --service "$SERVICE" --json >/tmp/rw-domains.json 2>/dev/null || echo '[]' >/tmp/rw-domains.json
-DOMAIN="$(jq -r '[.. | objects | .domain? // empty] | map(select(type == "string")) | .[0] // empty' /tmp/rw-domains.json)"
-[ -n "$DOMAIN" ] || fail "No public domain is attached. Add one under Settings -> Networking, then re-run."
+DOMAINS="$(gql 'query($p:String!,$e:String!,$s:String!){ domains(projectId:$p, environmentId:$e, serviceId:$s){ serviceDomains{ domain targetPort } } }' \
+  "$(jq -nc --arg p "$PROJECT_ID" --arg e "$ENVIRONMENT_ID" --arg s "$SERVICE_ID" '{p:$p,e:$e,s:$s}')")"
+DOMAIN="$(jq -r '.data.domains.serviceDomains[0].domain // empty' <<<"$DOMAINS")"
+if [ -z "$DOMAIN" ]; then
+  CREATED_DOMAIN="$(gql 'mutation($input:ServiceDomainCreateInput!){ serviceDomainCreate(input:$input){ domain } }' \
+    "$(jq -nc --arg e "$ENVIRONMENT_ID" --arg s "$SERVICE_ID" --argjson port "$PORT" \
+       '{input:{environmentId:$e,serviceId:$s,targetPort:$port}}')")"
+  DOMAIN="$(jq -r '.data.serviceDomainCreate.domain' <<<"$CREATED_DOMAIN")"
+fi
+[ -n "$DOMAIN" ] && [ "$DOMAIN" != "null" ] || fail "No public domain could be attached."
 BASE="https://${DOMAIN#https://}"
 note "$BASE"
+
+step "Uploading source and building"
+TARBALL="$(mktemp -t connector-XXXXXX.tar.gz)"
+trap 'rm -f "$TARBALL"' EXIT
+# storage/ holds live Telegram sessions and vendor/ is rebuilt inside the image;
+# neither belongs in an upload.
+tar -czf "$TARBALL" -C "$(dirname "$HERE")" \
+  --exclude="${ROOT_DIR}/storage/*" --exclude="${ROOT_DIR}/vendor" "$ROOT_DIR"
+note "bundled $(wc -c <"$TARBALL" | tr -d ' ') bytes"
+
+UP="$(curl -s -m 300 -X POST \
+  "https://backboard.railway.com/project/${PROJECT_ID}/environment/${ENVIRONMENT_ID}/up?serviceId=${SERVICE_ID}" \
+  -H "Project-Access-Token: ${RAILWAY_TOKEN}" \
+  -H 'Content-Type: multipart/form-data' \
+  --data-binary @"$TARBALL")"
+DEPLOYMENT_ID="$(jq -r '.deploymentId // empty' <<<"$UP")"
+[ -n "$DEPLOYMENT_ID" ] || fail "Upload rejected: $(printf '%s' "$UP" | head -c 400)"
+note "deployment $DEPLOYMENT_ID"
+
+step "Waiting for the build"
+STATUS=""
+for attempt in $(seq 1 60); do
+  STATUS="$(gql 'query($id:String!){ deployment(id:$id){ status } }' \
+    "$(jq -nc --arg id "$DEPLOYMENT_ID" '{id:$id}')" | jq -r '.data.deployment.status')"
+  case "$STATUS" in
+    SUCCESS) note "build succeeded"; break ;;
+    FAILED|CRASHED|REMOVED)
+      printf '\nBuild log:\n'
+      gql 'query($id:String!){ buildLogs(deploymentId:$id, limit:80){ message } }' \
+        "$(jq -nc --arg id "$DEPLOYMENT_ID" '{id:$id}')" | jq -r '.data.buildLogs[].message'
+      fail "Build ended as $STATUS."
+      ;;
+    *) note "attempt $attempt/60 -> $STATUS"; sleep 10 ;;
+  esac
+done
+[ "$STATUS" = "SUCCESS" ] || fail "Build did not finish in time."
 
 step "Waiting for the service to answer"
 healthy=0
@@ -115,11 +185,7 @@ for attempt in $(seq 1 30); do
   note "attempt $attempt/30 -> HTTP $code"
   sleep 10
 done
-if [ "$healthy" -ne 1 ]; then
-  printf '\nLast 60 lines of the deployment log:\n'
-  railway logs --deployment --service "$SERVICE" --lines 60 2>/dev/null || true
-  fail "Service never became healthy."
-fi
+[ "$healthy" -eq 1 ] || fail "Service never became healthy."
 
 step "Readiness report"
 curl -s -m 15 "$BASE/selfcheck" >/tmp/rw-selfcheck.json || true
