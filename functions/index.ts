@@ -147,8 +147,11 @@ export default {
       let serviceUp = false;
       try {
         const health = await env.DO.fetch(toEngine(request, "/status/public", publicOrigin, OWNER_TENANT_ID));
-        const payload = (await health.json()) as { reachable?: unknown };
-        serviceUp = payload.reachable === true;
+        const payload = (await health.json()) as { reachable?: unknown; configured?: unknown };
+        // Answering is not the same as usable: a service still missing its settings
+        // can never take a connection, so it must not be advertised as having free
+        // slots. `null` means readiness is simply unknown, which is not a failure.
+        serviceUp = payload.reachable === true && payload.configured !== false;
       } catch {
         // An unreachable engine is itself a service that cannot take connections,
         // so the default of `false` is already the honest answer.

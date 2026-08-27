@@ -161,6 +161,12 @@ type HostingFacts = {
   sourceKind: "repo" | "image" | null;
   rootDirectory: string | null;
   buildLogLines: number;
+  /**
+   * Whether the service this token configures is the one the connector address
+   * points at. `null` when the question cannot be answered — no address stored,
+   * or the service has no public address yet.
+   */
+  addressMatch: boolean | null;
 };
 
 /** Plain-language cause of a failed build, derived from the log but never quoting it. */
@@ -174,6 +180,8 @@ export type HostingApplyCode =
   | "no_session_key"
   | "token_rejected"
   | "no_service"
+  | "no_public_origin"
+  | "address_service_mismatch"
   | "settings_rejected";
 type HostingApplyResult = { ok: boolean; applied: string[]; error: string | null; code: HostingApplyCode };
 type AutoRepairState = { attempts: number; lastAt: number | null; nextAt: number | null; lastDetail: string | null; lastCode: HostingApplyCode | null; version: number };
@@ -181,7 +189,7 @@ type AutoRepairState = { attempts: number; lastAt: number | null; nextAt: number
  * Bumped whenever the repair routine itself changes. A stored count of failures
  * from an older routine says nothing about the new one, so it is discarded.
  */
-const REPAIR_LOGIC_VERSION = 3;
+const REPAIR_LOGIC_VERSION = 4;
 const EMPTY_REPAIR: AutoRepairState = { attempts: 0, lastAt: null, nextAt: null, lastDetail: null, lastCode: null, version: REPAIR_LOGIC_VERSION };
 
 /**
@@ -201,6 +209,16 @@ export type PublicStatus = {
   buildLogLines: number | null;
   buildFailure: BuildFailure | null;
   sourceState: SourceCheckState | null;
+  /**
+   * Whether the running service has every setting it needs. `null` means its
+   * readiness route has not answered yet, which is not the same as "ready".
+   */
+  configured: boolean | null;
+  /**
+   * Whether the hosting token and the connector address agree on which service is
+   * being run. False means settings are being written somewhere nothing listens.
+   */
+  addressMatch: boolean | null;
   repair: { attempts: number; exhausted: boolean; code: HostingApplyCode | null };
   checkedAt: number;
 };
@@ -213,6 +231,18 @@ const EMPTY_AUTODEPLOY: HostingAutoDeploy = { enabled: false, repository: null, 
  */
 export type ConnectorProbe = { reachable: boolean; detail: string; checkedAt: number | null; workerAgeSeconds: number | null; latencyMs: number | null };
 const EMPTY_PROBE: ConnectorProbe = { reachable: false, detail: "Not checked yet.", checkedAt: null, workerAgeSeconds: null, latencyMs: null };
+
+/**
+ * Whether the connector has actually been given the settings it needs to work.
+ * A service can answer its liveness route the moment its web server starts, long
+ * before — or entirely without — any configuration, so "answering" and "usable"
+ * are two different questions and are asked separately.
+ *
+ * `known` is false when the readiness route could not be read at all, in which
+ * case nothing is concluded rather than a failure being invented.
+ */
+export type ConnectorReadiness = { known: boolean; ready: boolean; failing: string[]; checkedAt: number | null };
+const EMPTY_READINESS: ConnectorReadiness = { known: false, ready: false, failing: [], checkedAt: null };
 
 export type ConditionField =
   | "text"
@@ -1290,6 +1320,21 @@ export class AutomationEngine extends DurableObject<Env> {
     return Boolean(this.env.CONNECTOR_BASE_URL?.trim() && this.env.CONNECTOR_SHARED_SECRET?.trim());
   }
 
+  /**
+   * Host part of the configured connector address, lowercased, or null when no
+   * usable address is stored. Used to prove that the service being configured is
+   * the same one being talked to — never logged or returned to a caller.
+   */
+  private connectorHost(): string | null {
+    const base = this.env.CONNECTOR_BASE_URL?.trim();
+    if (!base) return null;
+    try {
+      return new URL(base).host.toLowerCase();
+    } catch {
+      return null;
+    }
+  }
+
   private async hmac(secret: string, value: string): Promise<string> {
     const key = await crypto.subtle.importKey("raw", new TextEncoder().encode(secret), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
     return this.hex(new Uint8Array(await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(value))));
@@ -2153,6 +2198,33 @@ export class AutomationEngine extends DurableObject<Env> {
     }
   }
 
+  /**
+   * Asks the connector whether it has everything it needs, rather than merely
+   * whether it is answering. The readiness route deliberately replies 503 while
+   * anything is still missing, so a non-2xx response is read for its body instead
+   * of being discarded. Only the names of failing checks are kept — never their
+   * values, which the route does not publish in the first place.
+   */
+  private async readConnectorReadiness(): Promise<ConnectorReadiness> {
+    const checkedAt = Date.now();
+    const base = this.env.CONNECTOR_BASE_URL?.replace(/\/$/, "");
+    if (!base) return { ...EMPTY_READINESS, checkedAt };
+    try {
+      const response = await fetch(`${base}/selfcheck`, { signal: AbortSignal.timeout(10_000) });
+      const body = (await response.json().catch(() => null)) as { ok?: unknown; checks?: unknown } | null;
+      // An older connector, or a proxy error page, tells us nothing either way.
+      if (!body || typeof body.ok !== "boolean") return { ...EMPTY_READINESS, checkedAt };
+      const rows = Array.isArray(body.checks) ? (body.checks as Array<{ name?: unknown; status?: unknown }>) : [];
+      const failing = rows
+        .filter((row) => row.status === "fail")
+        .map((row) => String(row.name ?? "").trim())
+        .filter((name) => name.length > 0);
+      return { known: true, ready: body.ok, failing, checkedAt };
+    } catch {
+      return { ...EMPTY_READINESS, checkedAt };
+    }
+  }
+
   // ------------------------------------------------------------------ hosting
 
   private railwayToken(): string | null {
@@ -2605,7 +2677,37 @@ export class AutomationEngine extends DurableObject<Env> {
     const target = nodes.find((node) => /connector|reply|telego/i.test(node.name)) ?? nodes[0];
     if (!target) return fail("no_service", "This project has no service to configure. Create one from the connector folder first.");
 
-    const controlPlane = this.kvGet<string | null>("publicOrigin", null) ?? "";
+    // The connector reports its results back to this address. Storing a blank one
+    // would leave a service that builds, runs and answers its health route while
+    // being permanently unable to reply to anything — the worst kind of failure,
+    // because nothing looks wrong. So a missing origin stops the apply outright.
+    const controlPlane = (this.kvGet<string | null>("publicOrigin", null) ?? "").replace(/\/$/, "");
+    if (!controlPlane.startsWith("https://")) {
+      return fail("no_public_origin", "The engine does not know its own public address yet, so the connector would have nowhere to reply. Open the console once and try again.");
+    }
+    // Which addresses this service actually answers on. Read before anything is
+    // written, because it decides whether writing is safe at all.
+    const domains = await this.railwayQuery<{ domains: { serviceDomains: Array<{ id: string; domain: string; targetPort: number | null }> } }>(
+      scope.kind,
+      "query domains($projectId: String!, $environmentId: String!, $serviceId: String!) { domains(projectId: $projectId, environmentId: $environmentId, serviceId: $serviceId) { serviceDomains { id domain targetPort } } }",
+      { projectId: scope.projectId, environmentId: scope.environmentId, serviceId: target.id },
+    ).catch(() => null);
+    const existing = domains?.domains.serviceDomains ?? [];
+
+    // The token decides which project is configured; the address decides which
+    // service is actually used. Nothing has ever forced those two to agree, so a
+    // token for the wrong project would write every setting into a service nobody
+    // talks to and report complete success. The engine would then keep "repairing"
+    // a stranger's service forever while the real one stayed broken. Refusing here
+    // is the difference between a loud stop and a permanent silent lie.
+    const addressHost = this.connectorHost();
+    if (addressHost !== null && existing.length > 0 && !existing.some((entry) => entry.domain.toLowerCase() === addressHost)) {
+      return fail(
+        "address_service_mismatch",
+        "The hosting token opens a different service than the one the connector address points at, so the settings would have been written somewhere nothing is listening. Store the token for the project that actually runs the connector.",
+      );
+    }
+
     const applied: string[] = [];
 
     try {
@@ -2679,12 +2781,6 @@ export class AutomationEngine extends DurableObject<Env> {
       }
     }
 
-    const domains = await this.railwayQuery<{ domains: { serviceDomains: Array<{ id: string; domain: string; targetPort: number | null }> } }>(
-      scope.kind,
-      "query domains($projectId: String!, $environmentId: String!, $serviceId: String!) { domains(projectId: $projectId, environmentId: $environmentId, serviceId: $serviceId) { serviceDomains { id domain targetPort } } }",
-      { projectId: scope.projectId, environmentId: scope.environmentId, serviceId: target.id },
-    ).catch(() => null);
-    const existing = domains?.domains.serviceDomains ?? [];
     if (existing.length === 0) {
       try {
         await this.railwayQuery(
@@ -2860,6 +2956,7 @@ export class AutomationEngine extends DurableObject<Env> {
     const history = this.kvGet<HealthSample[]>("healthHistory", []);
     const facts = this.kvGet<HostingFacts | null>("hostingFacts", null);
     const repair = this.kvGet<AutoRepairState>("autoRepair", EMPTY_REPAIR);
+    const readiness = this.kvGet<ConnectorReadiness>("connectorReadiness", EMPTY_READINESS);
     return {
       reachable: probe.reachable,
       uptimePct: this.uptimeFrom(history).uptimePct,
@@ -2873,6 +2970,8 @@ export class AutomationEngine extends DurableObject<Env> {
       buildLogLines: facts?.buildLogLines ?? null,
       buildFailure: facts?.failure ?? null,
       sourceState: this.kvGet<SourceCheck | null>("sourceCheck", null)?.state ?? null,
+      configured: readiness.known ? readiness.ready : null,
+      addressMatch: facts?.addressMatch ?? null,
       repair: { attempts: repair.attempts, exhausted: repair.attempts >= AUTO_REPAIR_MAX_ATTEMPTS, code: repair.lastCode ?? null },
       checkedAt: Date.now(),
     };
@@ -3042,7 +3141,7 @@ export class AutomationEngine extends DurableObject<Env> {
       scope = await this.railwayScope();
     } catch (failure) {
       const detail = failure instanceof Error ? failure.message : "The hosting token could not be verified.";
-      return { serviceName: null, status: null, at: null, autoDeploy: { ...EMPTY_AUTODEPLOY, detail }, refreshedAt: Date.now(), tokenOk: false, serviceCount: 0, failure: null, sourceKind: null, rootDirectory: null, buildLogLines: 0 };
+      return { serviceName: null, status: null, at: null, autoDeploy: { ...EMPTY_AUTODEPLOY, detail }, refreshedAt: Date.now(), tokenOk: false, serviceCount: 0, failure: null, sourceKind: null, rootDirectory: null, buildLogLines: 0, addressMatch: null };
     }
     const nodes = await this.railwayServices(scope);
     const target = nodes.find((node) => /connector|reply|telego/i.test(node.name)) ?? nodes[0];
@@ -3059,12 +3158,14 @@ export class AutomationEngine extends DurableObject<Env> {
         sourceKind: null,
         rootDirectory: null,
         buildLogLines: 0,
+        addressMatch: null,
       };
     }
     const triggers = await this.railwayTriggers(scope);
     const mounts = await this.railwayMounts(scope);
     const report = await this.hostingServiceReport(scope, target, mounts, triggers);
     const diagnosis = await this.buildFailureFor(scope, target.id, report.latestStatus);
+    const addressHost = this.connectorHost();
     return {
       serviceName: report.name,
       status: report.latestStatus,
@@ -3077,6 +3178,9 @@ export class AutomationEngine extends DurableObject<Env> {
       sourceKind: report.source === null ? null : /\//.test(report.source) && !report.source.includes(":") ? "repo" : "image",
       rootDirectory: report.rootDirectory,
       buildLogLines: diagnosis.lines,
+      addressMatch: addressHost === null || report.domains.length === 0
+        ? null
+        : report.domains.some((entry) => entry.domain.toLowerCase() === addressHost),
     };
   }
 
@@ -3112,18 +3216,29 @@ export class AutomationEngine extends DurableObject<Env> {
   }
 
   /**
-   * Unattended recovery: when the connector is unreachable and a hosting token is
+   * Unattended recovery: when the connector cannot be used and a hosting token is
    * stored, re-apply the configuration and redeploy. Backed off exponentially and
    * capped, so a genuinely broken build is never redeployed in a loop.
+   *
+   * "Cannot be used" covers two distinct failures. The obvious one is a service
+   * that does not answer. The quieter one is a service that answers perfectly
+   * while missing the settings it needs — it passes every health check, reports
+   * itself up, and can still never connect to Telegram. Waiting does not fix the
+   * second kind, because the missing settings only ever arrive by being pushed.
    */
   private async autoRepairHosting(probe: ConnectorProbe): Promise<void> {
     await this.noteTokenRotation();
     const stored = this.kvGet<AutoRepairState>("autoRepair", EMPTY_REPAIR);
-    // The routine now reconnects the repository before building, so attempts made
+    // The routine now judges readiness as well as reachability, so attempts made
     // by the previous routine no longer predict whether this one will succeed.
     const state = stored.version === REPAIR_LOGIC_VERSION ? stored : { ...EMPTY_REPAIR };
     if (stored.version !== REPAIR_LOGIC_VERSION) this.kvPut("autoRepair", state);
-    if (probe.reachable) {
+
+    const readiness = probe.reachable ? await this.readConnectorReadiness() : { ...EMPTY_READINESS, checkedAt: Date.now() };
+    this.kvPut("connectorReadiness", readiness);
+    // An unreadable readiness route proves nothing, so it is never read as a fault.
+    const usable = probe.reachable && (!readiness.known || readiness.ready);
+    if (usable) {
       if (state.attempts !== 0) this.kvPut("autoRepair", EMPTY_REPAIR);
       return;
     }
@@ -3141,16 +3256,38 @@ export class AutomationEngine extends DurableObject<Env> {
     // Exponential backoff leaves room for a build to finish before the next attempt.
     const nextAt = now + AUTO_REPAIR_COOLDOWN_MS * 2 ** (attempts - 1);
     this.kvPut("autoRepair", { attempts, lastAt: now, nextAt, lastDetail: detail, lastCode: result.code, version: REPAIR_LOGIC_VERSION } satisfies AutoRepairState);
+    // Naming which of the two faults triggered this makes the log actionable:
+    // "unreachable" and "answering but unconfigured" call for different responses.
+    const cause = probe.reachable
+      ? `was missing ${readiness.failing.length} required setting(s) (${readiness.failing.join(", ")})`
+      : "was unreachable";
     this.log(
       result.ok ? "warn" : "error",
       "hosting.autorepair",
       result.ok
-        ? `Connector was unreachable, so a redeploy was started automatically (attempt ${attempts} of ${AUTO_REPAIR_MAX_ATTEMPTS}).`
+        ? `Connector ${cause}, so its settings were pushed and a redeploy was started automatically (attempt ${attempts} of ${AUTO_REPAIR_MAX_ATTEMPTS}).`
         : `Automatic repair attempt ${attempts} failed: ${detail}`,
     );
     if (attempts >= AUTO_REPAIR_MAX_ATTEMPTS) {
-      this.log("error", "hosting.autorepair", "Automatic repair has given up. Open the Hosting inspector and read the build log.");
-      this.ctx.waitUntil(this.sendOperationalAlert("ReplyFlow: automatic hosting repair gave up after repeated failures."));
+      // Repairs that keep reporting success while the address stays silent are the
+      // most misleading state this system can reach: every write lands, every check
+      // passes, and nothing works. It almost always means the stored address and
+      // token still describe a project that has since been replaced or deleted --
+      // they agree with each other, so no consistency check can catch it. Say so,
+      // rather than sending the reader to a build log that will look perfectly fine.
+      const stale = result.ok && !probe.reachable;
+      this.log(
+        "error",
+        "hosting.autorepair",
+        stale
+          ? "Automatic repair has given up. Every setting was accepted by the hosting platform, yet the connector address never answered — the stored address and hosting token most likely belong to a project that no longer exists. Replace both with the ones for the project actually running the connector."
+          : "Automatic repair has given up. Open the Hosting inspector and read the build log.",
+      );
+      this.ctx.waitUntil(this.sendOperationalAlert(
+        stale
+          ? "ReplyFlow: hosting repair gave up — settings apply cleanly but the connector address never answers, so the stored address and token are probably stale."
+          : "ReplyFlow: automatic hosting repair gave up after repeated failures.",
+      ));
     }
   }
 
