@@ -201,14 +201,16 @@ export type HostingApplyCode =
   | "no_service"
   | "no_public_origin"
   | "address_service_mismatch"
-  | "settings_rejected";
+  | "settings_rejected"
+  | "deferred_active_lease"
+  | "deferred_active_run";
 type HostingApplyResult = { ok: boolean; applied: string[]; error: string | null; code: HostingApplyCode };
 type AutoRepairState = { attempts: number; lastAt: number | null; nextAt: number | null; lastDetail: string | null; lastCode: HostingApplyCode | null; version: number };
 /**
  * Bumped whenever the repair routine itself changes. A stored count of failures
  * from an older routine says nothing about the new one, so it is discarded.
  */
-const REPAIR_LOGIC_VERSION = 4;
+const REPAIR_LOGIC_VERSION = 5;
 const EMPTY_REPAIR: AutoRepairState = { attempts: 0, lastAt: null, nextAt: null, lastDetail: null, lastCode: null, version: REPAIR_LOGIC_VERSION };
 
 /**
@@ -3389,7 +3391,7 @@ export class AutomationEngine extends DurableObject<Env> {
    * Pushes the connector's settings, build folder, disk and port to Railway, then
    * redeploys. Shared by the console button and the unattended watchdog repair.
    */
-  private async applyHostingConfig(): Promise<HostingApplyResult> {
+  private async applyHostingConfig(shouldDeploy = true): Promise<HostingApplyResult> {
     const credentials = this.presetCredentials();
     const sharedSecret = this.env.CONNECTOR_SHARED_SECRET?.trim();
     const sessionKey = await this.connectorSessionKey();
@@ -3540,10 +3542,14 @@ export class AutomationEngine extends DurableObject<Env> {
       }
     }
 
-    try {
-      applied.push(`${await this.startDeployment(scope, target.id, deployKind)} It usually takes two to four minutes.`);
-    } catch (failure) {
-      applied.push(`Could not start a deployment: ${failure instanceof Error ? failure.message : "unknown error"}`);
+    if (shouldDeploy) {
+      try {
+        applied.push(`${await this.startDeployment(scope, target.id, deployKind)} It usually takes two to four minutes.`);
+      } catch (failure) {
+        applied.push(`Could not start a deployment: ${failure instanceof Error ? failure.message : "unknown error"}`);
+      }
+    } else {
+      applied.push("Applied non-destructive configuration (redeploy deferred).");
     }
 
     this.log("info", "hosting.apply", `Applied hosting configuration to "${target.name}".`);
@@ -3980,8 +3986,40 @@ export class AutomationEngine extends DurableObject<Env> {
     if (state.nextAt !== null && now < state.nextAt) return;
     if (state.attempts >= AUTO_REPAIR_MAX_ATTEMPTS) return;
 
+    // Run- and lease-awareness check: defer redeploy while an agent lease or batch run is active
+    const activeLeases = this.ctx.storage.sql.exec<{ n: number }>(
+      "SELECT COUNT(*) AS n FROM agent_leases WHERE expires_at > ?", now
+    ).toArray()[0]?.n ?? 0;
+    const activeTurns = this.ctx.storage.sql.exec<{ n: number }>(
+      "SELECT COUNT(*) AS n FROM agent_turns WHERE status = 'running'"
+    ).toArray()[0]?.n ?? 0;
+    const activeRuns = this.ctx.storage.sql.exec<{ n: number }>(
+      "SELECT COUNT(*) AS n FROM runs WHERE status IN ('pending', 'running')"
+    ).toArray()[0]?.n ?? 0;
+
+    const isLeaseActive = activeLeases > 0 || activeTurns > 0;
+    const isRunActive = activeRuns > 0;
+
+    if (isLeaseActive || isRunActive) {
+      // Push non-destructive configuration without redeploying
+      await this.applyHostingConfig(false).catch(() => null);
+      const deferCode: HostingApplyCode = isLeaseActive ? "deferred_active_lease" : "deferred_active_run";
+      const deferReason = isLeaseActive ? "agent lease" : "batch run";
+      const nextAt = now + 60_000;
+      this.kvPut("autoRepair", {
+        attempts: state.attempts,
+        lastAt: now,
+        nextAt,
+        lastDetail: `Redeploy deferred while ${deferReason} is active. Non-destructive configuration was pushed.`,
+        lastCode: deferCode,
+        version: REPAIR_LOGIC_VERSION,
+      } satisfies AutoRepairState);
+      this.log("info", "hosting.autorepair", `Auto-repair redeploy deferred: an active ${deferReason} is running. Settings pushed.`);
+      return;
+    }
+
     const attempts = state.attempts + 1;
-    const result = await this.applyHostingConfig().catch((failure: unknown) => {
+    const result = await this.applyHostingConfig(true).catch((failure: unknown) => {
       const error = failure instanceof Error ? failure.message : "unknown error";
       return { ok: false, applied: [], error, code: "settings_rejected" } satisfies HostingApplyResult;
     });
