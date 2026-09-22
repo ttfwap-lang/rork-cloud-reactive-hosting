@@ -9,6 +9,23 @@ import {
   type MatchResult,
   type TriggerMode,
 } from "./matching";
+import {
+  checkCooldown,
+  checkMaxRuns,
+  evaluateRails,
+  isAllowlisted,
+  isWithinQuietHours,
+  targetsMatch as pureTargetsMatch,
+} from "./rails";
+import {
+  calculateFloodWaitResume,
+  calculateSlotTime,
+  checkRateLimits,
+  evaluateReserveSlot,
+} from "./pacing";
+import {
+  computeNextStep,
+} from "./step-logic";
 
 export type { ConditionOperator, TriggerMode };
 
@@ -2085,22 +2102,11 @@ export class AutomationEngine extends DurableObject<Env> {
   }
 
   private targetsMatch(workflow: Workflow, message: MessageContext): boolean {
-    if (workflow.targets.length === 0) return true;
-    const sender = message.sender.replace(/^@/, "").toLowerCase();
-    const chat = message.chatKey.replace(/^@/, "").toLowerCase();
-    return workflow.targets.some((target) => {
-      const normalized = target.replace(/^@/, "").toLowerCase();
-      return normalized === sender || normalized === chat;
-    });
+    return pureTargetsMatch(workflow.targets, message.chatKey, message.sender);
   }
 
   private withinQuietHours(settings: Settings): boolean {
-    if (!settings.quietHours.enabled) return false;
-    try {
-      const time = new Intl.DateTimeFormat("en-GB", { timeZone: settings.quietHours.timeZone, hour: "2-digit", minute: "2-digit", hour12: false }).format(new Date());
-      const { start, end } = settings.quietHours;
-      return start <= end ? time >= start && time < end : time >= start || time < end;
-    } catch { return false; }
+    return isWithinQuietHours(settings.quietHours);
   }
 
   private substitute(template: string, variables: Record<string, string>): string {
@@ -2171,21 +2177,29 @@ export class AutomationEngine extends DurableObject<Env> {
     const actionOk = await this.executeAction(workflow, step, message, variables);
     if (!actionOk) return;
     if (workflow.pinned) this.recordHardwiredReply(message, stepIndex);
-    const nextIndex = step.loopTo !== null ? step.loopTo : stepIndex + 1;
-    const loopCount = step.loopTo !== null ? (contextRow?.loop_count ?? 0) + 1 : 0;
-    if (step.loopTo !== null && loopCount > step.maxLoops) {
+    const stepDecision = computeNextStep({
+      stepIndex,
+      totalSteps: workflow.steps.length,
+      actionType: step.actionType,
+      loopTo: step.loopTo,
+      maxLoops: step.maxLoops,
+      timeoutMs: step.timeoutMs,
+      currentLoopCount: contextRow?.loop_count ?? 0,
+      bypassLimits: bypass,
+      now,
+    });
+    if (stepDecision.outcome === "loop_limit") {
       this.ctx.storage.sql.exec("DELETE FROM runtime WHERE chat_key = ?", message.chatKey);
       this.ctx.storage.sql.exec("INSERT INTO runtime_context (chat_key, variables, loop_count, run_count, last_completed_at) VALUES (?, ?, 0, ?, ?) ON CONFLICT(chat_key) DO UPDATE SET variables=excluded.variables, loop_count=0, run_count=excluded.run_count, last_completed_at=excluded.last_completed_at", message.chatKey, JSON.stringify(variables), (contextRow?.run_count ?? 0) + 1, Date.now());
-      this.log("warn", "workflow.loop_limit", "Workflow stopped at its maximum loop count.", workflow.id, message.chatKey);
-    } else if (nextIndex < workflow.steps.length && step.actionType !== "end") {
-      const expiresAt = bypass ? NEVER_EXPIRES : Date.now() + step.timeoutMs;
-      this.ctx.storage.sql.exec("INSERT INTO runtime (chat_key, workflow_id, step_index, updated_at, expires_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(chat_key) DO UPDATE SET workflow_id=excluded.workflow_id, step_index=excluded.step_index, updated_at=excluded.updated_at, expires_at=excluded.expires_at", message.chatKey, workflow.id, nextIndex, Date.now(), expiresAt);
-      this.ctx.storage.sql.exec("INSERT INTO runtime_context (chat_key, variables, loop_count, run_count) VALUES (?, ?, ?, ?) ON CONFLICT(chat_key) DO UPDATE SET variables=excluded.variables, loop_count=excluded.loop_count", message.chatKey, JSON.stringify(variables), loopCount, contextRow?.run_count ?? 0);
-      this.log("info", "step.advance", `Conversation advanced to step ${nextIndex + 1}.`, workflow.id, message.chatKey);
+      this.log("warn", "workflow.loop_limit", stepDecision.reason, workflow.id, message.chatKey);
+    } else if (stepDecision.outcome === "advance") {
+      this.ctx.storage.sql.exec("INSERT INTO runtime (chat_key, workflow_id, step_index, updated_at, expires_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(chat_key) DO UPDATE SET workflow_id=excluded.workflow_id, step_index=excluded.step_index, updated_at=excluded.updated_at, expires_at=excluded.expires_at", message.chatKey, workflow.id, stepDecision.nextIndex, Date.now(), stepDecision.expiresAt);
+      this.ctx.storage.sql.exec("INSERT INTO runtime_context (chat_key, variables, loop_count, run_count) VALUES (?, ?, ?, ?) ON CONFLICT(chat_key) DO UPDATE SET variables=excluded.variables, loop_count=excluded.loop_count", message.chatKey, JSON.stringify(variables), stepDecision.loopCount, contextRow?.run_count ?? 0);
+      this.log("info", "step.advance", `Conversation advanced to step ${stepDecision.nextIndex + 1}.`, workflow.id, message.chatKey);
     } else {
       this.ctx.storage.sql.exec("DELETE FROM runtime WHERE chat_key = ?", message.chatKey);
       this.ctx.storage.sql.exec("INSERT INTO runtime_context (chat_key, variables, loop_count, run_count, last_completed_at) VALUES (?, ?, 0, ?, ?) ON CONFLICT(chat_key) DO UPDATE SET variables=excluded.variables, loop_count=0, run_count=excluded.run_count, last_completed_at=excluded.last_completed_at", message.chatKey, JSON.stringify(variables), (contextRow?.run_count ?? 0) + 1, Date.now());
-      this.log("success", "workflow.complete", "Workflow completed.", workflow.id, message.chatKey);
+      this.log("success", "workflow.complete", stepDecision.reason, workflow.id, message.chatKey);
     }
     await this.ensureWatchdog();
   }
@@ -2233,13 +2247,23 @@ export class AutomationEngine extends DurableObject<Env> {
     sql.exec("DELETE FROM sends WHERE ts < ?", now - 172_800_000);
     const minute = sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM sends WHERE ts > ?", now - 60_000).toArray()[0]?.n ?? 0;
     const day = sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM sends WHERE ts > ?", now - 86_400_000).toArray()[0]?.n ?? 0;
-    if (minute >= settings.perMinuteCap) return { blocked: `Per-minute cap (${settings.perMinuteCap}) reached` };
-    if (day >= settings.dailyCap) return { blocked: `Daily cap (${settings.dailyCap}) reached` };
     const last = sql.exec<{ ts: number }>("SELECT ts FROM sends ORDER BY ts DESC LIMIT 1").toArray()[0];
-    const at = Math.max(now + Math.max(0, Math.min(delayMs, 300_000)), (last?.ts ?? 0) + settings.minGapMs);
-    sql.exec("INSERT INTO sends (ts) VALUES (?)", at);
+    const decision = evaluateReserveSlot({
+      now,
+      delayMs,
+      lastSendTs: last?.ts ?? null,
+      minGapMs: settings.minGapMs,
+      minuteCount: minute,
+      perMinuteCap: settings.perMinuteCap,
+      dayCount: day,
+      dailyCap: settings.dailyCap,
+    });
+    if (!decision.allowed) {
+      return { blocked: decision.blocked };
+    }
+    sql.exec("INSERT INTO sends (ts) VALUES (?)", decision.at);
     const id = sql.exec<{ id: number }>("SELECT last_insert_rowid() AS id").toArray()[0]?.id ?? 0;
-    return { id, at };
+    return { id, at: decision.at };
   }
 
   private releaseSlot(slotId: number): void {
