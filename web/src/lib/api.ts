@@ -440,6 +440,41 @@ export type DistilledSummary = {
   uniqueSpeakers: string[];
 };
 
+export type BatchPlanItem = {
+  id?: string;
+  target: string;
+  actionType: WorkflowActionType;
+  payload: {
+    text?: string;
+    buttonTarget?: string;
+    reaction?: string;
+    messageId?: string;
+  };
+  description: string;
+};
+
+export type BatchPlan = {
+  name: string;
+  summary: string;
+  totalItems: number;
+  totalActions: number;
+  estimatedSeconds: number;
+  items: BatchPlanItem[];
+};
+
+export type BatchRunInfo = {
+  id: string;
+  name: string;
+  status: "pending" | "running" | "completed" | "failed";
+  total_items: number;
+  completed_items: number;
+  failed_items: number;
+  created_at: number;
+  updated_at: number;
+  started_at: number | null;
+  completed_at: number | null;
+};
+
 export const api = {
   checkUsername: (username: string) => call<AvailabilityView>("/account/available", { username }),
   signUp: (input: { username: string; password: string; claimPasscode?: string }) =>
@@ -491,6 +526,11 @@ export const api = {
     call<{ ok: boolean; peer: string; count: number; messages: Array<{ id: number; date: number; out: boolean; text: string; fromId: string; replyToMsgId: number | null }> }>("/telegram/history", input),
   setAgentConfig: (input: { controlChat?: string; modelId?: string }) => call<{ ok: boolean; controlChat: string }>("/agent/config", input),
   releaseAgentLease: (input: { chatKey?: string; all?: boolean }) => call<{ ok: boolean }>("/agent/lease/release", input),
+  planBatch: (prompt: string) => call<{ ok: boolean; plan: BatchPlan }>("/batch/plan", { prompt }),
+  startBatchRun: (input: { name?: string; items: BatchPlanItem[] }) =>
+    call<{ ok: boolean; runId: string; totalItems: number }>("/batch/run", input),
+  getBatchRuns: () => call<{ runs: BatchRunInfo[] }>("/batch/runs"),
+  getBatchRun: (id: string) => call<{ run: BatchRunInfo; items: any[] }>(`/batch/run?id=${encodeURIComponent(id)}`),
 };
 
 export function streamUrl(ticket: string): string {

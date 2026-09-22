@@ -12,6 +12,7 @@ import SignUp from "./pages/SignUp";
 import Overview from "./pages/Overview";
 import Connection from "./pages/Connection";
 import Workflows from "./pages/Workflows";
+import BatchPlanner from "./pages/BatchPlanner";
 import ConversationImport from "./pages/ConversationImport";
 import Agent from "./pages/Agent";
 import Logs from "./pages/Logs";
@@ -23,7 +24,7 @@ import NotFound from "./pages/NotFound";
 const queryClient = new QueryClient({ defaultOptions: { queries: { refetchOnWindowFocus: false } } });
 
 /** Console routes. Following one while signed out remembers it through sign-in. */
-const CONSOLE_PATHS = ["/connection", "/workflows", "/agent", "/import", "/logs", "/jobs", "/settings", "/owner"] as const;
+const CONSOLE_PATHS = ["/connection", "/workflows", "/batch", "/agent", "/import", "/logs", "/jobs", "/settings", "/owner"] as const;
 
 /**
  * Sends someone who asked for a console page to the sign-in form carrying where
@@ -62,6 +63,7 @@ function Routed() {
         <Route path="/" element={<Overview />} />
         <Route path="/connection" element={<Connection />} />
         <Route path="/workflows" element={<Workflows />} />
+        <Route path="/batch" element={<BatchPlanner />} />
         <Route path="/agent" element={<Agent />} />
         <Route path="/import" element={<ConversationImport />} />
         <Route path="/logs" element={<Logs />} />

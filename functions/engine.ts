@@ -27,6 +27,7 @@ import {
   computeNextStep,
 } from "./step-logic";
 import type { DistilledSummary } from "./conversation-parser";
+import { expandBatchPlan, parseNaturalLanguagePlan, type BatchPlan } from "./batch-planner";
 
 export type { ConditionOperator, TriggerMode };
 
@@ -963,6 +964,7 @@ export class AutomationEngine extends DurableObject<Env> {
       case "/agent/lease/release": return this.handleAgentLeaseRelease(request);
       case "/batch/runs": return this.handleBatchRuns();
       case "/batch/run": return this.handleBatchRun(request);
+      case "/batch/plan": return this.handleBatchPlan(request);
       case "/telegram/history": return this.handleTelegramHistory(request);
       default: return Response.json({ error: "not found" }, { status: 404 });
     }
@@ -2093,6 +2095,76 @@ export class AutomationEngine extends DurableObject<Env> {
     if (!run) return Response.json({ error: "Run not found" }, { status: 404 });
     const items = this.ctx.storage.sql.exec("SELECT * FROM run_items WHERE run_id = ? ORDER BY item_index ASC", id).toArray();
     return Response.json({ run, items });
+  }
+
+  private async handleBatchPlan(request: Request): Promise<Response> {
+    const body = (await request.json().catch(() => ({}))) as { prompt?: string };
+    const prompt = String(body.prompt ?? "").trim();
+    if (!prompt) {
+      return Response.json({ error: "Please provide a natural language prompt for the batch planner." }, { status: 400 });
+    }
+    const settings = this.settings();
+
+    // Check if Rork AI Toolkit is available to parse complex natural language
+    const toolkitUrl = this.env.EXPO_PUBLIC_TOOLKIT_URL?.replace(/\/$/, "") ?? "https://toolkit.rork.com";
+    const secret = this.env.EXPO_PUBLIC_RORK_TOOLKIT_SECRET_KEY;
+
+    if (secret) {
+      try {
+        const sysPrompt = "You are a batch execution planner for Telegram automation. Convert the natural language request into a batch execution plan targeting Telegram bots or chats. Actions must be one of: sendText, pressButton, react, forward.";
+        const parameters = {
+          type: "object",
+          required: ["name", "summary", "targets", "initialCommands", "subItems"],
+          properties: {
+            name: { type: "string" },
+            summary: { type: "string" },
+            targets: { type: "array", items: { type: "string" } },
+            initialCommands: { type: "array", items: { type: "string" } },
+            subItems: { type: "array", items: { type: "string" } },
+          },
+        };
+        const response = await fetch(`${toolkitUrl}/v2/vercel/v1/chat/completions`, {
+          method: "POST",
+          headers: { Authorization: `Bearer ${secret}`, "Content-Type": "application/json" },
+          body: JSON.stringify({
+            model: AI_MODEL,
+            temperature: 0.1,
+            max_tokens: 2000,
+            messages: [
+              { role: "system", content: sysPrompt },
+              { role: "user", content: prompt },
+            ],
+            tools: [{ type: "function", function: { name: "submit_batch_plan", description: "Submit the structured batch execution plan parameters.", strict: true, parameters } }],
+            tool_choice: { type: "function", function: { name: "submit_batch_plan" } },
+          }),
+        });
+        const payload = await response.json().catch(() => ({})) as { choices?: Array<{ message?: { tool_calls?: Array<{ function?: { arguments?: string } }> } }> };
+        const argText = payload.choices?.[0]?.message?.tool_calls?.[0]?.function?.arguments;
+        if (argText) {
+          const parsed = JSON.parse(argText) as { name?: string; targets?: string[]; initialCommands?: string[]; subItems?: string[] };
+          if (Array.isArray(parsed.targets) && parsed.targets.length > 0) {
+            const plan = expandBatchPlan({
+              name: parsed.name ?? "Batch Run",
+              targets: parsed.targets,
+              initialCommands: Array.isArray(parsed.initialCommands) ? parsed.initialCommands : [],
+              subItems: Array.isArray(parsed.subItems) ? parsed.subItems : [],
+              minGapMs: settings.minGapMs,
+              perMinuteCap: settings.perMinuteCap,
+            });
+            return Response.json({ ok: true, plan });
+          }
+        }
+      } catch {
+        // Fall back to pure natural language parser
+      }
+    }
+
+    // Pure rule-based / regex parser
+    const plan = parseNaturalLanguagePlan(prompt, {
+      minGapMs: settings.minGapMs,
+      perMinuteCap: settings.perMinuteCap,
+    });
+    return Response.json({ ok: true, plan });
   }
 
   private async handleWebhook(request: Request): Promise<Response> {
