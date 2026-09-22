@@ -425,6 +425,21 @@ export type PersonalStartInput = {
   riskAccepted: boolean;
 };
 
+export type InteractionPattern = {
+  trigger: string;
+  reply: string;
+  occurrences: number;
+  sampleContext?: string;
+};
+
+export type DistilledSummary = {
+  chatName: string;
+  totalMessages: number;
+  exchangeCount: number;
+  patterns: InteractionPattern[];
+  uniqueSpeakers: string[];
+};
+
 export const api = {
   checkUsername: (username: string) => call<AvailabilityView>("/account/available", { username }),
   signUp: (input: { username: string; password: string; claimPasscode?: string }) =>
@@ -470,8 +485,10 @@ export const api = {
   updateJob: (id: string, status: "cancelled" | "dismissed") => call<Snapshot>("/job/status", { id, status }),
   simulate: (input: { chatKey?: string; sender?: string; text: string }) => call<{ ok: boolean }>("/simulate", input),
   previewWorkflow: (step: Partial<WorkflowStep>, text: string) => call<{ matched: boolean; captures: string[]; actionType: WorkflowActionType; output: string; note: string }>("/workflow/preview", { step, message: { text } }),
-  analyzeConversation: (input: { images: string[]; ownerSide: "left" | "right"; localeHint?: string }) =>
+  analyzeConversation: (input: { images?: string[]; ownerSide?: "left" | "right"; localeHint?: string; distilled?: DistilledSummary }) =>
     call<{ analysis: ConversationAnalysis; model: string; retention: string }>("/ai/conversation", input),
+  pullTelegramHistory: (input: { chatKey: string; limit?: number; offsetId?: number; maxPages?: number }) =>
+    call<{ ok: boolean; peer: string; count: number; messages: Array<{ id: number; date: number; out: boolean; text: string; fromId: string; replyToMsgId: number | null }> }>("/telegram/history", input),
   setAgentConfig: (input: { controlChat?: string; modelId?: string }) => call<{ ok: boolean; controlChat: string }>("/agent/config", input),
   releaseAgentLease: (input: { chatKey?: string; all?: boolean }) => call<{ ok: boolean }>("/agent/lease/release", input),
 };

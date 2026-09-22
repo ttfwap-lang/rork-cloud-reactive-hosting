@@ -428,6 +428,71 @@ final class TelegramService
         );
     }
 
+    public function getHistory(array $input): array
+    {
+        $peer = trim((string) ($input['peer'] ?? $input['chatKey'] ?? ''));
+        if ($peer === '') {
+            throw new ConnectorException('A peer or chatKey is required.');
+        }
+        $limit = min(100, max(1, (int) ($input['limit'] ?? 50)));
+        $maxPages = min(5, max(1, (int) ($input['maxPages'] ?? 3)));
+        $offsetId = (int) ($input['offsetId'] ?? 0);
+
+        $allMessages = [];
+        $pagesFetched = 0;
+
+        try {
+            while ($pagesFetched < $maxPages && count($allMessages) < 300) {
+                $history = $this->api->messages->getHistory(
+                    peer: $peer,
+                    offset_id: $offsetId,
+                    limit: $limit,
+                );
+                $rawMessages = $history['messages'] ?? [];
+                if (!is_array($rawMessages) || empty($rawMessages)) {
+                    break;
+                }
+
+                $newCount = 0;
+                foreach ($rawMessages as $msg) {
+                    if (!is_array($msg) || ($msg['_'] ?? '') === 'messageEmpty') {
+                        continue;
+                    }
+                    $allMessages[] = [
+                        'id' => (int) ($msg['id'] ?? 0),
+                        'date' => (int) ($msg['date'] ?? 0),
+                        'out' => (bool) ($msg['out'] ?? false),
+                        'text' => (string) ($msg['message'] ?? ''),
+                        'fromId' => isset($msg['from_id']) ? (string) ($msg['from_id']['user_id'] ?? $msg['from_id']['channel_id'] ?? $msg['from_id']['chat_id'] ?? '') : '',
+                        'replyToMsgId' => isset($msg['reply_to']['reply_to_msg_id']) ? (int) $msg['reply_to']['reply_to_msg_id'] : null,
+                    ];
+                    $offsetId = (int) ($msg['id'] ?? 0);
+                    $newCount++;
+                }
+
+                $pagesFetched++;
+                if (count($rawMessages) < $limit || $newCount === 0) {
+                    break;
+                }
+            }
+        } catch (ConnectorException $error) {
+            throw $error;
+        } catch (Throwable $error) {
+            $seconds = ConnectorException::floodSeconds($error);
+            if ($seconds !== null) {
+                throw new ConnectorException("Telegram asked for a {$seconds}s pause.", $seconds, 429, $error);
+            }
+            throw new ConnectorException($error->getMessage(), null, 400, $error);
+        }
+
+        return [
+            'ok' => true,
+            'peer' => $peer,
+            'count' => count($allMessages),
+            'messages' => $allMessages,
+        ];
+    }
+
     private function publicState(array $state, string $detail): array
     {
         return [

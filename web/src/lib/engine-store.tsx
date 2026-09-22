@@ -12,6 +12,7 @@ import {
   type ConversationAnalysis,
   type EngineEvent,
   type FlowImportPreview,
+  type DistilledSummary,
   type FlowTemplate,
   type HostingReport,
   type HostingStatus,
@@ -79,7 +80,8 @@ type EngineContextValue = {
   updateJob: (id: string, status: "cancelled" | "dismissed") => void;
   simulate: (input: { chatKey?: string; sender?: string; text: string }) => Promise<void>;
   previewWorkflow: (step: Partial<WorkflowStep>, text: string) => Promise<{ matched: boolean; captures: string[]; actionType: WorkflowActionType; output: string; note: string }>;
-  analyzeConversation: (input: { images: string[]; ownerSide: "left" | "right"; localeHint?: string }) => Promise<ConversationAnalysis>;
+  analyzeConversation: (input: { images?: string[]; ownerSide?: "left" | "right"; localeHint?: string; distilled?: DistilledSummary }) => Promise<ConversationAnalysis>;
+  pullTelegramHistory: (chatKey: string, limit?: number, maxPages?: number) => Promise<{ ok: boolean; count: number; messages: any[] }>;
   setAgentControlChat: (chat: string) => Promise<void>;
   releaseAgentLease: (chatKey?: string, all?: boolean) => Promise<void>;
 };
@@ -445,6 +447,7 @@ export function EngineProvider({ children }: { children: ReactNode }) {
     simulate: async (input) => { await simulateMutation.mutateAsync(input); },
     previewWorkflow: async (step, text) => api.previewWorkflow(step, text),
     analyzeConversation: async (input) => (await analysisMutation.mutateAsync(input)).analysis,
+    pullTelegramHistory: async (chatKey: string, limit?: number, maxPages?: number) => api.pullTelegramHistory({ chatKey, limit, maxPages }),
     setAgentControlChat: async (chat: string) => { await agentConfigMutation.mutateAsync(chat); },
     releaseAgentLease: async (chatKey?: string, all?: boolean) => { await leaseReleaseMutation.mutateAsync({ chatKey, all }); },
   }), [
