@@ -36,6 +36,7 @@ final class SessionRunner
                 StateStore::supervisorHeartbeat();
                 self::reap();
                 self::spawnEligible();
+                self::checkCompactionPressure();
             } catch (Throwable) {
                 // Never logged: traces can contain session material and message text.
             }
@@ -136,4 +137,28 @@ final class SessionRunner
         }
         self::$children[$tenant] = ['process' => $process, 'startedAt' => time()];
     }
+
+    private static function checkCompactionPressure(): void
+    {
+        $policy = new \ReplyFlow\Agent\CompactionPolicy();
+        $dataPath = StateStore::path('');
+        $freeBytes = @disk_free_space($dataPath);
+        $totalBytes = @disk_total_space($dataPath);
+        $free = $freeBytes !== false ? (int) $freeBytes : PHP_INT_MAX;
+        $total = $totalBytes !== false ? (int) $totalBytes : PHP_INT_MAX;
+
+        foreach (array_keys(self::$children) as $tenant) {
+            $tenantLogBytes = 0;
+            foreach (glob(StateStore::path('agent-*.log', $tenant)) ?: [] as $logFile) {
+                $tenantLogBytes += (int) filesize($logFile);
+            }
+            if ($policy->shouldCompact($free, $total, $tenantLogBytes)) {
+                $reqFile = StateStore::path('agent-compact.request', $tenant);
+                if (!is_file($reqFile)) {
+                    touch($reqFile);
+                }
+            }
+        }
+    }
 }
+

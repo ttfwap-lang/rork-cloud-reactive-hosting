@@ -38,6 +38,7 @@ final class ReplyFlowEventHandler extends SimpleEventHandler
                 StateStore::heartbeat();
             });
             EventForwarder::status('online', 'Personal connector event loop is online.', $state['identity'] ?? null);
+            $this->getAgentRunner()->recoverOrphans($this);
         } catch (Throwable) {
             // Never log: session material can surface in traces.
         }

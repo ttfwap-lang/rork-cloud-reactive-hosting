@@ -114,6 +114,7 @@ export type LinkState = {
   since: number | null;
   lastEventAt: number | null;
   connectorHeartbeatAt: number | null;
+  childHeartbeatAge: number | null;
   detail: string | null;
   pausedUntil: number | null;
   qrUrl: string | null;
@@ -318,6 +319,47 @@ export type FlowTemplate = {
   steps: WorkflowStep[];
 };
 
+export type AgentHeldLease = {
+  chatKey: string;
+  owner: string;
+  acquiredAt: number;
+  ttlSeconds: number;
+  expiresAt: number;
+};
+
+export type AgentParkedRow = {
+  chatKey: string;
+  workflowId: string;
+  stepIndex: number;
+  originalExpiresAt: number;
+  parkedAt: number;
+};
+
+export type AgentActiveTurn = {
+  turnId: string;
+  chatKey: string;
+  startedAt: number;
+  status: string;
+};
+
+export type AgentRecentTool = {
+  ts: number;
+  chatKey: string;
+  detail: string;
+};
+
+export type AgentStateInfo = {
+  controlChat: string;
+  childHeartbeatAge: number | null;
+  activeTurns: AgentActiveTurn[];
+  heldLeases: AgentHeldLease[];
+  parkedRows: AgentParkedRow[];
+  conflictRestores: number;
+  recentTools: AgentRecentTool[];
+  replayAbandonEvents: number;
+  diskState: string;
+};
+
 export type Snapshot = {
   account: {
     username: string | null;
@@ -328,6 +370,7 @@ export type Snapshot = {
   };
   link: LinkState;
   hardwired: HardwiredState;
+  agent?: AgentStateInfo;
   connector: { configured: boolean; deployment: string; credentialsPreset: boolean; probe: ConnectorProbe };
   ai: { enabled: boolean; model: string };
   settings: Settings;

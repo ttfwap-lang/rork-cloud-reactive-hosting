@@ -373,6 +373,7 @@ type LinkState = {
   since: number | null;
   lastEventAt: number | null;
   connectorHeartbeatAt: number | null;
+  childHeartbeatAge: number | null;
   detail: string | null;
   pausedUntil: number | null;
   qrUrl: string | null;
@@ -428,6 +429,7 @@ const EMPTY_LINK: LinkState = {
   since: null,
   lastEventAt: null,
   connectorHeartbeatAt: null,
+  childHeartbeatAge: null,
   detail: null,
   pausedUntil: null,
   qrUrl: null,
@@ -536,6 +538,33 @@ export class AutomationEngine extends DurableObject<Env> {
     )`);
     sql.exec("CREATE TABLE IF NOT EXISTS dedupe (h TEXT PRIMARY KEY, ts INTEGER NOT NULL)");
     sql.exec("CREATE TABLE IF NOT EXISTS sends (id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL)");
+    sql.exec(`CREATE TABLE IF NOT EXISTS parked_runtime (
+      chat_key TEXT PRIMARY KEY, workflow_id TEXT NOT NULL,
+      step_index INTEGER NOT NULL, updated_at INTEGER NOT NULL,
+      original_expires_at INTEGER NOT NULL, parked_at INTEGER NOT NULL
+    )`);
+    sql.exec(`CREATE TABLE IF NOT EXISTS agent_leases (
+      chat_key TEXT PRIMARY KEY, owner TEXT NOT NULL,
+      acquired_at INTEGER NOT NULL, ttl_seconds INTEGER NOT NULL,
+      expires_at INTEGER NOT NULL, metadata TEXT
+    )`);
+    sql.exec(`CREATE TABLE IF NOT EXISTS agent_turns (
+      turn_id TEXT PRIMARY KEY, chat_key TEXT NOT NULL,
+      started_at INTEGER NOT NULL, status TEXT NOT NULL,
+      ended_at INTEGER
+    )`);
+    sql.exec(`CREATE TABLE IF NOT EXISTS runs (
+      id TEXT PRIMARY KEY, name TEXT NOT NULL, status TEXT NOT NULL,
+      total_items INTEGER NOT NULL, completed_items INTEGER NOT NULL,
+      failed_items INTEGER NOT NULL, created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL, started_at INTEGER, completed_at INTEGER
+    )`);
+    sql.exec(`CREATE TABLE IF NOT EXISTS run_items (
+      id TEXT PRIMARY KEY, run_id TEXT NOT NULL, item_index INTEGER NOT NULL,
+      target TEXT NOT NULL, action_type TEXT NOT NULL, payload TEXT NOT NULL,
+      status TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0,
+      error TEXT, scheduled_at INTEGER, completed_at INTEGER
+    )`);
   }
 
   /** Lazily created so ordinary tenant engines never build the registry tables. */
@@ -1024,6 +1053,64 @@ export class AutomationEngine extends DurableObject<Env> {
       .exec<{ chat_key: string; step_index: number }>("SELECT chat_key, step_index FROM runtime WHERE workflow_id = ?", HARDWIRED_ID)
       .toArray()
       .map((row) => ({ chatKey: row.chat_key, stepIndex: row.step_index }));
+
+    const heldLeases = this.ctx.storage.sql
+      .exec<{ chat_key: string; owner: string; acquired_at: number; ttl_seconds: number; expires_at: number; metadata: string }>(
+        "SELECT * FROM agent_leases WHERE expires_at > ?", Date.now(),
+      )
+      .toArray()
+      .map((row) => ({
+        chatKey: row.chat_key,
+        owner: row.owner,
+        acquiredAt: row.acquired_at,
+        ttlSeconds: row.ttl_seconds,
+        expiresAt: row.expires_at,
+      }));
+
+    const parkedRows = this.ctx.storage.sql
+      .exec<{ chat_key: string; workflow_id: string; step_index: number; original_expires_at: number; parked_at: number }>(
+        "SELECT * FROM parked_runtime",
+      )
+      .toArray()
+      .map((row) => ({
+        chatKey: row.chat_key,
+        workflowId: row.workflow_id,
+        stepIndex: row.step_index,
+        originalExpiresAt: row.original_expires_at,
+        parkedAt: row.parked_at,
+      }));
+
+    const activeTurns = this.ctx.storage.sql
+      .exec<{ turn_id: string; chat_key: string; started_at: number; status: string }>(
+        "SELECT * FROM agent_turns WHERE status = 'running'",
+      )
+      .toArray()
+      .map((row) => ({
+        turnId: row.turn_id,
+        chatKey: row.chat_key,
+        startedAt: row.started_at,
+        status: row.status,
+      }));
+
+    const conflictRestores = this.ctx.storage.sql
+      .exec<{ n: number }>("SELECT COUNT(*) AS n FROM events WHERE type = 'agent.lease_conflict_restore'")
+      .toArray()[0]?.n ?? 0;
+
+    const recentTools = this.ctx.storage.sql
+      .exec<{ ts: number; chat_key: string | null; detail: string }>(
+        "SELECT ts, chat_key, detail FROM events WHERE type LIKE 'agent.tool%' ORDER BY id DESC LIMIT 10",
+      )
+      .toArray()
+      .map((row) => ({
+        ts: row.ts,
+        chatKey: row.chat_key ?? "unknown",
+        detail: row.detail,
+      }));
+
+    const replayAbandonCount = this.ctx.storage.sql
+      .exec<{ n: number }>("SELECT COUNT(*) AS n FROM events WHERE type IN ('agent.turn_abandoned', 'agent.turn_attempt')")
+      .toArray()[0]?.n ?? 0;
+
     return {
       account: {
         username: actor?.username ?? null,
@@ -1043,6 +1130,17 @@ export class AutomationEngine extends DurableObject<Env> {
         lastStep: hardwiredStats.lastStep ?? null,
         lastAt: hardwiredStats.lastAt ?? null,
         activeRuns: hardwiredRuns,
+      },
+      agent: {
+        controlChat: this.kvGet<string>("agentControlChat", "@agent_control"),
+        childHeartbeatAge: this.link().childHeartbeatAge ?? null,
+        activeTurns,
+        heldLeases,
+        parkedRows,
+        conflictRestores,
+        recentTools,
+        replayAbandonEvents: replayAbandonCount,
+        diskState: "Healthy. Shared /data volume within safe thresholds.",
       },
       connector: {
         configured: Boolean(this.env.CONNECTOR_BASE_URL && this.env.CONNECTOR_SHARED_SECRET),
@@ -1617,16 +1715,256 @@ export class AutomationEngine extends DurableObject<Env> {
   private async handleConnectorEvent(request: Request): Promise<Response> {
     const raw = await request.text();
     if (!(await this.verifyConnectorRequest(request, raw))) return Response.json({ error: "unauthorized" }, { status: 401 });
-    const event = JSON.parse(raw) as { type?: "status" | "message"; status?: LinkStatus; identity?: string; phoneMasked?: string; detail?: string; message?: Partial<MessageContext> };
+    const event = JSON.parse(raw) as {
+      type?: "status" | "message" | "lease" | "agent_log" | "agentTool";
+      status?: LinkStatus;
+      identity?: string;
+      phoneMasked?: string;
+      detail?: string;
+      message?: Partial<MessageContext>;
+      action?: "acquire" | "release";
+      chatKey?: string;
+      owner?: string;
+      ttlSeconds?: number;
+      metadata?: Record<string, unknown>;
+      event?: Record<string, unknown>;
+      tool?: string;
+      args?: Record<string, unknown>;
+    };
+
     if (event.type === "status" && event.status) {
-      this.setLink({ mode: "personal", status: event.status, identity: event.identity ?? this.link().identity, phoneMasked: event.phoneMasked ?? this.link().phoneMasked, detail: event.detail ?? null, connectorHeartbeatAt: Date.now(), since: event.status === "online" ? (this.link().since ?? Date.now()) : this.link().since, qrUrl: null, qrExpiresAt: null });
+      this.setLink({
+        mode: "personal",
+        status: event.status,
+        identity: event.identity ?? this.link().identity,
+        phoneMasked: event.phoneMasked ?? this.link().phoneMasked,
+        detail: event.detail ?? null,
+        connectorHeartbeatAt: Date.now(),
+        since: event.status === "online" ? (this.link().since ?? Date.now()) : this.link().since,
+        qrUrl: null,
+        qrExpiresAt: null,
+      });
       this.broadcast({ kind: "link", link: this.link() });
-    } else if (event.type === "message" && event.message) {
+      return Response.json({ ok: true });
+    }
+
+    if (event.type === "message" && event.message) {
       const message = this.normalizeMessage(event.message);
       this.setLink({ lastEventAt: Date.now(), connectorHeartbeatAt: Date.now() });
       this.ctx.waitUntil(this.ingest(message));
+      return Response.json({ ok: true });
     }
+
+    if (event.type === "lease") {
+      if (event.action === "acquire" && event.chatKey) {
+        this.acquireAgentLease(event.chatKey, event.owner ?? "agent", event.ttlSeconds ?? 300, event.metadata ?? {});
+      } else if (event.action === "release" && event.chatKey) {
+        this.releaseAgentLease(event.chatKey, "connector_release");
+      }
+      return Response.json({ ok: true });
+    }
+
+    if (event.type === "agent_log" && event.event) {
+      const e = event.event;
+      const kind = String(e.kind ?? "");
+      const chatKey = String(e.chatKey ?? "");
+      const turnId = String(e.turnId ?? "");
+      const now = Date.now();
+      if (kind === "turn.start" && turnId) {
+        this.ctx.storage.sql.exec(
+          "INSERT INTO agent_turns (turn_id, chat_key, started_at, status) VALUES (?, ?, ?, 'running') ON CONFLICT(turn_id) DO UPDATE SET status='running'",
+          turnId, chatKey, now,
+        );
+      } else if ((kind === "turn.end" || kind === "turn.abandoned") && turnId) {
+        this.ctx.storage.sql.exec(
+          "UPDATE agent_turns SET status = ?, ended_at = ? WHERE turn_id = ?",
+          kind === "turn.end" ? "completed" : "abandoned", now, turnId,
+        );
+      }
+      this.broadcast({ kind: "agent_event", event: e });
+      return Response.json({ ok: true });
+    }
+
+    if (event.type === "agentTool") {
+      return this.handleAgentTool(event.tool ?? "", event.args ?? {});
+    }
+
     return Response.json({ ok: true });
+  }
+
+  private acquireAgentLease(chatKey: string, owner = "agent", ttlSeconds = 300, metadata: Record<string, unknown> = {}): void {
+    const sql = this.ctx.storage.sql;
+    const now = Date.now();
+    const expiresAt = now + (ttlSeconds * 1000);
+
+    sql.exec(
+      `INSERT INTO agent_leases (chat_key, owner, acquired_at, ttl_seconds, expires_at, metadata)
+       VALUES (?, ?, ?, ?, ?, ?)
+       ON CONFLICT(chat_key) DO UPDATE SET
+         owner=excluded.owner,
+         acquired_at=excluded.acquired_at,
+         ttl_seconds=excluded.ttl_seconds,
+         expires_at=excluded.expires_at,
+         metadata=excluded.metadata`,
+      chatKey, owner, now, ttlSeconds, expiresAt, JSON.stringify(metadata),
+    );
+
+    const current = sql.exec<{
+      chat_key: string;
+      workflow_id: string;
+      step_index: number;
+      updated_at: number;
+      expires_at: number;
+    }>("SELECT * FROM runtime WHERE chat_key = ?", chatKey).toArray()[0];
+
+    if (current) {
+      sql.exec(
+        `INSERT INTO parked_runtime (chat_key, workflow_id, step_index, updated_at, original_expires_at, parked_at)
+         VALUES (?, ?, ?, ?, ?, ?)
+         ON CONFLICT(chat_key) DO UPDATE SET
+           workflow_id=excluded.workflow_id,
+           step_index=excluded.step_index,
+           updated_at=excluded.updated_at,
+           original_expires_at=excluded.original_expires_at,
+           parked_at=excluded.parked_at`,
+        current.chat_key, current.workflow_id, current.step_index, current.updated_at, current.expires_at, now,
+      );
+      sql.exec("DELETE FROM runtime WHERE chat_key = ?", chatKey);
+    }
+
+    this.log("info", "agent.lease_acquired", `Agent lease acquired by ${owner}`, current?.workflow_id, chatKey);
+  }
+
+  private releaseAgentLease(chatKey: string, reason = "normal"): void {
+    const sql = this.ctx.storage.sql;
+    const now = Date.now();
+
+    const parked = sql.exec<{
+      chat_key: string;
+      workflow_id: string;
+      step_index: number;
+      updated_at: number;
+      original_expires_at: number;
+      parked_at: number;
+    }>("SELECT * FROM parked_runtime WHERE chat_key = ?", chatKey).toArray()[0];
+
+    const current = sql.exec<{
+      chat_key: string;
+      workflow_id: string;
+      step_index: number;
+      updated_at: number;
+      expires_at: number;
+    }>("SELECT * FROM runtime WHERE chat_key = ?", chatKey).toArray()[0];
+
+    if (parked) {
+      if (current) {
+        this.log(
+          "warn",
+          "agent.lease_conflict_restore",
+          `Restoring parked workflow ${parked.workflow_id} over active runtime row ${current.workflow_id}`,
+          parked.workflow_id,
+          chatKey,
+        );
+      }
+
+      const restoredExpiresAt = parked.original_expires_at >= NEVER_EXPIRES
+        ? NEVER_EXPIRES
+        : now + Math.max(0, parked.original_expires_at - parked.parked_at);
+
+      sql.exec(
+        `INSERT INTO runtime (chat_key, workflow_id, step_index, updated_at, expires_at)
+         VALUES (?, ?, ?, ?, ?)
+         ON CONFLICT(chat_key) DO UPDATE SET
+           workflow_id=excluded.workflow_id,
+           step_index=excluded.step_index,
+           updated_at=excluded.updated_at,
+           expires_at=excluded.expires_at`,
+        parked.chat_key,
+        parked.workflow_id,
+        parked.step_index,
+        now,
+        restoredExpiresAt,
+      );
+
+      sql.exec("DELETE FROM parked_runtime WHERE chat_key = ?", chatKey);
+    }
+
+    sql.exec("DELETE FROM agent_leases WHERE chat_key = ?", chatKey);
+    this.log("info", "agent.lease_released", `Agent lease released (${reason})`, undefined, chatKey);
+  }
+
+  private async handleAgentTool(tool: string, args: Record<string, unknown>): Promise<Response> {
+    if (tool === "patch_settings") {
+      const patch = (args.settings ?? args) as Partial<Settings>;
+      if (patch.alertChatId !== undefined) {
+        return Response.json({ error: "alertChatId cannot be modified by agent tools" }, { status: 400 });
+      }
+      const previous = this.settings();
+      const next: Settings = {
+        ...previous,
+        ...patch,
+        automationEnabled: patch.automationEnabled === undefined ? previous.automationEnabled : Boolean(patch.automationEnabled),
+        killSwitch: patch.killSwitch === undefined ? previous.killSwitch : Boolean(patch.killSwitch),
+        dryRun: patch.dryRun === undefined ? previous.dryRun : Boolean(patch.dryRun),
+        autoPauseOnFlood: patch.autoPauseOnFlood === undefined ? previous.autoPauseOnFlood : Boolean(patch.autoPauseOnFlood),
+        minGapMs: Math.max(0, Math.min(Number(patch.minGapMs ?? previous.minGapMs) || 0, 600_000)),
+        perMinuteCap: Math.max(1, Math.min(Number(patch.perMinuteCap ?? previous.perMinuteCap) || 1, 60)),
+        dailyCap: Math.max(1, Math.min(Number(patch.dailyCap ?? previous.dailyCap) || 1, 10_000)),
+        perChatCooldownMs: Math.max(0, Math.min(Number(patch.perChatCooldownMs ?? previous.perChatCooldownMs) || 0, 86_400_000)),
+        dedupeWindowMs: Math.max(0, Math.min(Number(patch.dedupeWindowMs ?? previous.dedupeWindowMs) || 0, 3_600_000)),
+        allowlist: Array.isArray(patch.allowlist) ? patch.allowlist.map((item) => String(item).trim()).filter(Boolean).slice(0, 200) : previous.allowlist,
+        quietHours: { ...previous.quietHours, ...(patch.quietHours ?? {}) },
+        alertChatId: previous.alertChatId,
+      };
+      this.kvPut("settings", next);
+      this.ctx.waitUntil(this.sendOperationalAlert("ReplyFlow alert: agent modified safety settings."));
+      this.broadcast({ kind: "settings", settings: next });
+      return Response.json({ ok: true, settings: next });
+    }
+
+    if (tool === "save_workflow") {
+      const raw = (args.workflow ?? args) as Partial<Workflow> & { steps?: WorkflowStep[] };
+      if (!raw.name?.trim() || !Array.isArray(raw.steps) || raw.steps.length === 0) {
+        return Response.json({ error: "Invalid workflow payload." }, { status: 400 });
+      }
+      const steps = raw.steps.slice(0, MAX_STEPS).map((step) => this.normalizeStep(step));
+      for (const [index, step] of steps.entries()) {
+        const error = this.validateStep(step, index);
+        if (error) return Response.json({ error }, { status: 400 });
+      }
+      const now = Date.now();
+      const id = raw.id?.trim() || crypto.randomUUID();
+      const existing = this.ctx.storage.sql.exec<{ created_at: number }>("SELECT created_at FROM workflows WHERE id = ?", id).toArray()[0];
+      const targets = Array.isArray(raw.targets)
+        ? raw.targets.map((target) => String(target).trim().slice(0, 80)).filter(Boolean).slice(0, 50)
+        : (raw.target ? [String(raw.target).trim().slice(0, 80)] : []);
+      const envelope = {
+        version: 2,
+        status: (raw.status as WorkflowStatus) || (raw.enabled ? "enabled" : "paused"),
+        targets,
+        cooldownMs: Math.max(0, Math.min(Number(raw.cooldownMs) || 0, 86_400_000)),
+        maxRunsPerChat: Math.max(0, Math.min(Number(raw.maxRunsPerChat) || 0, 1000)),
+        pinned: false,
+        bypassLimits: Boolean(raw.bypassLimits),
+        steps,
+      };
+      this.ctx.storage.sql.exec(
+        `INSERT INTO workflows (id, name, target, enabled, steps, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(id) DO UPDATE SET name=excluded.name, target=excluded.target, enabled=excluded.enabled, steps=excluded.steps, updated_at=excluded.updated_at`,
+        id, raw.name.trim().slice(0, 80), targets[0] ?? "", envelope.status === "enabled" || envelope.status === "test" ? 1 : 0,
+        JSON.stringify(envelope), existing?.created_at ?? now, now,
+      );
+      this.ctx.waitUntil(this.sendOperationalAlert(`ReplyFlow alert: agent saved workflow "${raw.name.trim()}".`));
+      this.broadcast({ kind: "workflows", workflows: this.workflows() });
+      return Response.json({ ok: true, workflowId: id });
+    }
+
+    if (tool === "start_batch_run") {
+      return Response.json({ ok: true });
+    }
+
+    return Response.json({ error: `Unknown agent tool: ${tool}` }, { status: 400 });
   }
 
   private async handleWebhook(request: Request): Promise<Response> {
@@ -2103,6 +2441,18 @@ export class AutomationEngine extends DurableObject<Env> {
     this.ctx.storage.sql.exec("DELETE FROM dedupe WHERE ts < ?", now - this.settings().dedupeWindowMs);
     this.ctx.storage.sql.exec("DELETE FROM events WHERE id NOT IN (SELECT id FROM events ORDER BY id DESC LIMIT ?)", MAX_EVENTS);
     this.ctx.storage.sql.exec("DELETE FROM kv WHERE k LIKE 'connectorNonce:%' AND CAST(v AS INTEGER) < ?", now - 120_000);
+
+    // Watchdog check for agent leases: restore parked rows when child heartbeat age is stale OR absolute max lease TTL has elapsed
+    const childHeartbeatStale = (this.link().childHeartbeatAge ?? 0) > 45;
+    const leasesToRestore = this.ctx.storage.sql
+      .exec<{ chat_key: string; expires_at: number }>("SELECT chat_key, expires_at FROM agent_leases")
+      .toArray()
+      .filter((lease) => childHeartbeatStale || now >= lease.expires_at);
+
+    for (const lease of leasesToRestore) {
+      this.releaseAgentLease(lease.chat_key, childHeartbeatStale ? "child_heartbeat_stale" : "lease_ttl_expired");
+    }
+
     await this.runDueRetries(now);
     if (link.mode === "bot" && link.status === "online") await this.repairBotWebhook();
     if (this.connectorReady()) {
@@ -3293,9 +3643,17 @@ export class AutomationEngine extends DurableObject<Env> {
 
   private async refreshConnectorHealth(): Promise<void> {
     try {
-      const result = await this.connectorCall<{ status: LinkStatus; identity?: string; phoneMasked?: string; detail?: string }>("/v1/session/status", {});
+      const result = await this.connectorCall<{ status: LinkStatus; identity?: string; phoneMasked?: string; detail?: string; heartbeatAge?: number }>("/v1/session/status", {});
       const previous = this.link();
-      this.setLink({ status: result.status, identity: result.identity ?? previous.identity, phoneMasked: result.phoneMasked ?? previous.phoneMasked, detail: result.detail ?? previous.detail, connectorHeartbeatAt: Date.now(), since: result.status === "online" ? (previous.since ?? Date.now()) : previous.since });
+      this.setLink({
+        status: result.status,
+        identity: result.identity ?? previous.identity,
+        phoneMasked: result.phoneMasked ?? previous.phoneMasked,
+        detail: result.detail ?? previous.detail,
+        connectorHeartbeatAt: Date.now(),
+        childHeartbeatAge: typeof result.heartbeatAge === "number" ? result.heartbeatAge : null,
+        since: result.status === "online" ? (previous.since ?? Date.now()) : previous.since,
+      });
       if (previous.status !== result.status) this.log(result.status === "online" ? "success" : "warn", "connector.status", `Personal connector entered ${result.status} state.`);
     } catch {
       const last = this.link().connectorHeartbeatAt ?? 0;

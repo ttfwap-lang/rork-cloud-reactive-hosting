@@ -182,4 +182,56 @@ final class AgentRunnerTest extends TestCase
         // Verify target chat lease was acquired
         $this->assertTrue($runner->isLeased('@target_user'));
     }
+
+    public function testRecoverOrphansReissuesMissingAndSkipsConfirmed(): void
+    {
+        // 1. Write an uncompleted intent for press_button (must reissue unconditionally)
+        AgentLog::append('@bot_chat', [
+            'kind' => 'turn.start',
+            'chatKey' => '@bot_chat',
+            'turnId' => 'turn_btn',
+            'timestamp' => 2000,
+        ]);
+        AgentLog::append('@bot_chat', [
+            'kind' => 'tool.intent',
+            'chatKey' => '@bot_chat',
+            'turnId' => 'turn_btn',
+            'callId' => 'call_btn',
+            'tool' => 'press_button',
+            'arguments' => ['chat' => '@bot_chat', 'button' => 'Spin'],
+            'timestamp' => 2001,
+        ]);
+
+        $mockTools = $this->createMock(AgentTools::class);
+        $mockTools->expects($this->once())
+            ->method('execute')
+            ->with('press_button', ['chat' => '@bot_chat', 'button' => 'Spin'])
+            ->willReturn(['ok' => true, 'pressed' => true]);
+
+        $runner = new AgentRunner(
+            tools: $mockTools,
+        );
+
+        $proto = new class {
+            public object $messages;
+            public function __construct() {
+                $this->messages = new class {
+                    public function getHistory(string $peer, int $limit): array {
+                        return ['messages' => []];
+                    }
+                };
+            }
+        };
+
+        $decisions = $runner->recoverOrphans($proto);
+        $this->assertArrayHasKey('call_btn', $decisions);
+        $this->assertSame('reissue', $decisions['call_btn']['decision']);
+
+        // Verify turn.attempt and tool.result were written
+        $events = AgentLog::readAll('@bot_chat');
+        $kinds = array_column($events, 'kind');
+        $this->assertContains('turn.attempt', $kinds);
+        $this->assertContains('tool.result', $kinds);
+    }
 }
+

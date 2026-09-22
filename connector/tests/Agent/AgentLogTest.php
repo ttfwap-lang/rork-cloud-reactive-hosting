@@ -56,4 +56,31 @@ final class AgentLogTest extends TestCase
         $this->assertSame('tool.intent', $events[1]['kind']);
         $this->assertSame('call_1', $events[1]['callId']);
     }
+
+    public function testCompactionCreatesSnapshotAndTailsLog(): void
+    {
+        for ($i = 1; $i <= 15; $i++) {
+            AgentLog::append('compact_chat', [
+                'kind' => 'instruction',
+                'chatKey' => 'compact_chat',
+                'text' => "Message {$i}",
+                'timestamp' => 1000 + $i,
+            ]);
+        }
+
+        $allBefore = AgentLog::readAll('compact_chat');
+        $this->assertCount(15, $allBefore);
+
+        AgentLog::compact('compact_chat');
+
+        // Verify snapshot file exists
+        $snapshotFile = StateStore::path('agent-compact_chat.snapshot');
+        $this->assertFileExists($snapshotFile);
+
+        // Verify log was tailed to recent events
+        $allAfter = AgentLog::readAll('compact_chat');
+        $this->assertLessThan(15, count($allAfter));
+        $this->assertSame('Message 15', $allAfter[count($allAfter) - 1]['text']);
+    }
 }
+

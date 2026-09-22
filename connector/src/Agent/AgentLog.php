@@ -135,6 +135,71 @@ final class AgentLog
             .sodium_bin2base64($cipher, SODIUM_BASE64_VARIANT_URLSAFE_NO_PADDING);
     }
 
+    /**
+     * Performs crash-safe emergency compaction of a log file.
+     * Writes snapshot and tail to temporary files, flushes, fsyncs, and atomically renames.
+     */
+    public static function compact(string $logName, ?string $tenant = null): void
+    {
+        $logFile = self::logPath($logName, $tenant);
+        if (!is_file($logFile)) {
+            return;
+        }
+
+        $events = self::readAll($logName, $tenant);
+        if (count($events) <= 5) {
+            return;
+        }
+
+        $state = AgentState::foldEvents($events);
+        $safeName = preg_replace('/[^a-zA-Z0-9_-]/', '_', $logName);
+
+        // 1. Write snapshot: tmp -> flush -> fsync -> atomic rename
+        $snapshotTmp = StateStore::path("agent-{$safeName}.snapshot.tmp", $tenant);
+        $snapshotFile = StateStore::path("agent-{$safeName}.snapshot", $tenant);
+
+        $snapHandle = fopen($snapshotTmp, 'wb');
+        if ($snapHandle !== false) {
+            try {
+                $snapshotData = [
+                    'timestamp' => time(),
+                    'chatKey' => $logName,
+                    'transcript' => array_slice($state->getTranscript($logName), -20),
+                    'turnAttempts' => $state->getAllTurnAttempts(),
+                ];
+                $plain = json_encode($snapshotData, JSON_THROW_ON_ERROR | JSON_UNESCAPED_SLASHES);
+                $nonce = random_bytes(SODIUM_CRYPTO_SECRETBOX_NONCEBYTES);
+                $cipher = sodium_crypto_secretbox($plain, $nonce, self::key());
+                $sealed = sodium_bin2base64($nonce, SODIUM_BASE64_VARIANT_URLSAFE_NO_PADDING).'.'
+                    .sodium_bin2base64($cipher, SODIUM_BASE64_VARIANT_URLSAFE_NO_PADDING);
+
+                fwrite($snapHandle, $sealed);
+                fflush($snapHandle);
+                fsync($snapHandle);
+            } finally {
+                fclose($snapHandle);
+            }
+            rename($snapshotTmp, $snapshotFile);
+        }
+
+        // 2. Tail log to temp: tmp -> flush -> fsync -> atomic rename
+        $tailEvents = array_slice($events, -10);
+        $logTmp = StateStore::path("agent-{$safeName}.log.tmp", $tenant);
+        $logHandle = fopen($logTmp, 'wb');
+        if ($logHandle !== false) {
+            try {
+                foreach ($tailEvents as $e) {
+                    fwrite($logHandle, self::sealEvent($e)."\n");
+                }
+                fflush($logHandle);
+                fsync($logHandle);
+            } finally {
+                fclose($logHandle);
+            }
+            rename($logTmp, $logFile);
+        }
+    }
+
     private static function key(): string
     {
         $secret = getenv('SESSION_ENCRYPTION_KEY') ?: '';

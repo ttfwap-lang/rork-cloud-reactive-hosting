@@ -187,6 +187,7 @@ final class AgentRunner
                     $this->runTurn($chatKey, $turnId, $item, $proto);
                 } finally {
                     $this->queue->finishTurn($chatKey, $turnId);
+                    $this->checkCompaction();
                     $this->processQueue($chatKey, $proto);
                 }
             });
@@ -386,6 +387,149 @@ final class AgentRunner
         ], $this->tenant);
     }
 
+    /**
+     * Performs orphan recovery on child start (Stage 6).
+     * Folds existing logs, identifies tool intents without results,
+     * verifies against recent history using ReplayPlanner, and re-issues or skips.
+     *
+     * @return array<string, array{decision: string, intent: array}> Decisions made
+     */
+    public function recoverOrphans(object $proto): array
+    {
+        if (!$this->isConfigured()) {
+            return [];
+        }
+
+        $logFiles = glob(StateStore::path('agent-*.log', $this->tenant)) ?: [];
+        $planner = new ReplayPlanner();
+        $allDecisions = [];
+
+        foreach ($logFiles as $file) {
+            $base = basename($file, '.log');
+            $chatKey = substr($base, 6);
+            $events = AgentLog::readAll($chatKey, $this->tenant);
+            if (empty($events)) {
+                continue;
+            }
+
+            $state = AgentState::foldEvents($events);
+            $pendingIntents = $state->getPendingToolIntents();
+            if (empty($pendingIntents)) {
+                continue;
+            }
+
+            $chatHistories = [];
+            foreach ($pendingIntents as $intent) {
+                $tool = (string) ($intent['tool'] ?? '');
+                $target = $planner->targetChatForTool($tool, $intent);
+                if (!isset($chatHistories[$target])) {
+                    try {
+                        $peer = $target === ReplayPlanner::SAVED_MESSAGES_KEY
+                            ? \ReplyFlow\SavedMessagesResolver::resolve($proto)
+                            : $target;
+                        $res = $proto->messages->getHistory(peer: $peer, limit: 10);
+                        $chatHistories[$target] = (array) ($res['messages'] ?? []);
+                    } catch (Throwable) {
+                        $chatHistories[$target] = [];
+                    }
+                }
+            }
+
+            $decisions = $planner->planAll($pendingIntents, $state->getAllTurnAttempts(), $chatHistories);
+
+            foreach ($decisions as $callId => $dec) {
+                $decision = $dec['decision'];
+                $intent = $dec['intent'];
+                $turnId = (string) ($intent['turnId'] ?? '');
+                $tool = (string) ($intent['tool'] ?? '');
+                $args = (array) ($intent['arguments'] ?? []);
+
+                if ($decision === ReplayPlanner::DECISION_ABANDON) {
+                    $abandonEvent = [
+                        'kind' => 'turn.abandoned',
+                        'timestamp' => time(),
+                        'chatKey' => $chatKey,
+                        'turnId' => $turnId,
+                        'reason' => 'replay_abandoned',
+                    ];
+                    AgentLog::append($chatKey, $abandonEvent, $this->tenant);
+                    $this->state->apply($abandonEvent);
+                    EventForwarder::post(['type' => 'agent_log', 'event' => $abandonEvent], $this->tenant);
+                } elseif ($decision === ReplayPlanner::DECISION_SKIP) {
+                    $resultEvent = [
+                        'kind' => 'tool.result',
+                        'timestamp' => time(),
+                        'chatKey' => $chatKey,
+                        'turnId' => $turnId,
+                        'callId' => $callId,
+                        'tool' => $tool,
+                        'result' => ['output' => ['skipped' => true, 'verified_landed' => true]],
+                    ];
+                    AgentLog::append($chatKey, $resultEvent, $this->tenant);
+                    $this->state->apply($resultEvent);
+                    EventForwarder::post(['type' => 'agent_log', 'event' => $resultEvent], $this->tenant);
+                } elseif ($decision === ReplayPlanner::DECISION_REISSUE) {
+                    $attemptEvent = [
+                        'kind' => 'turn.attempt',
+                        'timestamp' => time(),
+                        'chatKey' => $chatKey,
+                        'turnId' => $turnId,
+                    ];
+                    AgentLog::append($chatKey, $attemptEvent, $this->tenant);
+                    $this->state->apply($attemptEvent);
+                    EventForwarder::post(['type' => 'agent_log', 'event' => $attemptEvent], $this->tenant);
+
+                    try {
+                        $res = $this->tools->execute($tool, $args, $proto);
+                        $resultData = ['output' => $res];
+                        $error = null;
+                    } catch (Throwable $e) {
+                        $resultData = ['error' => $e->getMessage()];
+                        $error = $e->getMessage();
+                    }
+
+                    $resultEvent = [
+                        'kind' => 'tool.result',
+                        'timestamp' => time(),
+                        'chatKey' => $chatKey,
+                        'turnId' => $turnId,
+                        'callId' => $callId,
+                        'tool' => $tool,
+                        'result' => $resultData,
+                        'error' => $error,
+                    ];
+                    AgentLog::append($chatKey, $resultEvent, $this->tenant);
+                    $this->state->apply($resultEvent);
+                    EventForwarder::post(['type' => 'agent_log', 'event' => $resultEvent], $this->tenant);
+                }
+
+                $allDecisions[$callId] = $dec;
+            }
+        }
+
+        return $allDecisions;
+    }
+
+    /**
+     * Executes emergency compaction if requested by supervisor (Stage 7).
+     * Compacts at a turn boundary, preserving single-writer.
+     */
+    public function checkCompaction(): void
+    {
+        $reqFile = StateStore::path('agent-compact.request', $this->tenant);
+        if (!is_file($reqFile)) {
+            return;
+        }
+
+        foreach (glob(StateStore::path('agent-*.log', $this->tenant)) ?: [] as $logFile) {
+            $base = basename($logFile, '.log');
+            $chatKey = substr($base, 6);
+            AgentLog::compact($chatKey, $this->tenant);
+        }
+
+        @unlink($reqFile);
+    }
+
     private function buildPrompt(string $chatKey, array $item): string
     {
         $type = (string) ($item['type'] ?? 'message');
@@ -406,3 +550,4 @@ final class AgentRunner
         }
     }
 }
+
