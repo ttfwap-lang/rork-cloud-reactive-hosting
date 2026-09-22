@@ -341,6 +341,7 @@ final class TelegramService
                 'pressButton' => $this->pressButton($peer, (string) ($action['buttonTarget'] ?? '')),
                 'react' => $this->react($peer, (int) ($action['messageId'] ?? 0), (string) ($action['reaction'] ?? '')),
                 'markRead' => $this->api->messages->readHistory(peer: $peer, max_id: (int) ($action['messageId'] ?? 0)),
+                'forward' => $this->forward($peer, (int) ($action['messageId'] ?? 0), (string) ($action['target'] ?? $action['buttonTarget'] ?? '')),
                 default => throw new ConnectorException('Unsupported personal-account action.'),
             };
         } catch (ConnectorException $error) {
@@ -394,6 +395,22 @@ final class TelegramService
             peer: $peer,
             msg_id: $messageId,
             reaction: [['_' => 'reactionEmoji', 'emoticon' => $emoji]],
+        );
+    }
+
+    private function forward(string $fromPeer, int $messageId, string $toPeer = ''): void
+    {
+        if ($messageId <= 0) {
+            throw new ConnectorException('A valid messageId is required for forward.');
+        }
+        $target = trim($toPeer);
+        if ($target === '' || strtolower($target) === 'saved' || strtolower($target) === 'me') {
+            $target = (string) SavedMessagesResolver::resolve($this->api);
+        }
+        $this->api->messages->forwardMessages(
+            from_peer: $fromPeer,
+            to_peer: $target,
+            id: [$messageId],
         );
     }
 

@@ -273,7 +273,7 @@ export type ConditionField =
   | "isBot"
   | "mediaType";
 export type WorkflowStatus = "draft" | "test" | "enabled" | "paused" | "attention";
-export type WorkflowActionType = "sendText" | "pressButton" | "react" | "markRead" | "end";
+export type WorkflowActionType = "sendText" | "pressButton" | "react" | "markRead" | "forward" | "end";
 
 export type WorkflowCondition = {
   id: string;
@@ -673,7 +673,7 @@ export class AutomationEngine extends DurableObject<Env> {
 
   private normalizeStep(raw: Partial<WorkflowStep>): WorkflowStep {
     const modes: TriggerMode[] = ["exact", "contains", "starts", "ends", "regex"];
-    const actionTypes: WorkflowActionType[] = ["sendText", "pressButton", "react", "markRead", "end"];
+    const actionTypes: WorkflowActionType[] = ["sendText", "pressButton", "react", "markRead", "forward", "end"];
     const mode = modes.includes(raw.mode as TriggerMode) ? (raw.mode as TriggerMode) : "contains";
     return {
       id: typeof raw.id === "string" && raw.id ? raw.id.slice(0, 64) : crypto.randomUUID(),
@@ -960,6 +960,8 @@ export class AutomationEngine extends DurableObject<Env> {
       case "/ai/conversation": return this.handleConversationAnalysis(request);
       case "/agent/config": return this.handleAgentConfig(request);
       case "/agent/lease/release": return this.handleAgentLeaseRelease(request);
+      case "/batch/runs": return this.handleBatchRuns();
+      case "/batch/run": return this.handleBatchRun(request);
       default: return Response.json({ error: "not found" }, { status: 404 });
     }
   }
@@ -1985,7 +1987,29 @@ export class AutomationEngine extends DurableObject<Env> {
     }
 
     if (tool === "start_batch_run") {
-      return Response.json({ ok: true });
+      const runId = String(args.runId ?? args.id ?? crypto.randomUUID());
+      const name = String(args.name ?? "Batch Run");
+      const items = Array.isArray(args.items) ? (args.items as Array<Record<string, unknown>>) : [];
+      if (items.length === 0) {
+        return Response.json({ error: "Batch run must have at least one item." }, { status: 400 });
+      }
+      const now = Date.now();
+      this.ctx.storage.sql.exec(
+        "INSERT INTO runs (id, name, status, total_items, completed_items, failed_items, created_at, updated_at, started_at) VALUES (?, ?, 'running', ?, 0, 0, ?, ?, ?)",
+        runId, name, items.length, now, now, now,
+      );
+      for (const [idx, item] of items.entries()) {
+        const itemId = crypto.randomUUID();
+        const target = String(item.target ?? item.chatKey ?? "");
+        const actionType = String(item.actionType ?? item.action ?? "sendText");
+        this.ctx.storage.sql.exec(
+          "INSERT INTO run_items (id, run_id, item_index, target, action_type, payload, status, scheduled_at) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)",
+          itemId, runId, idx, target, actionType, JSON.stringify(item), now,
+        );
+      }
+      this.log("info", "batch.start", `Started batch run "${name}" with ${items.length} item(s).`);
+      this.ctx.waitUntil(this.runBatchTick(now));
+      return Response.json({ ok: true, runId, totalItems: items.length });
     }
 
     return Response.json({ error: `Unknown agent tool: ${tool}` }, { status: 400 });
@@ -2024,6 +2048,49 @@ export class AutomationEngine extends DurableObject<Env> {
     }
     this.broadcast({ kind: "refresh" });
     return Response.json({ ok: true });
+  }
+
+  private handleBatchRuns(): Response {
+    const runs = this.ctx.storage.sql
+      .exec<{ id: string; name: string; status: string; total_items: number; completed_items: number; failed_items: number; created_at: number; updated_at: number; started_at: number | null; completed_at: number | null }>(
+        "SELECT * FROM runs ORDER BY created_at DESC LIMIT 50",
+      )
+      .toArray();
+    return Response.json({ runs });
+  }
+
+  private async handleBatchRun(request: Request): Promise<Response> {
+    if (request.method === "POST") {
+      const body = (await request.json().catch(() => ({}))) as { name?: string; items?: Array<Record<string, unknown>> };
+      const items = Array.isArray(body.items) ? body.items : [];
+      if (items.length === 0) return Response.json({ error: "Batch run must have at least one item." }, { status: 400 });
+      const runId = crypto.randomUUID();
+      const name = String(body.name ?? "Batch Run").trim();
+      const now = Date.now();
+      this.ctx.storage.sql.exec(
+        "INSERT INTO runs (id, name, status, total_items, completed_items, failed_items, created_at, updated_at, started_at) VALUES (?, ?, 'running', ?, 0, 0, ?, ?, ?)",
+        runId, name, items.length, now, now, now,
+      );
+      for (const [idx, item] of items.entries()) {
+        const itemId = crypto.randomUUID();
+        const target = String(item.target ?? item.chatKey ?? "");
+        const actionType = String(item.actionType ?? item.action ?? "sendText");
+        this.ctx.storage.sql.exec(
+          "INSERT INTO run_items (id, run_id, item_index, target, action_type, payload, status, scheduled_at) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)",
+          itemId, runId, idx, target, actionType, JSON.stringify(item), now,
+        );
+      }
+      this.log("info", "batch.start", `Started batch run "${name}" with ${items.length} item(s).`);
+      this.ctx.waitUntil(this.runBatchTick(now));
+      return Response.json({ ok: true, runId, totalItems: items.length });
+    }
+    const url = new URL(request.url);
+    const id = url.searchParams.get("id");
+    if (!id) return Response.json({ error: "Missing run id" }, { status: 400 });
+    const run = this.ctx.storage.sql.exec("SELECT * FROM runs WHERE id = ?", id).toArray()[0];
+    if (!run) return Response.json({ error: "Run not found" }, { status: 404 });
+    const items = this.ctx.storage.sql.exec("SELECT * FROM run_items WHERE run_id = ? ORDER BY item_index ASC", id).toArray();
+    return Response.json({ run, items });
   }
 
   private async handleWebhook(request: Request): Promise<Response> {
@@ -2299,13 +2366,27 @@ export class AutomationEngine extends DurableObject<Env> {
       } else {
         const token = await this.botToken();
         if (!token) throw new Error("Bot credentials are unavailable.");
-        if (action.actionType !== "sendText") throw new Error(`${action.actionType} requires personal-account mode.`);
-        const response = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ chat_id: chatKey, text: action.text ?? "" }) });
-        const result = await response.json() as { ok: boolean; description?: string; parameters?: { retry_after?: number } };
-        if (!result.ok) {
-          const error = new Error(result.description ?? "Telegram send failed") as Error & { retryAfter?: number };
-          error.retryAfter = result.parameters?.retry_after;
-          throw error;
+        if (action.actionType === "sendText") {
+          const response = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ chat_id: chatKey, text: action.text ?? "" }) });
+          const result = await response.json() as { ok: boolean; description?: string; parameters?: { retry_after?: number } };
+          if (!result.ok) {
+            const error = new Error(result.description ?? "Telegram send failed") as Error & { retryAfter?: number };
+            error.retryAfter = result.parameters?.retry_after;
+            throw error;
+          }
+        } else if (action.actionType === "forward") {
+          const fromChatId = action.text || chatKey;
+          const messageId = Number(action.messageId ?? 0);
+          const toChatId = action.buttonTarget || chatKey;
+          const response = await fetch(`https://api.telegram.org/bot${token}/forwardMessage`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ chat_id: toChatId, from_chat_id: fromChatId, message_id: messageId }) });
+          const result = await response.json() as { ok: boolean; description?: string; parameters?: { retry_after?: number } };
+          if (!result.ok) {
+            const error = new Error(result.description ?? "Telegram forward failed") as Error & { retryAfter?: number };
+            error.retryAfter = result.parameters?.retry_after;
+            throw error;
+          }
+        } else {
+          throw new Error(`${action.actionType} requires personal-account mode.`);
         }
       }
       this.setLink({ lastEventAt: Date.now() });
@@ -2479,13 +2560,130 @@ export class AutomationEngine extends DurableObject<Env> {
     if (earliest !== null) await this.scheduleAlarm(earliest);
   }
 
+  /** Self-pacing batch orchestrator that runs items without triggering rate-limit blocks. */
+  private async runBatchTick(now: number): Promise<void> {
+    const activeRun = this.ctx.storage.sql
+      .exec<{ id: string; name: string }>(
+        "SELECT id, name FROM runs WHERE status IN ('pending', 'running') ORDER BY created_at ASC LIMIT 1",
+      )
+      .toArray()[0];
+    if (!activeRun) return;
+
+    const settings = this.settings();
+    const minute = this.ctx.storage.sql
+      .exec<{ n: number }>("SELECT COUNT(*) AS n FROM sends WHERE ts > ?", now - 60_000)
+      .toArray()[0]?.n ?? 0;
+    const day = this.ctx.storage.sql
+      .exec<{ n: number }>("SELECT COUNT(*) AS n FROM sends WHERE ts > ?", now - 86_400_000)
+      .toArray()[0]?.n ?? 0;
+    const last = this.ctx.storage.sql
+      .exec<{ ts: number }>("SELECT ts FROM sends ORDER BY ts DESC LIMIT 1")
+      .toArray()[0];
+
+    // Daily cap reached: postpone until next day window
+    if (day >= settings.dailyCap) {
+      const earliestDay = this.ctx.storage.sql
+        .exec<{ ts: number }>("SELECT MIN(ts) AS ts FROM sends WHERE ts > ?", now - 86_400_000)
+        .toArray()[0];
+      const resumeAt = (earliestDay?.ts ?? now) + 86_400_000 + 1_000;
+      await this.scheduleAlarm(resumeAt);
+      return;
+    }
+
+    // Per-minute cap reached: self-pace to next minute window without failing
+    if (minute >= settings.perMinuteCap) {
+      const oldestMinute = this.ctx.storage.sql
+        .exec<{ ts: number }>("SELECT MIN(ts) AS ts FROM sends WHERE ts > ?", now - 60_000)
+        .toArray()[0];
+      const resumeAt = (oldestMinute?.ts ?? now) + 60_000 + 500;
+      await this.scheduleAlarm(resumeAt);
+      return;
+    }
+
+    // Minimum gap between sends
+    const minGapTarget = (last?.ts ?? 0) + settings.minGapMs;
+    if (now < minGapTarget) {
+      await this.scheduleAlarm(minGapTarget + 50);
+      return;
+    }
+
+    const item = this.ctx.storage.sql
+      .exec<{ id: string; run_id: string; item_index: number; target: string; action_type: WorkflowActionType; payload: string; attempts: number }>(
+        "SELECT * FROM run_items WHERE run_id = ? AND status = 'pending' ORDER BY item_index ASC LIMIT 1",
+        activeRun.id,
+      )
+      .toArray()[0];
+
+    if (!item) {
+      const failedCount = this.ctx.storage.sql
+        .exec<{ n: number }>("SELECT COUNT(*) AS n FROM run_items WHERE run_id = ? AND status = 'failed'", activeRun.id)
+        .toArray()[0]?.n ?? 0;
+      const completedCount = this.ctx.storage.sql
+        .exec<{ n: number }>("SELECT COUNT(*) AS n FROM run_items WHERE run_id = ? AND status = 'completed'", activeRun.id)
+        .toArray()[0]?.n ?? 0;
+      this.ctx.storage.sql.exec(
+        "UPDATE runs SET status = 'completed', completed_items = ?, failed_items = ?, updated_at = ?, completed_at = ? WHERE id = ?",
+        completedCount, failedCount, now, now, activeRun.id,
+      );
+      this.log("success", "batch.complete", `Batch run "${activeRun.name}" completed (${completedCount} completed, ${failedCount} failed).`);
+      this.broadcast({ kind: "refresh" });
+      await this.scheduleAlarm(now + 100);
+      return;
+    }
+
+    let payload: Record<string, unknown> = {};
+    try {
+      payload = JSON.parse(item.payload) as Record<string, unknown>;
+    } catch { /* empty payload */ }
+
+    this.ctx.storage.sql.exec("INSERT INTO sends (ts) VALUES (?)", now);
+    const slotId = this.ctx.storage.sql.exec<{ id: number }>("SELECT last_insert_rowid() AS id").toArray()[0]?.id ?? 0;
+    this.ctx.storage.sql.exec("UPDATE run_items SET status = 'running', attempts = attempts + 1 WHERE id = ?", item.id);
+
+    const ok = await this.sendAction(
+      item.target,
+      activeRun.id,
+      slotId,
+      {
+        actionType: item.action_type,
+        text: typeof payload.text === "string" ? payload.text : typeof payload.reply === "string" ? payload.reply : undefined,
+        buttonTarget: typeof payload.buttonTarget === "string" ? payload.buttonTarget : undefined,
+        reaction: typeof payload.reaction === "string" ? payload.reaction : undefined,
+        messageId: typeof payload.messageId === "string" ? payload.messageId : null,
+        idempotencyKey: item.id,
+      },
+      true,
+    );
+
+    if (ok) {
+      this.ctx.storage.sql.exec("UPDATE run_items SET status = 'completed', completed_at = ? WHERE id = ?", Date.now(), item.id);
+      this.ctx.storage.sql.exec("UPDATE runs SET completed_items = completed_items + 1, updated_at = ? WHERE id = ?", Date.now(), activeRun.id);
+    } else {
+      this.ctx.storage.sql.exec("UPDATE run_items SET status = 'failed', error = 'Action execution failed', completed_at = ? WHERE id = ?", Date.now(), item.id);
+      this.ctx.storage.sql.exec("UPDATE runs SET failed_items = failed_items + 1, updated_at = ? WHERE id = ?", Date.now(), activeRun.id);
+    }
+
+    const more = this.ctx.storage.sql
+      .exec<{ n: number }>("SELECT COUNT(*) AS n FROM run_items WHERE run_id = ? AND status = 'pending'", activeRun.id)
+      .toArray()[0]?.n ?? 0;
+
+    if (more > 0) {
+      const nextSlot = Math.max(Date.now() + 50, now + settings.minGapMs);
+      await this.scheduleAlarm(nextSlot);
+    }
+  }
+
   async onAlarm(): Promise<void> {
     // The heartbeat must survive any failure inside this tick: if the reschedule is
     // skipped the engine silently stops being always-on, so it lives in a finally.
     try {
       await this.runWatchdogTick();
     } finally {
-      await this.env.DO.setAlarm("AutomationEngine", this.tenantId(), Date.now() + WATCHDOG_MS).catch(() => undefined);
+      const nextWatchdog = Date.now() + WATCHDOG_MS;
+      const pending = await this.env.DO.getAlarm("AutomationEngine", this.tenantId()).catch(() => null);
+      if (pending === null || pending === undefined || pending > nextWatchdog) {
+        await this.env.DO.setAlarm("AutomationEngine", this.tenantId(), nextWatchdog).catch(() => undefined);
+      }
     }
   }
 
@@ -2520,6 +2718,7 @@ export class AutomationEngine extends DurableObject<Env> {
     }
 
     await this.runDueRetries(now);
+    await this.runBatchTick(now);
     if (link.mode === "bot" && link.status === "online") await this.repairBotWebhook();
     if (this.connectorReady()) {
       const probe = await this.probeConnector();

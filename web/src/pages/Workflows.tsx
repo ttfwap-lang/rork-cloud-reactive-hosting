@@ -49,7 +49,7 @@ const MODES: Array<{ id: TriggerMode; label: string }> = [
 ];
 const ACTIONS: Array<{ id: WorkflowActionType; label: string }> = [
   { id: "sendText", label: "Send text" }, { id: "pressButton", label: "Press button" },
-  { id: "react", label: "React" }, { id: "markRead", label: "Mark read" }, { id: "end", label: "End" },
+  { id: "react", label: "React" }, { id: "markRead", label: "Mark read" }, { id: "forward", label: "Forward" }, { id: "end", label: "End" },
 ];
 const FIELDS: Array<{ id: ConditionField; label: string }> = [
   { id: "text", label: "Message text" }, { id: "sender", label: "Sender" }, { id: "chat", label: "Chat" },
@@ -88,6 +88,7 @@ function stepSummary(step: WorkflowStep): string {
   if (step.actionType === "sendText") return step.reply.split("\n").join(" · ");
   if (step.actionType === "pressButton") return `press “${step.buttonTarget}”`;
   if (step.actionType === "react") return `react ${step.reaction}`;
+  if (step.actionType === "forward") return `forward to ${step.buttonTarget || "Saved Messages"}`;
   return step.actionType;
 }
 
@@ -396,6 +397,7 @@ export default function Workflows() {
                     {step.actionType === "sendText" ? <><Textarea value={step.reply} placeholder="Reply — use {1}, {sender}, {chat}, {text} or {time}" rows={2} onChange={(event) => patchStep(stepIndex, { reply: event.target.value })} className="mt-2 rounded-xl bg-background/60 text-sm" /><div className="mt-1.5 flex flex-wrap gap-1">{VARIABLES.map((variable) => <button key={variable} onClick={() => patchStep(stepIndex, { reply: `${step.reply}${step.reply ? " " : ""}${variable}` })} className="rounded-md bg-background/50 px-1.5 py-1 font-mono text-[9px] text-muted-foreground hover:text-primary">{variable}</button>)}</div></> : null}
                     {step.actionType === "pressButton" ? <Input value={step.buttonTarget} placeholder="Button label or coordinates, e.g. 2,1" onChange={(event) => patchStep(stepIndex, { buttonTarget: event.target.value })} className="mt-2 h-10 rounded-xl bg-background/60 text-sm" /> : null}
                     {step.actionType === "react" ? <Input value={step.reaction} placeholder="👍" maxLength={16} onChange={(event) => patchStep(stepIndex, { reaction: event.target.value })} className="mt-2 h-10 rounded-xl bg-background/60 text-sm" /> : null}
+                    {step.actionType === "forward" ? <Input value={step.buttonTarget} placeholder="Target chat (leave blank for Saved Messages)" onChange={(event) => patchStep(stepIndex, { buttonTarget: event.target.value })} className="mt-2 h-10 rounded-xl bg-background/60 text-sm" /> : null}
 
                     <div className="mt-3 flex flex-wrap items-center gap-3">
                       <label className="flex items-center gap-1.5 text-[11px] text-muted-foreground">delay<Input type="number" value={Math.round(step.delayMs / 100) / 10} step={0.5} min={0} onChange={(event) => patchStep(stepIndex, { delayMs: Math.max(0, Number(event.target.value)) * 1000 })} className="h-7 w-16 rounded-lg bg-background/60 px-2 font-mono text-[11px]" />s</label>

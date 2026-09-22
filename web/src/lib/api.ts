@@ -21,7 +21,7 @@ export type ConditionField =
   | "isEdited" | "isReply" | "isForwarded" | "isBot" | "mediaType";
 export type ConditionOperator = TriggerMode | "is" | "isNot";
 export type WorkflowStatus = "draft" | "test" | "enabled" | "paused" | "attention";
-export type WorkflowActionType = "sendText" | "pressButton" | "react" | "markRead" | "end";
+export type WorkflowActionType = "sendText" | "pressButton" | "react" | "markRead" | "forward" | "end";
 
 export type WorkflowCondition = {
   id: string;
