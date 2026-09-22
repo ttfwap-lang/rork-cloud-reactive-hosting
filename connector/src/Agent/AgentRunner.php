@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace ReplyFlow\Agent;
 
+use ReplyFlow\ConnectorException;
 use ReplyFlow\EventForwarder;
 use ReplyFlow\GeminiClient;
 use ReplyFlow\StateStore;
@@ -17,6 +18,8 @@ use function Amp\async;
  */
 final class AgentRunner
 {
+    public const MAX_TOOL_ITERATIONS = 25;
+
     private GeminiClient $gemini;
     private AgentTools $tools;
     private TurnQueue $queue;
@@ -34,7 +37,7 @@ final class AgentRunner
         $this->tenant = StateStore::normalize($tenant ?? StateStore::tenant());
         $this->config = $this->loadConfig();
         $apiKey = (string) ($this->config['apiKey'] ?? (getenv('GEMINI_API_KEY') ?: ''));
-        $model = (string) ($this->config['model'] ?? (getenv('GEMINI_MODEL') ?: 'gemini-2.5-flash'));
+        $model = (string) ($this->config['model'] ?? (getenv('GEMINI_MODEL') ?: GeminiClient::DEFAULT_MODEL));
 
         $this->gemini = $gemini ?? new GeminiClient($apiKey, $model);
         $this->tools = $tools ?? new AgentTools();
@@ -223,8 +226,24 @@ final class AgentRunner
             ],
         ];
 
+        $iteration = 0;
         try {
             while (true) {
+                if ($iteration >= self::MAX_TOOL_ITERATIONS) {
+                    $abandonEvent = [
+                        'kind' => 'turn.abandoned',
+                        'timestamp' => time(),
+                        'chatKey' => $chatKey,
+                        'turnId' => $turnId,
+                        'error' => 'Reached maximum tool iterations (' . self::MAX_TOOL_ITERATIONS . ')',
+                    ];
+                    AgentLog::append($chatKey, $abandonEvent, $this->tenant);
+                    $this->state->apply($abandonEvent);
+                    EventForwarder::post(['type' => 'agent_log', 'event' => $abandonEvent], $this->tenant);
+                    return;
+                }
+                $iteration++;
+
                 $response = $this->gemini->generateContent(
                     contents: $contents,
                     tools: [['functionDeclarations' => AgentTools::declarations()]],
@@ -283,7 +302,15 @@ final class AgentRunner
 
                     // 2. Execute tool
                     try {
-                        $toolResult = $this->tools->execute($toolName, $args, $proto);
+                        if ($toolName === 'release_lease') {
+                            if ($targetChat === '') {
+                                throw new ConnectorException('chat argument is required for release_lease.');
+                            }
+                            $this->releaseLease($targetChat);
+                            $toolResult = ['ok' => true, 'released' => $targetChat];
+                        } else {
+                            $toolResult = $this->tools->execute($toolName, $args, $proto);
+                        }
                         $responseContent = ['output' => $toolResult];
                         $error = null;
                     } catch (Throwable $e) {

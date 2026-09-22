@@ -1163,7 +1163,7 @@ export class AutomationEngine extends DurableObject<Env> {
         activeRuns: hardwiredRuns,
       },
       agent: {
-        controlChat: this.kvGet<string>("agentControlChat", "@agent_control"),
+        controlChat: this.kvGet<string>("agentControlChat", ""),
         childHeartbeatAge: this.link().childHeartbeatAge ?? null,
         activeTurns,
         heldLeases,
@@ -2030,7 +2030,7 @@ export class AutomationEngine extends DurableObject<Env> {
         await this.connectorCall("/v1/agent/config", {
           config: {
             controlChat,
-            modelId: body.modelId || "gemini-2.5-flash",
+            modelId: body.modelId || "gemini-3.7-flash",
           },
         }).catch((err) => {
           this.log("warn", "agent.config_sync_fail", `Failed to sync agent config to connector: ${err instanceof Error ? err.message : String(err)}`);
@@ -2039,7 +2039,7 @@ export class AutomationEngine extends DurableObject<Env> {
       this.log("info", "agent.config", `Agent control chat updated to "${controlChat}".`);
       this.broadcast({ kind: "refresh" });
     }
-    return Response.json({ ok: true, controlChat: this.kvGet<string>("agentControlChat", "@agent_control") });
+    return Response.json({ ok: true, controlChat: this.kvGet<string>("agentControlChat", "") });
   }
 
   private async handleAgentLeaseRelease(request: Request): Promise<Response> {

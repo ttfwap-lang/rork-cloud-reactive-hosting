@@ -138,6 +138,20 @@ class AgentTools
                     'required' => ['chat', 'messageId'],
                 ],
             ],
+            [
+                'name' => 'release_lease',
+                'description' => 'Release agent lease on a chat when finished interacting with it.',
+                'parameters' => [
+                    'type' => 'OBJECT',
+                    'properties' => [
+                        'chat' => [
+                            'type' => 'STRING',
+                            'description' => 'Target chat peer to release lease for.',
+                        ],
+                    ],
+                    'required' => ['chat'],
+                ],
+            ],
         ];
     }
 

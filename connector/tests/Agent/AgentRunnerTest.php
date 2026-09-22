@@ -21,27 +21,31 @@ final class AgentRunnerTest extends TestCase
     {
         $this->tempDir = sys_get_temp_dir().'/replyflow_agent_runner_test_'.uniqid();
         mkdir($this->tempDir, 0700, true);
+        putenv('SESSION_PATH='.$this->tempDir);
         putenv('DATA_DIR='.$this->tempDir);
         putenv('SESSION_ENCRYPTION_KEY=12345678901234567890123456789012');
         putenv('GEMINI_API_KEY=test_key_123');
+        StateStore::use(StateStore::OWNER_TENANT);
 
         StateStore::writeAgentConfig([
             'controlChat' => '@agent_control',
-            'model' => 'gemini-2.5-flash',
+            'model' => 'gemini-3.7-flash',
         ]);
     }
 
     protected function tearDown(): void
     {
-        $files = glob($this->tempDir.'/*');
-        if ($files) {
-            foreach ($files as $file) {
-                if (is_file($file)) {
-                    unlink($file);
-                }
+        if (is_dir($this->tempDir)) {
+            $iterator = new \RecursiveIteratorIterator(
+                new \RecursiveDirectoryIterator($this->tempDir, \FilesystemIterator::SKIP_DOTS),
+                \RecursiveIteratorIterator::CHILD_FIRST
+            );
+            foreach ($iterator as $item) {
+                $item->isDir() ? @rmdir($item->getPathname()) : @unlink($item->getPathname());
             }
+            @rmdir($this->tempDir);
         }
-        @rmdir($this->tempDir);
+        putenv('SESSION_PATH');
     }
 
     public function testControlChatMatching(): void
@@ -232,6 +236,151 @@ final class AgentRunnerTest extends TestCase
         $kinds = array_column($events, 'kind');
         $this->assertContains('turn.attempt', $kinds);
         $this->assertContains('tool.result', $kinds);
+    }
+
+    public function testTurnLoopStopsAtMaxIterationsAndEmitsTurnAbandoned(): void
+    {
+        $mockGemini = $this->createMock(GeminiClient::class);
+        $mockGemini->expects($this->exactly(AgentRunner::MAX_TOOL_ITERATIONS))
+            ->method('generateContent')
+            ->willReturn([
+                'candidates' => [
+                    [
+                        'content' => [
+                            'parts' => [
+                                [
+                                    'functionCall' => [
+                                        'name' => 'read_history',
+                                        'args' => ['chat' => '@loop_target'],
+                                    ],
+                                ],
+                            ],
+                        ],
+                    ],
+                ],
+            ]);
+
+        $mockTools = $this->createMock(AgentTools::class);
+        $mockTools->expects($this->exactly(AgentRunner::MAX_TOOL_ITERATIONS))
+            ->method('execute')
+            ->willReturn(['messages' => []]);
+
+        $runner = new AgentRunner(
+            gemini: $mockGemini,
+            tools: $mockTools,
+        );
+
+        $proto = new class {};
+        $item = [
+            'type' => 'instruction',
+            'message' => [
+                'chatKey' => '@agent_control',
+                'sender' => '@owner',
+                'text' => 'Keep looping',
+                'messageId' => '201',
+            ],
+        ];
+
+        $runner->runTurn('@agent_control', 'turn_loop_test', $item, $proto);
+
+        $events = AgentLog::readAll('@agent_control');
+        $kinds = array_column($events, 'kind');
+
+        $this->assertContains('turn.start', $kinds);
+        $this->assertContains('turn.abandoned', $kinds);
+        $this->assertNotContains('turn.end', $kinds);
+
+        $abandoned = null;
+        foreach ($events as $ev) {
+            if ($ev['kind'] === 'turn.abandoned') {
+                $abandoned = $ev;
+                break;
+            }
+        }
+        $this->assertNotNull($abandoned);
+        $this->assertSame('Reached maximum tool iterations (25)', $abandoned['error']);
+    }
+
+    public function testReleaseLeaseToolDispatchesAndReleasesLeaseWithoutAutoAcquire(): void
+    {
+        $mockGemini = $this->createMock(GeminiClient::class);
+        $mockGemini->expects($this->exactly(2))
+            ->method('generateContent')
+            ->willReturnOnConsecutiveCalls(
+                [
+                    'candidates' => [
+                        [
+                            'content' => [
+                                'parts' => [
+                                    [
+                                        'functionCall' => [
+                                            'name' => 'release_lease',
+                                            'args' => ['chat' => '@leased_target'],
+                                        ],
+                                    ],
+                                ],
+                            ],
+                        ],
+                    ],
+                ],
+                [
+                    'candidates' => [
+                        [
+                            'content' => [
+                                'parts' => [
+                                    ['text' => 'Released lease successfully.'],
+                                ],
+                            ],
+                        ],
+                    ],
+                ]
+            );
+
+        $mockTools = $this->createMock(AgentTools::class);
+        $mockTools->expects($this->never())->method('execute');
+
+        $runner = new AgentRunner(
+            gemini: $mockGemini,
+            tools: $mockTools,
+        );
+
+        // Pre-acquire lease on @leased_target
+        $runner->acquireLease('@leased_target');
+        $this->assertTrue($runner->isLeased('@leased_target'));
+
+        $proto = new class {};
+        $item = [
+            'type' => 'instruction',
+            'message' => [
+                'chatKey' => '@agent_control',
+                'sender' => '@owner',
+                'text' => 'Release @leased_target',
+                'messageId' => '202',
+            ],
+        ];
+
+        $runner->runTurn('@agent_control', 'turn_release_test', $item, $proto);
+
+        // Verify lease was released
+        $this->assertFalse($runner->isLeased('@leased_target'));
+
+        // Verify events recorded
+        $events = AgentLog::readAll('@agent_control');
+        $kinds = array_column($events, 'kind');
+
+        $this->assertContains('tool.intent', $kinds);
+        $this->assertContains('tool.result', $kinds);
+        $this->assertContains('turn.end', $kinds);
+
+        $resultEvent = null;
+        foreach ($events as $ev) {
+            if ($ev['kind'] === 'tool.result' && $ev['tool'] === 'release_lease') {
+                $resultEvent = $ev;
+                break;
+            }
+        }
+        $this->assertNotNull($resultEvent);
+        $this->assertSame(['ok' => true, 'released' => '@leased_target'], $resultEvent['result']['output'] ?? null);
     }
 }
 

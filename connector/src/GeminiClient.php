@@ -13,7 +13,7 @@ use Throwable;
 class GeminiClient
 {
     private const DEFAULT_BASE_URL = 'https://generativelanguage.googleapis.com/v1beta';
-    public const DEFAULT_MODEL = 'gemini-2.5-flash';
+    public const DEFAULT_MODEL = 'gemini-3.7-flash';
 
     private string $apiKey;
     private string $model;

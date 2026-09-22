@@ -9,7 +9,7 @@ export default function Agent() {
   const [controlChatInput, setControlChatInput] = useState("");
 
   const handleStartEdit = () => {
-    setControlChatInput(agent?.controlChat ?? "@agent_control");
+    setControlChatInput(agent?.controlChat ?? "");
     setIsEditingControlChat(true);
   };
 
@@ -126,7 +126,17 @@ export default function Agent() {
             </div>
           ) : (
             <p className="text-foreground">
-              {agent?.controlChat ?? "@agent_control"} — only this chat creates instructions. Actions may target any chat, including humans.
+              {agent?.controlChat ? (
+                <>
+                  <span className="font-mono font-medium">{agent.controlChat}</span>
+                  {" — only this chat creates instructions. Actions may target any chat, including humans."}
+                </>
+              ) : (
+                <>
+                  <span className="text-muted-foreground italic font-medium">Not configured</span>
+                  {" — configure a control chat above to create instructions. Actions may target any chat, including humans."}
+                </>
+              )}
             </p>
           )}
         </div>
