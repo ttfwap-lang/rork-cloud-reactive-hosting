@@ -52,25 +52,45 @@ final class ReplyFlowEventHandler extends SimpleEventHandler
             if (($state['disabled'] ?? false) === true) {
                 return;
             }
+
+            $messagePayload = [
+                'chatKey' => (string) $message->chatId,
+                'sender' => (string) $message->senderId,
+                'text' => $message->message,
+                'direction' => $message->out ? 'outgoing' : 'incoming',
+                'chatType' => $this->chatType($message),
+                'isEdited' => $message->editDate !== null,
+                'isReply' => $message->replyToMsgId !== null,
+                'isForwarded' => $message->fwdInfo !== null,
+                'isBot' => $this->isBot($message->senderId),
+                'mediaType' => $this->mediaType($message),
+                'messageId' => (string) $message->id,
+            ];
+
+            // Agent hook: strictly below the disabled check
+            $runner = $this->getAgentRunner();
+            if ($runner->handleMessage($messagePayload, $this)) {
+                return;
+            }
+
             EventForwarder::post([
                 'type' => 'message',
-                'message' => [
-                    'chatKey' => (string) $message->chatId,
-                    'sender' => (string) $message->senderId,
-                    'text' => $message->message,
-                    'direction' => $message->out ? 'outgoing' : 'incoming',
-                    'chatType' => $this->chatType($message),
-                    'isEdited' => $message->editDate !== null,
-                    'isReply' => $message->replyToMsgId !== null,
-                    'isForwarded' => $message->fwdInfo !== null,
-                    'isBot' => $this->isBot($message->senderId),
-                    'mediaType' => $this->mediaType($message),
-                    'messageId' => (string) $message->id,
-                ],
+                'message' => $messagePayload,
             ]);
         } catch (Throwable) {
             // Message bodies and exceptions are intentionally never logged.
         }
+    }
+
+    private ?\ReplyFlow\Agent\AgentRunner $agentRunner = null;
+
+    private function getAgentRunner(): \ReplyFlow\Agent\AgentRunner
+    {
+        if ($this->agentRunner === null) {
+            $this->agentRunner = new \ReplyFlow\Agent\AgentRunner();
+        }
+
+        return $this->agentRunner;
     }
 
     /**

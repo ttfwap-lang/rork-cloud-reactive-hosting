@@ -10,7 +10,7 @@ use Throwable;
  * Async Gemini client shell.
  * Provides transport and request/response structure without turn loop or tool dispatching.
  */
-final class GeminiClient
+class GeminiClient
 {
     private const DEFAULT_BASE_URL = 'https://generativelanguage.googleapis.com/v1beta';
     public const DEFAULT_MODEL = 'gemini-2.5-flash';
