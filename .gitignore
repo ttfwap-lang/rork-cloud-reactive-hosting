@@ -6,3 +6,5 @@ node_modules
 # Cloudflare Functions
 functions/node_modules
 !functions/package.json
+
+.vscode/

@@ -168,14 +168,60 @@ final class StateStore
         chmod($file, 0600);
     }
 
-    /** Erases one account's Telegram material without touching anybody else's. */
+    public static function readAgentConfig(?string $tenant = null): array
+    {
+        $file = self::path('agent-config.sealed', $tenant);
+        if (!is_file($file)) {
+            return [
+                'controlChatId' => null,
+                'model' => null,
+                'provider' => [],
+            ];
+        }
+        $raw = file_get_contents($file);
+        if ($raw === false || !str_contains($raw, '.')) {
+            throw new RuntimeException('Stored agent config is invalid.');
+        }
+        [$nonceEncoded, $cipherEncoded] = explode('.', $raw, 2);
+        $plain = sodium_crypto_secretbox_open(
+            sodium_base642bin($cipherEncoded, SODIUM_BASE64_VARIANT_URLSAFE_NO_PADDING),
+            sodium_base642bin($nonceEncoded, SODIUM_BASE64_VARIANT_URLSAFE_NO_PADDING),
+            self::key(),
+        );
+        if ($plain === false) {
+            throw new RuntimeException('Stored agent config could not be decrypted.');
+        }
+
+        return json_decode($plain, true, flags: JSON_THROW_ON_ERROR);
+    }
+
+    public static function writeAgentConfig(array $config, ?string $tenant = null): void
+    {
+        $plain = json_encode($config, JSON_THROW_ON_ERROR | JSON_UNESCAPED_SLASHES);
+        $nonce = random_bytes(SODIUM_CRYPTO_SECRETBOX_NONCEBYTES);
+        $cipher = sodium_crypto_secretbox($plain, $nonce, self::key());
+        $value = sodium_bin2base64($nonce, SODIUM_BASE64_VARIANT_URLSAFE_NO_PADDING).'.'.sodium_bin2base64($cipher, SODIUM_BASE64_VARIANT_URLSAFE_NO_PADDING);
+        $file = self::path('agent-config.sealed', $tenant);
+        file_put_contents($file, $value, LOCK_EX);
+        chmod($file, 0600);
+    }
+
+    /** Erases one account's Telegram and agent material without touching anybody else's. */
     public static function clear(?string $tenant = null): void
     {
         foreach (glob(self::sessionPath($tenant).'*') ?: [] as $file) {
             is_dir($file) ? self::removeDirectory($file) : @unlink($file);
         }
         @unlink(self::path('state.sealed', $tenant));
+        @unlink(self::path('agent-config.sealed', $tenant));
+        @unlink(self::path('agent-compact.request', $tenant));
         foreach (glob(self::path('action_*', $tenant)) ?: [] as $file) {
+            @unlink($file);
+        }
+        foreach (glob(self::path('agent-*.log', $tenant)) ?: [] as $file) {
+            @unlink($file);
+        }
+        foreach (glob(self::path('agent-*.snapshot', $tenant)) ?: [] as $file) {
             @unlink($file);
         }
         @unlink(self::path('worker.heartbeat', $tenant));

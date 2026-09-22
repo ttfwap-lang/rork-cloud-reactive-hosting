@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace ReplyFlow;
 
 use Throwable;
+use function Amp\async;
 
 /**
  * Signed, fire-and-forget delivery of connector events to the control plane.
@@ -32,20 +33,21 @@ final class EventForwarder
         } catch (Throwable) {
             return;
         }
-        $curl = curl_init($controlPlane.self::PATH);
-        if ($curl === false) {
-            return;
+
+        $headers = Signature::outboundHeaders(self::PATH, $body, $resolved);
+        $url = $controlPlane.self::PATH;
+
+        try {
+            async(static function () use ($url, $headers, $body): void {
+                try {
+                    AsyncHttpClient::request('POST', $url, $headers, $body, 10.0);
+                } catch (Throwable) {
+                    // Fire-and-forget: discard failures silently
+                }
+            });
+        } catch (Throwable) {
+            // Silently absorb any fiber scheduling failure
         }
-        curl_setopt_array($curl, [
-            CURLOPT_POST => true,
-            CURLOPT_POSTFIELDS => $body,
-            CURLOPT_HTTPHEADER => Signature::outboundHeaders(self::PATH, $body, $resolved),
-            CURLOPT_RETURNTRANSFER => true,
-            CURLOPT_TIMEOUT => 10,
-            CURLOPT_CONNECTTIMEOUT => 5,
-        ]);
-        curl_exec($curl);
-        curl_close($curl);
     }
 
     /** Announces a session-level state change (never carries message content). */

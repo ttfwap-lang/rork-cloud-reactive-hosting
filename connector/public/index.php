@@ -76,6 +76,7 @@ try {
         '/v1/session/disconnect' => $service->disconnect(),
         '/v1/session/forget' => $service->forget(),
         '/v1/actions/execute' => $service->execute($input),
+        '/v1/agent/config' => $service->saveAgentConfig($input),
         default => throw new ConnectorException('not found', null, 404),
     };
     echo json_encode($result, JSON_THROW_ON_ERROR | JSON_UNESCAPED_SLASHES);

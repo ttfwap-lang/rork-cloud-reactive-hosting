@@ -23,6 +23,7 @@ final class SelfCheck
             self::sharedSecret(),
             self::controlPlane(),
             self::telegramCredentials(),
+            self::geminiCredentials(),
             self::storage(),
             self::worker(),
             self::session(),
@@ -119,6 +120,16 @@ final class SelfCheck
         }
 
         return self::result('Telegram app credentials', 'pass', 'Both values are present and correctly shaped.');
+    }
+
+    private static function geminiCredentials(): array
+    {
+        $key = trim((string) (getenv('GEMINI_API_KEY') ?: ''));
+        if ($key === '') {
+            return self::result('Gemini API key', 'warn', 'GEMINI_API_KEY is not set. Agent functionality will remain inert.');
+        }
+
+        return self::result('Gemini API key', 'pass', 'GEMINI_API_KEY is configured.');
     }
 
     private static function storage(): array

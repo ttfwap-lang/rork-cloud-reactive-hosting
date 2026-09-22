@@ -34,6 +34,9 @@ final class ReplyFlowEventHandler extends SimpleEventHandler
             $state['workerStartedAt'] = time();
             StateStore::write($state);
             StateStore::heartbeat();
+            \Revolt\EventLoop::repeat(15.0, static function (): void {
+                StateStore::heartbeat();
+            });
             EventForwarder::status('online', 'Personal connector event loop is online.', $state['identity'] ?? null);
         } catch (Throwable) {
             // Never log: session material can surface in traces.

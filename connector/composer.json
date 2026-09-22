@@ -10,7 +10,14 @@
     "ext-mbstring": "*",
     "ext-openssl": "*",
     "ext-sodium": "*",
+    "amphp/http-client": "^5.3.3",
     "danog/madelineproto": "8.4.18"
+  },
+  "require-dev": {
+    "phpunit/phpunit": "^11.5"
+  },
+  "scripts": {
+    "test": "phpunit"
   },
   "autoload": {
     "psr-4": {

@@ -397,12 +397,27 @@ final class TelegramService
         );
     }
 
+    public function saveAgentConfig(array $input): array
+    {
+        $config = $input['config'] ?? $input;
+        if (!is_array($config)) {
+            throw new ConnectorException('Invalid agent config payload.');
+        }
+        StateStore::writeAgentConfig($config, $this->tenant);
+
+        return array_merge(
+            ['ok' => true],
+            $this->publicState(StateStore::read($this->tenant), 'Agent configuration updated.')
+        );
+    }
+
     private function publicState(array $state, string $detail): array
     {
         return [
             'status' => $state['status'] ?? 'offline',
             'identity' => $state['identity'] ?? null,
             'phoneMasked' => $state['phoneMasked'] ?? null,
+            'heartbeatAge' => StateStore::heartbeatAge($this->tenant),
             'detail' => $detail,
         ];
     }
