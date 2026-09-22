@@ -1,5 +1,5 @@
 import { NavLink, Outlet } from "react-router-dom";
-import { Activity, Crown, GitBranch, ImagePlus, Link2, LogOut, RotateCcw, ScrollText, ShieldCheck, SlidersHorizontal } from "lucide-react";
+import { Activity, Bot, Crown, GitBranch, ImagePlus, Link2, LogOut, RotateCcw, ScrollText, ShieldCheck, SlidersHorizontal } from "lucide-react";
 
 import { cn } from "@/lib/utils";
 import { useEngine } from "@/lib/engine-store";
@@ -10,6 +10,7 @@ const NAV = [
   { to: "/", label: "Overview", icon: Activity, end: true, ownerOnly: false },
   { to: "/connection", label: "Connection", icon: Link2, end: false, ownerOnly: false },
   { to: "/workflows", label: "Workflows", icon: GitBranch, end: false, ownerOnly: false },
+  { to: "/agent", label: "Agent", icon: Bot, end: false, ownerOnly: false },
   { to: "/import", label: "AI Import", icon: ImagePlus, end: false, ownerOnly: false },
   { to: "/logs", label: "Logs", icon: ScrollText, end: false, ownerOnly: false },
   { to: "/jobs", label: "Failed jobs", icon: RotateCcw, end: false, ownerOnly: false },

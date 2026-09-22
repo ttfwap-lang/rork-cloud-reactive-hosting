@@ -357,6 +357,7 @@ export type AgentStateInfo = {
   conflictRestores: number;
   recentTools: AgentRecentTool[];
   replayAbandonEvents: number;
+  turnsToday: number;
   diskState: string;
 };
 
@@ -471,6 +472,8 @@ export const api = {
   previewWorkflow: (step: Partial<WorkflowStep>, text: string) => call<{ matched: boolean; captures: string[]; actionType: WorkflowActionType; output: string; note: string }>("/workflow/preview", { step, message: { text } }),
   analyzeConversation: (input: { images: string[]; ownerSide: "left" | "right"; localeHint?: string }) =>
     call<{ analysis: ConversationAnalysis; model: string; retention: string }>("/ai/conversation", input),
+  setAgentConfig: (input: { controlChat?: string; modelId?: string }) => call<{ ok: boolean; controlChat: string }>("/agent/config", input),
+  releaseAgentLease: (input: { chatKey?: string; all?: boolean }) => call<{ ok: boolean }>("/agent/lease/release", input),
 };
 
 export function streamUrl(ticket: string): string {

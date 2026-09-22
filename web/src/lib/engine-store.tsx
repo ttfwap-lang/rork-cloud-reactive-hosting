@@ -80,6 +80,8 @@ type EngineContextValue = {
   simulate: (input: { chatKey?: string; sender?: string; text: string }) => Promise<void>;
   previewWorkflow: (step: Partial<WorkflowStep>, text: string) => Promise<{ matched: boolean; captures: string[]; actionType: WorkflowActionType; output: string; note: string }>;
   analyzeConversation: (input: { images: string[]; ownerSide: "left" | "right"; localeHint?: string }) => Promise<ConversationAnalysis>;
+  setAgentControlChat: (chat: string) => Promise<void>;
+  releaseAgentLease: (chatKey?: string, all?: boolean) => Promise<void>;
 };
 
 const EngineContext = createContext<EngineContextValue | null>(null);
@@ -340,6 +342,22 @@ export function EngineProvider({ children }: { children: ReactNode }) {
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ACCOUNT_KEY }),
     onError: (error: Error) => toast.error(error.message),
   });
+  const agentConfigMutation = useMutation({
+    mutationFn: (controlChat: string) => api.setAgentConfig({ controlChat }),
+    onSuccess: () => {
+      invalidate();
+      toast.success("Control chat updated");
+    },
+    onError: (error: Error) => toast.error(error.message),
+  });
+  const leaseReleaseMutation = useMutation({
+    mutationFn: ({ chatKey, all }: { chatKey?: string; all?: boolean }) => api.releaseAgentLease({ chatKey, all }),
+    onSuccess: () => {
+      invalidate();
+      toast.success("Lease released");
+    },
+    onError: (error: Error) => toast.error(error.message),
+  });
 
   const adopt = useCallback((token: string, account: AccountView, welcome: string): void => {
     setToken(token);
@@ -427,6 +445,8 @@ export function EngineProvider({ children }: { children: ReactNode }) {
     simulate: async (input) => { await simulateMutation.mutateAsync(input); },
     previewWorkflow: async (step, text) => api.previewWorkflow(step, text),
     analyzeConversation: async (input) => (await analysisMutation.mutateAsync(input)).analysis,
+    setAgentControlChat: async (chat: string) => { await agentConfigMutation.mutateAsync(chat); },
+    releaseAgentLease: async (chatKey?: string, all?: boolean) => { await leaseReleaseMutation.mutateAsync({ chatKey, all }); },
   }), [
     authed, authStatus, sessionExpired, dismissExpiry, retryAuth,
     accountQuery.data, isOwner, signUp, signIn, signOut, query.data, query.isLoading, query.error, liveEvents, streamOnline, queryClient,
@@ -435,6 +455,7 @@ export function EngineProvider({ children }: { children: ReactNode }) {
     ownerQuery.data, suspendMutation, removeMutation, passwordMutation,
     runWorkflowMutation, checkConnectorMutation, diagnoseHostingMutation, applyHostingMutation,
     reconnectMutation, disconnectMutation, forgetMutation, retryMutation, jobMutation, simulateMutation, analysisMutation,
+    agentConfigMutation, leaseReleaseMutation,
   ]);
 
   return <EngineContext.Provider value={value}>{children}</EngineContext.Provider>;

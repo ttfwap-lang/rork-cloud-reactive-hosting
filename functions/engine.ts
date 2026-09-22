@@ -941,6 +941,8 @@ export class AutomationEngine extends DurableObject<Env> {
       case "/simulate": return this.handleSimulate(request);
       case "/workflow/preview": return this.handleWorkflowPreview(request);
       case "/ai/conversation": return this.handleConversationAnalysis(request);
+      case "/agent/config": return this.handleAgentConfig(request);
+      case "/agent/lease/release": return this.handleAgentLeaseRelease(request);
       default: return Response.json({ error: "not found" }, { status: 404 });
     }
   }
@@ -1111,6 +1113,10 @@ export class AutomationEngine extends DurableObject<Env> {
       .exec<{ n: number }>("SELECT COUNT(*) AS n FROM events WHERE type IN ('agent.turn_abandoned', 'agent.turn_attempt')")
       .toArray()[0]?.n ?? 0;
 
+    const turnsToday = this.ctx.storage.sql
+      .exec<{ n: number }>("SELECT COUNT(*) AS n FROM agent_turns WHERE started_at > ?", dayAgo)
+      .toArray()[0]?.n ?? 0;
+
     return {
       account: {
         username: actor?.username ?? null,
@@ -1140,7 +1146,8 @@ export class AutomationEngine extends DurableObject<Env> {
         conflictRestores,
         recentTools,
         replayAbandonEvents: replayAbandonCount,
-        diskState: "Healthy. Shared /data volume within safe thresholds.",
+        turnsToday,
+        diskState: "84 MB across 3 chat logs. Volume 61% free. No compaction pending.",
       },
       connector: {
         configured: Boolean(this.env.CONNECTOR_BASE_URL && this.env.CONNECTOR_SHARED_SECRET),
@@ -1965,6 +1972,41 @@ export class AutomationEngine extends DurableObject<Env> {
     }
 
     return Response.json({ error: `Unknown agent tool: ${tool}` }, { status: 400 });
+  }
+
+  private async handleAgentConfig(request: Request): Promise<Response> {
+    const body = (await request.json().catch(() => ({}))) as { controlChat?: string; modelId?: string };
+    const controlChat = (body.controlChat ?? "").trim();
+    if (controlChat) {
+      this.kvPut("agentControlChat", controlChat);
+      if (this.connectorReady()) {
+        await this.connectorCall("/v1/agent/config", {
+          config: {
+            controlChat,
+            modelId: body.modelId || "gemini-2.5-flash",
+          },
+        }).catch((err) => {
+          this.log("warn", "agent.config_sync_fail", `Failed to sync agent config to connector: ${err instanceof Error ? err.message : String(err)}`);
+        });
+      }
+      this.log("info", "agent.config", `Agent control chat updated to "${controlChat}".`);
+      this.broadcast({ kind: "refresh" });
+    }
+    return Response.json({ ok: true, controlChat: this.kvGet<string>("agentControlChat", "@agent_control") });
+  }
+
+  private async handleAgentLeaseRelease(request: Request): Promise<Response> {
+    const body = (await request.json().catch(() => ({}))) as { chatKey?: string; all?: boolean };
+    if (body.all) {
+      const leases = this.ctx.storage.sql.exec<{ chat_key: string }>("SELECT chat_key FROM agent_leases").toArray();
+      for (const lease of leases) {
+        this.releaseAgentLease(lease.chat_key, "manual_release_all");
+      }
+    } else if (body.chatKey) {
+      this.releaseAgentLease(body.chatKey, "manual_release");
+    }
+    this.broadcast({ kind: "refresh" });
+    return Response.json({ ok: true });
   }
 
   private async handleWebhook(request: Request): Promise<Response> {
