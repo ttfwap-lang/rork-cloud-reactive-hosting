@@ -70,7 +70,7 @@ final class GeminiClient
         try {
             $jsonBody = json_encode($payload, JSON_THROW_ON_ERROR | JSON_UNESCAPED_SLASHES);
         } catch (Throwable $e) {
-            throw new ConnectorException('Failed to encode Gemini request payload: '.$e->getMessage(), $e, 400);
+            throw new ConnectorException('Failed to encode Gemini request payload: '.$e->getMessage(), null, 400, $e);
         }
 
         try {
@@ -82,7 +82,7 @@ final class GeminiClient
                 $timeout,
             );
         } catch (Throwable $e) {
-            throw new ConnectorException('Gemini HTTP request failed: '.$e->getMessage(), $e, 502);
+            throw new ConnectorException('Gemini HTTP request failed: '.$e->getMessage(), null, 502, $e);
         }
 
         $status = $response['status'];
@@ -90,7 +90,7 @@ final class GeminiClient
         try {
             $decoded = json_decode($rawBody, true, flags: JSON_THROW_ON_ERROR);
         } catch (Throwable $e) {
-            throw new ConnectorException('Failed to decode Gemini response: '.$e->getMessage(), $e, 502);
+            throw new ConnectorException('Failed to decode Gemini response: '.$e->getMessage(), null, 502, $e);
         }
 
         if ($status < 200 || $status >= 300) {

@@ -29,7 +29,7 @@ final class WorkerClient
         try {
             $body = json_encode($payload + ['tenant' => $resolved], JSON_THROW_ON_ERROR | JSON_UNESCAPED_SLASHES);
         } catch (Throwable $e) {
-            throw new ConnectorException('Failed to encode worker request payload: '.$e->getMessage(), $e, 400);
+            throw new ConnectorException('Failed to encode worker request payload: '.$e->getMessage(), null, 400, $e);
         }
 
         $url = $controlPlane.$path;
@@ -38,7 +38,7 @@ final class WorkerClient
         try {
             $response = AsyncHttpClient::request('POST', $url, $headers, $body, $timeout);
         } catch (Throwable $e) {
-            throw new ConnectorException('Worker request failed: '.$e->getMessage(), $e, 502);
+            throw new ConnectorException('Worker request failed: '.$e->getMessage(), null, 502, $e);
         }
 
         $status = $response['status'];

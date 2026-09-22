@@ -176,4 +176,74 @@ final class ReplayPlannerTest extends TestCase
         $this->assertSame(ReplayPlanner::DECISION_REISSUE, $decisions['c1']['decision']);
         $this->assertSame(ReplayPlanner::DECISION_ABANDON, $decisions['c2']['decision']);
     }
+
+    public function testReactWithMissingIsSelfReissues(): void
+    {
+        $intent = [
+            'callId' => 'call_react_unknown',
+            'tool' => 'react',
+            'arguments' => ['chat' => '@user', 'messageId' => '100', 'emoji' => '🔥'],
+        ];
+
+        // Missing isSelf -> must treat unknown provenance as unverified and reissue
+        $historyMissingIsSelf = [
+            ['id' => '100', 'message' => 'test', 'reactions' => [['emoji' => '🔥']]],
+        ];
+        $this->assertSame(
+            ReplayPlanner::DECISION_REISSUE,
+            $this->planner->plan($intent, attemptCount: 0, recentHistory: $historyMissingIsSelf)
+        );
+
+        // isSelf is false -> authored by another user, must reissue
+        $historyOtherSelf = [
+            ['id' => '100', 'message' => 'test', 'reactions' => [['emoji' => '🔥', 'isSelf' => false]]],
+        ];
+        $this->assertSame(
+            ReplayPlanner::DECISION_REISSUE,
+            $this->planner->plan($intent, attemptCount: 0, recentHistory: $historyOtherSelf)
+        );
+    }
+
+    public function testPlanAllForwardToSavedUsesSavedHistoryNotSourceChat(): void
+    {
+        $intents = [
+            [
+                'callId' => 'call_fwd_1',
+                'turnId' => 'turn_1',
+                'chatKey' => '@source_chat',
+                'tool' => 'forward_to_saved',
+                'arguments' => ['chat' => '@source_chat', 'messageId' => '500'],
+            ],
+        ];
+
+        // Source chat (@source_chat) contains message 500, but Saved Messages history has the forward record
+        $chatHistoriesWithSaved = [
+            '@source_chat' => [
+                ['id' => '500', 'message' => 'Important incoming message', 'out' => false],
+            ],
+            ReplayPlanner::SAVED_MESSAGES_KEY => [
+                ['id' => '2001', 'fwdMsgId' => '500'],
+            ],
+        ];
+
+        $decisions = $this->planner->planAll($intents, ['turn_1' => 0], $chatHistoriesWithSaved);
+
+        $this->assertArrayHasKey('call_fwd_1', $decisions);
+        // Proves a previously forwarded message is skipped rather than duplicated
+        $this->assertSame(ReplayPlanner::DECISION_SKIP, $decisions['call_fwd_1']['decision']);
+
+        // When Saved Messages does not contain the forwarded message, it reissues even if source chat history has it
+        $chatHistoriesWithoutSaved = [
+            '@source_chat' => [
+                ['id' => '500', 'message' => 'Important incoming message', 'out' => false],
+            ],
+            ReplayPlanner::SAVED_MESSAGES_KEY => [
+                ['id' => '2000', 'fwdMsgId' => '499'],
+            ],
+        ];
+
+        $decisionsNotLanded = $this->planner->planAll($intents, ['turn_1' => 0], $chatHistoriesWithoutSaved);
+        $this->assertSame(ReplayPlanner::DECISION_REISSUE, $decisionsNotLanded['call_fwd_1']['decision']);
+    }
 }
+

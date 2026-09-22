@@ -20,6 +20,7 @@ final class ReplayPlanner
 
     /** Replay is strictly allowed only once to prevent infinite crash loops. */
     public const MAX_REPLAY_ATTEMPTS = 1;
+    public const SAVED_MESSAGES_KEY = 'saved';
 
     /**
      * Decides action for a single pending tool intent.
@@ -27,10 +28,15 @@ final class ReplayPlanner
      * @param array{tool: string, arguments?: array, callId?: string, turnId?: string} $intent
      * @param int $attemptCount Number of previous attempts recorded for this turn/intent
      * @param list<array> $recentHistory Recent messages in the target chat
+     * @param list<array>|null $savedMessagesHistory Recent messages in Saved Messages (if checking forward_to_saved separately)
      * @return self::DECISION_*
      */
-    public function plan(array $intent, int $attemptCount, array $recentHistory = []): string
-    {
+    public function plan(
+        array $intent,
+        int $attemptCount,
+        array $recentHistory = [],
+        ?array $savedMessagesHistory = null,
+    ): string {
         // 1. Crash loop protection: replay strictly once.
         if ($attemptCount >= self::MAX_REPLAY_ATTEMPTS) {
             return self::DECISION_ABANDON;
@@ -76,7 +82,8 @@ final class ReplayPlanner
 
         if ($tool === 'forward_to_saved') {
             $messageId = (string) ($args['messageId'] ?? '');
-            if ($this->hasForwardInSavedMessages($recentHistory, $messageId)) {
+            $saved = $savedMessagesHistory ?? $recentHistory;
+            if ($this->hasForwardInSavedMessages($saved, $messageId)) {
                 return self::DECISION_SKIP;
             }
 
@@ -88,25 +95,53 @@ final class ReplayPlanner
     }
 
     /**
+     * Resolves the target chat whose history proves or disproves tool execution.
+     */
+    public function targetChatForTool(string $tool, array $intent): string
+    {
+        if ($tool === 'forward_to_saved') {
+            return self::SAVED_MESSAGES_KEY;
+        }
+
+        return (string) ($intent['chatKey'] ?? ($intent['arguments']['chat'] ?? ''));
+    }
+
+    /**
      * Plans replay decisions for all pending tool intents in folded state.
      *
      * @param list<array> $pendingIntents
      * @param array<string, int> $turnAttempts turnId => count
      * @param array<string, list<array>> $chatHistories chatKey => history
+     * @param list<array>|null $savedMessagesHistory Saved Messages history override
      * @return array<string, array{decision: string, intent: array}>
      */
-    public function planAll(array $pendingIntents, array $turnAttempts, array $chatHistories = []): array
-    {
+    public function planAll(
+        array $pendingIntents,
+        array $turnAttempts,
+        array $chatHistories = [],
+        ?array $savedMessagesHistory = null,
+    ): array {
         $decisions = [];
+        $savedHistory = $savedMessagesHistory
+            ?? $chatHistories[self::SAVED_MESSAGES_KEY]
+            ?? $chatHistories['me']
+            ?? $chatHistories['saved_messages']
+            ?? null;
+
         foreach ($pendingIntents as $intent) {
             $callId = (string) ($intent['callId'] ?? uniqid('call_', true));
             $turnId = (string) ($intent['turnId'] ?? '');
-            $chatKey = (string) ($intent['chatKey'] ?? ($intent['arguments']['chat'] ?? ''));
+            $tool = (string) ($intent['tool'] ?? '');
+
+            // Choose verification history by tool-specific target, not always by chatKey
+            $targetChat = $this->targetChatForTool($tool, $intent);
+            $history = $targetChat === self::SAVED_MESSAGES_KEY
+                ? ($savedHistory ?? [])
+                : ($chatHistories[$targetChat] ?? []);
 
             $attempts = $turnAttempts[$turnId] ?? 0;
-            $history = $chatHistories[$chatKey] ?? [];
 
-            $decision = $this->plan($intent, $attempts, $history);
+            $decision = $this->plan($intent, $attempts, $history, $savedHistory);
             $decisions[$callId] = [
                 'decision' => $decision,
                 'intent' => $intent,
@@ -144,7 +179,7 @@ final class ReplayPlanner
             if ($msgId === $messageId) {
                 $reactions = (array) ($msg['reactions'] ?? []);
                 foreach ($reactions as $r) {
-                    if (($r['emoji'] ?? $r['emoticon'] ?? '') === $emoji && ($r['isSelf'] ?? true)) {
+                    if (($r['emoji'] ?? $r['emoticon'] ?? '') === $emoji && ($r['isSelf'] ?? false) === true) {
                         return true;
                     }
                 }
