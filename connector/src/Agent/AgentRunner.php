@@ -26,6 +26,11 @@ final class AgentRunner
     private AgentState $state;
     private string $tenant;
     private array $config;
+    private ?int $lastConfigMtime = null;
+    private bool $injectedGemini = false;
+
+    /** @var callable(string, array, ?string): array|null */
+    private $workerToolDispatcher = null;
 
     public function __construct(
         ?string $tenant = null,
@@ -33,16 +38,58 @@ final class AgentRunner
         ?AgentTools $tools = null,
         ?TurnQueue $queue = null,
         ?AgentState $state = null,
+        ?callable $workerToolDispatcher = null,
     ) {
         $this->tenant = StateStore::normalize($tenant ?? StateStore::tenant());
-        $this->config = $this->loadConfig();
-        $apiKey = (string) ($this->config['apiKey'] ?? (getenv('GEMINI_API_KEY') ?: ''));
-        $model = (string) ($this->config['model'] ?? (getenv('GEMINI_MODEL') ?: GeminiClient::DEFAULT_MODEL));
-
-        $this->gemini = $gemini ?? new GeminiClient($apiKey, $model);
+        $this->injectedGemini = $gemini !== null;
+        $this->refreshConfig();
+        if ($this->injectedGemini) {
+            $this->gemini = $gemini;
+        }
         $this->tools = $tools ?? new AgentTools();
         $this->queue = $queue ?? new TurnQueue();
         $this->state = $state ?? new AgentState();
+        $this->workerToolDispatcher = $workerToolDispatcher;
+    }
+
+    public function setWorkerToolDispatcher(?callable $dispatcher): void
+    {
+        $this->workerToolDispatcher = $dispatcher;
+    }
+
+    /**
+     * Refreshes the stored agent configuration if agent-config.sealed changed on disk.
+     */
+    public function refreshConfig(): void
+    {
+        $configFile = StateStore::path('agent-config.sealed', $this->tenant);
+        $mtime = is_file($configFile) ? (@filemtime($configFile) ?: 0) : -1;
+        if ($this->lastConfigMtime !== null && $mtime === $this->lastConfigMtime) {
+            return;
+        }
+
+        $this->lastConfigMtime = $mtime;
+        $this->config = $this->loadConfig();
+        if (!$this->injectedGemini) {
+            $apiKey = (string) ($this->config['apiKey'] ?? (getenv('GEMINI_API_KEY') ?: ''));
+            $model = (string) ($this->config['model'] ?? (getenv('GEMINI_MODEL') ?: GeminiClient::DEFAULT_MODEL));
+            $this->gemini = new GeminiClient($apiKey, $model);
+        }
+    }
+
+    private function dispatchWorkerTool(string $tool, array $args): array
+    {
+        if ($this->workerToolDispatcher !== null) {
+            return ($this->workerToolDispatcher)($tool, $args, $this->tenant);
+        }
+
+        $res = \ReplyFlow\WorkerClient::post('/connector/event', [
+            'type' => 'agentTool',
+            'tool' => $tool,
+            'args' => $args,
+        ], $this->tenant);
+
+        return $res['data'] ?? $res;
     }
 
     /**
@@ -50,6 +97,7 @@ final class AgentRunner
      */
     public function isConfigured(): bool
     {
+        $this->refreshConfig();
         $apiKey = (string) ($this->config['apiKey'] ?? (getenv('GEMINI_API_KEY') ?: ''));
 
         return $apiKey !== '';
@@ -57,6 +105,7 @@ final class AgentRunner
 
     public function getControlChat(): string
     {
+        $this->refreshConfig();
         return trim((string) ($this->config['controlChat'] ?? ''));
     }
 
@@ -149,7 +198,11 @@ final class AgentRunner
             ];
             AgentLog::append($chatKey, $event, $this->tenant);
             $this->state->apply($event);
-            EventForwarder::post(['type' => 'agent_log', 'event' => $event], $this->tenant);
+
+            // Redacted copy for EventForwarder: strip message text from ambient observations
+            $forwardedEvent = $event;
+            unset($forwardedEvent['text']);
+            EventForwarder::post(['type' => 'agent_log', 'event' => $forwardedEvent], $this->tenant);
 
             $this->queue->enqueue($chatKey, [
                 'type' => 'observation',
@@ -308,6 +361,8 @@ final class AgentRunner
                             }
                             $this->releaseLease($targetChat);
                             $toolResult = ['ok' => true, 'released' => $targetChat];
+                        } elseif (in_array($toolName, ['patch_settings', 'save_workflow', 'start_batch_run'], true)) {
+                            $toolResult = $this->dispatchWorkerTool($toolName, $args);
                         } else {
                             $toolResult = $this->tools->execute($toolName, $args, $proto);
                         }

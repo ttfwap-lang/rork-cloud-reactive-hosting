@@ -152,6 +152,70 @@ class AgentTools
                     'required' => ['chat'],
                 ],
             ],
+            [
+                'name' => 'patch_settings',
+                'description' => 'Patch engine safety and pacing settings on the worker (e.g. killSwitch, automationEnabled, dryRun, minGapMs, perMinuteCap, dailyCap, quietHours, allowlist).',
+                'parameters' => [
+                    'type' => 'OBJECT',
+                    'properties' => [
+                        'settings' => [
+                            'type' => 'OBJECT',
+                            'description' => 'Key-value map of settings to update.',
+                        ],
+                    ],
+                ],
+            ],
+            [
+                'name' => 'save_workflow',
+                'description' => 'Save or update an automation workflow definition on the worker.',
+                'parameters' => [
+                    'type' => 'OBJECT',
+                    'properties' => [
+                        'name' => [
+                            'type' => 'STRING',
+                            'description' => 'Name of the workflow.',
+                        ],
+                        'steps' => [
+                            'type' => 'ARRAY',
+                            'description' => 'List of workflow steps.',
+                            'items' => [
+                                'type' => 'OBJECT',
+                            ],
+                        ],
+                        'targets' => [
+                            'type' => 'ARRAY',
+                            'description' => 'Target chats or bots.',
+                            'items' => ['type' => 'STRING'],
+                        ],
+                        'bypassLimits' => [
+                            'type' => 'BOOLEAN',
+                            'description' => 'Whether this workflow bypasses safety limits.',
+                        ],
+                    ],
+                    'required' => ['name', 'steps'],
+                ],
+            ],
+            [
+                'name' => 'start_batch_run',
+                'description' => 'Start an unattended batch run of queued actions on the worker.',
+                'parameters' => [
+                    'type' => 'OBJECT',
+                    'properties' => [
+                        'name' => [
+                            'type' => 'STRING',
+                            'description' => 'Descriptive name for this batch run.',
+                        ],
+                        'items' => [
+                            'type' => 'ARRAY',
+                            'description' => 'List of batch action items to execute.',
+                            'items' => [
+                                'type' => 'OBJECT',
+                            ],
+                        ],
+                    ],
+                    'required' => ['items'],
+                ],
+            ],
         ];
     }
 

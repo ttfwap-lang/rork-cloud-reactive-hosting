@@ -20,7 +20,7 @@ final class AgentToolsTest extends TestCase
     public function testDeclarationsCountAndNames(): void
     {
         $declarations = AgentTools::declarations();
-        $this->assertCount(7, $declarations);
+        $this->assertCount(10, $declarations);
 
         $names = array_column($declarations, 'name');
         $this->assertContains('read_history', $names);
@@ -30,6 +30,9 @@ final class AgentToolsTest extends TestCase
         $this->assertContains('forward_to_saved', $names);
         $this->assertContains('mark_read', $names);
         $this->assertContains('release_lease', $names);
+        $this->assertContains('patch_settings', $names);
+        $this->assertContains('save_workflow', $names);
+        $this->assertContains('start_batch_run', $names);
     }
 
     public function testSendText(): void

@@ -382,5 +382,118 @@ final class AgentRunnerTest extends TestCase
         $this->assertNotNull($resultEvent);
         $this->assertSame(['ok' => true, 'released' => '@leased_target'], $resultEvent['result']['output'] ?? null);
     }
+
+    public function testConfigFreshnessReloadsControlChatWithoutReconstructingRunner(): void
+    {
+        StateStore::writeAgentConfig([
+            'controlChat' => '@initial_control',
+            'apiKey' => 'test-key',
+        ]);
+
+        $runner = new AgentRunner();
+        $this->assertSame('@initial_control', $runner->getControlChat());
+        $this->assertTrue($runner->isControlChat('@initial_control'));
+        $this->assertFalse($runner->isControlChat('@updated_control'));
+
+        // Modify sealed config on disk without reconstructing the runner
+        touch(StateStore::path('agent-config.sealed'), time() + 5);
+        StateStore::writeAgentConfig([
+            'controlChat' => '@updated_control',
+            'apiKey' => 'test-key-2',
+        ]);
+
+        // Freshness check must reload and recognize the new control chat immediately
+        $this->assertSame('@updated_control', $runner->getControlChat());
+        $this->assertTrue($runner->isControlChat('@updated_control'));
+        $this->assertFalse($runner->isControlChat('@initial_control'));
+
+        // Clearing control chat must also be recognized immediately
+        touch(StateStore::path('agent-config.sealed'), time() + 10);
+        StateStore::writeAgentConfig([
+            'controlChat' => '',
+            'apiKey' => 'test-key-2',
+        ]);
+
+        $this->assertSame('', $runner->getControlChat());
+        $this->assertFalse($runner->isControlChat('@updated_control'));
+    }
+
+    public function testWorkerMediatedToolDispatchInTurnLoop(): void
+    {
+        $mockGemini = $this->createMock(GeminiClient::class);
+        $mockGemini->expects($this->exactly(2))
+            ->method('generateContent')
+            ->willReturnOnConsecutiveCalls(
+                [
+                    'candidates' => [
+                        [
+                            'content' => [
+                                'parts' => [
+                                    [
+                                        'functionCall' => [
+                                            'name' => 'patch_settings',
+                                            'args' => ['settings' => ['killSwitch' => true]],
+                                        ],
+                                    ],
+                                ],
+                            ],
+                        ],
+                    ],
+                ],
+                [
+                    'candidates' => [
+                        [
+                            'content' => [
+                                'parts' => [
+                                    ['text' => 'Settings patched successfully.'],
+                                ],
+                            ],
+                        ],
+                    ],
+                ]
+            );
+
+        $mockTools = $this->createMock(AgentTools::class);
+        $mockTools->expects($this->never())->method('execute');
+
+        $dispatchedTool = null;
+        $dispatchedArgs = null;
+        $runner = new AgentRunner(
+            gemini: $mockGemini,
+            tools: $mockTools,
+            workerToolDispatcher: function (string $tool, array $args) use (&$dispatchedTool, &$dispatchedArgs): array {
+                $dispatchedTool = $tool;
+                $dispatchedArgs = $args;
+                return ['ok' => true, 'settings' => ['killSwitch' => true]];
+            },
+        );
+
+        $proto = new class {};
+        $item = [
+            'type' => 'instruction',
+            'message' => [
+                'chatKey' => '@agent_control',
+                'sender' => '@owner',
+                'text' => 'Emergency stop',
+                'messageId' => '303',
+            ],
+        ];
+
+        $runner->runTurn('@agent_control', 'turn_worker_tool_test', $item, $proto);
+
+        $this->assertSame('patch_settings', $dispatchedTool);
+        $this->assertSame(['settings' => ['killSwitch' => true]], $dispatchedArgs);
+
+        $events = AgentLog::readAll('@agent_control');
+        $toolResult = null;
+        foreach ($events as $ev) {
+            if ($ev['kind'] === 'tool.result' && $ev['tool'] === 'patch_settings') {
+                $toolResult = $ev;
+                break;
+            }
+        }
+        $this->assertNotNull($toolResult);
+        $this->assertSame(['ok' => true, 'settings' => ['killSwitch' => true]], $toolResult['result']['output'] ?? null);
+    }
 }
 

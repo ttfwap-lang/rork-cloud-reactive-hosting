@@ -14,48 +14,34 @@ export default function Agent() {
   };
 
   const handleSaveControlChat = async () => {
-    if (controlChatInput.trim()) {
-      await setAgentControlChat(controlChatInput.trim());
-    }
+    await setAgentControlChat(controlChatInput.trim());
     setIsEditingControlChat(false);
   };
 
   const statusText = (agent?.activeTurns && agent.activeTurns.length > 0) || snapshot?.link?.status === "online" ? "Acting" : "Idle";
-  const heartbeatText = agent?.childHeartbeatAge !== null && agent?.childHeartbeatAge !== undefined ? `${agent.childHeartbeatAge}s` : "3s";
+  const heartbeatText = agent?.childHeartbeatAge !== null && agent?.childHeartbeatAge !== undefined ? `${agent.childHeartbeatAge}s` : "—";
   const leasesCount = agent?.heldLeases?.length ?? 0;
   const turnsCount = agent?.turnsToday ?? 0;
 
-  // Default sample recent tools if none recorded yet to match live wireframe feel
-  const tools = (agent?.recentTools && agent.recentTools.length > 0)
-    ? agent.recentTools.map((t) => {
-        const timeStr = new Date(t.ts).toLocaleTimeString("en-GB", { hour12: false });
-        let toolName = "action";
-        let outcome = "ok";
-        let isWarn = false;
-        let isDanger = false;
-        try {
-          const parsed = JSON.parse(t.detail);
-          toolName = parsed.tool || toolName;
-          outcome = parsed.outcome || outcome;
-          isWarn = parsed.warn || false;
-          isDanger = parsed.danger || outcome.includes("fail") || outcome.includes("replayed");
-        } catch {
-          toolName = t.detail.slice(0, 30);
-        }
-        return { time: timeStr, chat: t.chatKey, tool: toolName, outcome, isWarn, isDanger };
-      })
-    : [
-        { time: "14:22:07", chat: "@astro2", tool: "forward_to_saved", outcome: "ok", isWarn: false, isDanger: false },
-        { time: "14:21:54", chat: "Sarah", tool: "send_text", outcome: "ok", isWarn: false, isDanger: false },
-        { time: "14:21:40", chat: "@astro1", tool: "press_button", outcome: "replayed — possible double press", isWarn: false, isDanger: true },
-      ];
+  const tools = (agent?.recentTools ?? []).map((t) => {
+    const timeStr = new Date(t.ts).toLocaleTimeString("en-GB", { hour12: false });
+    let toolName = "action";
+    let outcome = "ok";
+    let isWarn = false;
+    let isDanger = false;
+    try {
+      const parsed = JSON.parse(t.detail);
+      toolName = parsed.tool || toolName;
+      outcome = parsed.outcome || outcome;
+      isWarn = parsed.warn || false;
+      isDanger = parsed.danger || outcome.includes("fail") || outcome.includes("replayed");
+    } catch {
+      toolName = t.detail.slice(0, 30);
+    }
+    return { time: timeStr, chat: t.chatKey, tool: toolName, outcome, isWarn, isDanger };
+  });
 
-  const heldLeases = (agent?.heldLeases && agent.heldLeases.length > 0)
-    ? agent.heldLeases
-    : [
-        { chatKey: "@astro1", state: "turn running", parkedWorkflow: "—", note: "agent owns", warn: false },
-        { chatKey: "@joefortune", state: "leased", parkedWorkflow: "step 3, frozen", note: "restore may overwrite newer row", warn: true },
-      ];
+  const heldLeases = agent?.heldLeases ?? [];
 
   return (
     <div className="mx-auto w-full max-w-5xl space-y-4">
@@ -165,36 +151,44 @@ export default function Agent() {
               </tr>
             </thead>
             <tbody>
-              {heldLeases.map((lease, idx) => {
-                const cleanId = lease.chatKey.replace(/^@/, "").replace(/[^a-zA-Z0-9_-]/g, "");
-                const elementId = `release-${cleanId || idx}`;
-                const parked = agent?.parkedRows?.find((p) => p.chatKey === lease.chatKey);
-                const isRunning = agent?.activeTurns?.some((t) => t.chatKey === lease.chatKey);
-                const stateStr = ("state" in lease) ? lease.state : isRunning ? "turn running" : "leased";
-                const parkedStr = ("parkedWorkflow" in lease) ? lease.parkedWorkflow : parked ? `step ${parked.stepIndex + 1}, frozen` : "—";
-                const noteStr = ("note" in lease) ? lease.note : parked ? "restore may overwrite newer row" : "agent owns";
-                const isWarn = ("warn" in lease) ? lease.warn : Boolean(parked);
+              {heldLeases.length === 0 ? (
+                <tr>
+                  <td colSpan={5} className="px-3 py-4 text-center text-muted-foreground italic">
+                    No leases held.
+                  </td>
+                </tr>
+              ) : (
+                heldLeases.map((lease, idx) => {
+                  const cleanId = lease.chatKey.replace(/^@/, "").replace(/[^a-zA-Z0-9_-]/g, "");
+                  const elementId = `release-${cleanId || idx}`;
+                  const parked = agent?.parkedRows?.find((p) => p.chatKey === lease.chatKey);
+                  const isRunning = agent?.activeTurns?.some((t) => t.chatKey === lease.chatKey);
+                  const stateStr = isRunning ? "turn running" : "leased";
+                  const parkedStr = parked ? `step ${parked.stepIndex + 1}, frozen` : "—";
+                  const noteStr = parked ? "restore may overwrite newer row" : "agent owns";
+                  const isWarn = Boolean(parked);
 
-                return (
-                  <tr key={lease.chatKey} className="border-b border-border/50">
-                    <td className="px-3 py-2 font-mono text-foreground">{lease.chatKey}</td>
-                    <td className="px-3 py-2 text-foreground">{stateStr}</td>
-                    <td className="px-3 py-2 text-foreground">{parkedStr}</td>
-                    <td className={`px-3 py-2 ${isWarn ? "warn text-amber-500 font-medium" : "text-muted-foreground"}`}>
-                      {noteStr}
-                    </td>
-                    <td className="px-3 py-2 text-right">
-                      <button
-                        data-element-id={elementId}
-                        onClick={() => releaseAgentLease(lease.chatKey)}
-                        className="rounded border border-border bg-background px-2.5 py-1 text-xs font-medium text-foreground hover:bg-muted"
-                      >
-                        Release
-                      </button>
-                    </td>
-                  </tr>
-                );
-              })}
+                  return (
+                    <tr key={lease.chatKey} className="border-b border-border/50">
+                      <td className="px-3 py-2 font-mono text-foreground">{lease.chatKey}</td>
+                      <td className="px-3 py-2 text-foreground">{stateStr}</td>
+                      <td className="px-3 py-2 text-foreground">{parkedStr}</td>
+                      <td className={`px-3 py-2 ${isWarn ? "warn text-amber-500 font-medium" : "text-muted-foreground"}`}>
+                        {noteStr}
+                      </td>
+                      <td className="px-3 py-2 text-right">
+                        <button
+                          data-element-id={elementId}
+                          onClick={() => releaseAgentLease(lease.chatKey)}
+                          className="rounded border border-border bg-background px-2.5 py-1 text-xs font-medium text-foreground hover:bg-muted"
+                        >
+                          Release
+                        </button>
+                      </td>
+                    </tr>
+                  );
+                })
+              )}
             </tbody>
           </table>
         </div>
@@ -215,16 +209,24 @@ export default function Agent() {
               </tr>
             </thead>
             <tbody>
-              {tools.map((item, idx) => (
-                <tr key={idx} className="border-b border-border/50">
-                  <td className="px-3 py-2 font-mono text-muted-foreground">{item.time}</td>
-                  <td className="px-3 py-2 font-mono text-foreground">{item.chat}</td>
-                  <td className="px-3 py-2 font-mono text-foreground">{item.tool}</td>
-                  <td className={`px-3 py-2 ${item.isDanger ? "danger text-red-500 font-medium" : item.isWarn ? "warn text-amber-500 font-medium" : "text-foreground"}`}>
-                    {item.outcome}
+              {tools.length === 0 ? (
+                <tr>
+                  <td colSpan={4} className="px-3 py-4 text-center text-muted-foreground italic">
+                    No recent tools yet.
                   </td>
                 </tr>
-              ))}
+              ) : (
+                tools.map((item, idx) => (
+                  <tr key={idx} className="border-b border-border/50">
+                    <td className="px-3 py-2 font-mono text-muted-foreground">{item.time}</td>
+                    <td className="px-3 py-2 font-mono text-foreground">{item.chat}</td>
+                    <td className="px-3 py-2 font-mono text-foreground">{item.tool}</td>
+                    <td className={`px-3 py-2 ${item.isDanger ? "danger text-red-500 font-medium" : item.isWarn ? "warn text-amber-500 font-medium" : "text-foreground"}`}>
+                      {item.outcome}
+                    </td>
+                  </tr>
+                ))
+              )}
             </tbody>
           </table>
         </div>
@@ -235,7 +237,7 @@ export default function Agent() {
           <span>Storage</span>
         </div>
         <div className="p-3 text-xs text-foreground">
-          {agent?.diskState ?? "84 MB across 3 chat logs. Volume 61% free. No compaction pending."}
+          {agent?.diskState || "No storage telemetry reported."}
         </div>
       </div>
     </div>

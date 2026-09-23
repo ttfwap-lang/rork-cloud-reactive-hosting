@@ -30,6 +30,7 @@ import type { DistilledSummary } from "./conversation-parser";
 import { expandBatchPlan, parseNaturalLanguagePlan, type BatchPlan } from "./batch-planner";
 
 export type { ConditionOperator, TriggerMode };
+export { normalizeBatchActionPayload } from "./batch-normalization";
 
 type Env = {
   DO: Fetcher & {
@@ -1172,7 +1173,7 @@ export class AutomationEngine extends DurableObject<Env> {
         recentTools,
         replayAbandonEvents: replayAbandonCount,
         turnsToday,
-        diskState: "84 MB across 3 chat logs. Volume 61% free. No compaction pending.",
+        diskState: this.kvGet<string>("agentDiskState", "No storage telemetry reported."),
       },
       connector: {
         configured: Boolean(this.env.CONNECTOR_BASE_URL && this.env.CONNECTOR_SHARED_SECRET),
@@ -1797,11 +1798,17 @@ export class AutomationEngine extends DurableObject<Env> {
     }
 
     if (event.type === "agent_log" && event.event) {
-      const e = event.event;
+      const e = { ...event.event };
       const kind = String(e.kind ?? "");
       const chatKey = String(e.chatKey ?? "");
       const turnId = String(e.turnId ?? "");
       const now = Date.now();
+
+      // Redact ambient observation message text so it is never broadcast or persisted
+      if (kind === "observation") {
+        delete e.text;
+      }
+
       if (kind === "turn.start" && turnId) {
         this.ctx.storage.sql.exec(
           "INSERT INTO agent_turns (turn_id, chat_key, started_at, status) VALUES (?, ?, ?, 'running') ON CONFLICT(turn_id) DO UPDATE SET status='running'",
@@ -1812,7 +1819,19 @@ export class AutomationEngine extends DurableObject<Env> {
           "UPDATE agent_turns SET status = ?, ended_at = ? WHERE turn_id = ?",
           kind === "turn.end" ? "completed" : "abandoned", now, turnId,
         );
+        if (kind === "turn.abandoned") {
+          this.log("warn", "agent.turn_abandoned", `Turn abandoned: ${String(e.error ?? "unknown")}`, undefined, chatKey);
+        }
+      } else if (kind === "tool.intent") {
+        const tool = String(e.tool ?? "unknown");
+        this.log("info", "agent.tool.intent", JSON.stringify({ tool, outcome: "intent" }), undefined, chatKey);
+      } else if (kind === "tool.result") {
+        const tool = String(e.tool ?? "unknown");
+        const hasError = Boolean(e.error);
+        const outcome = hasError ? `failed: ${String(e.error)}` : "ok";
+        this.log(hasError ? "error" : "info", "agent.tool.result", JSON.stringify({ tool, outcome, danger: hasError }), undefined, chatKey);
       }
+
       this.broadcast({ kind: "agent_event", event: e });
       return Response.json({ ok: true });
     }
@@ -2023,21 +2042,37 @@ export class AutomationEngine extends DurableObject<Env> {
 
   private async handleAgentConfig(request: Request): Promise<Response> {
     const body = (await request.json().catch(() => ({}))) as { controlChat?: string; modelId?: string };
-    const controlChat = (body.controlChat ?? "").trim();
-    if (controlChat) {
-      this.kvPut("agentControlChat", controlChat);
-      if (this.connectorReady()) {
-        await this.connectorCall("/v1/agent/config", {
-          config: {
-            controlChat,
-            modelId: body.modelId || "gemini-3.7-flash",
-          },
-        }).catch((err) => {
-          this.log("warn", "agent.config_sync_fail", `Failed to sync agent config to connector: ${err instanceof Error ? err.message : String(err)}`);
-        });
+    if (body.controlChat !== undefined) {
+      const controlChat = body.controlChat.trim();
+      if (controlChat === "") {
+        this.kvPut("agentControlChat", "");
+        if (this.connectorReady()) {
+          await this.connectorCall("/v1/agent/config", {
+            config: {
+              controlChat: "",
+              modelId: body.modelId || "gemini-3.7-flash",
+            },
+          }).catch((err) => {
+            this.log("warn", "agent.config_sync_fail", `Failed to sync agent config to connector: ${err instanceof Error ? err.message : String(err)}`);
+          });
+        }
+        this.log("info", "agent.config", "Agent control chat cleared.");
+        this.broadcast({ kind: "refresh" });
+      } else {
+        this.kvPut("agentControlChat", controlChat);
+        if (this.connectorReady()) {
+          await this.connectorCall("/v1/agent/config", {
+            config: {
+              controlChat,
+              modelId: body.modelId || "gemini-3.7-flash",
+            },
+          }).catch((err) => {
+            this.log("warn", "agent.config_sync_fail", `Failed to sync agent config to connector: ${err instanceof Error ? err.message : String(err)}`);
+          });
+        }
+        this.log("info", "agent.config", `Agent control chat updated to "${controlChat}".`);
+        this.broadcast({ kind: "refresh" });
       }
-      this.log("info", "agent.config", `Agent control chat updated to "${controlChat}".`);
-      this.broadcast({ kind: "refresh" });
     }
     return Response.json({ ok: true, controlChat: this.kvGet<string>("agentControlChat", "") });
   }
@@ -2424,7 +2459,22 @@ export class AutomationEngine extends DurableObject<Env> {
     return { category: "unknown", retryable: true };
   }
 
-  private async sendAction(chatKey: string, workflowId: string, slotId: number, action: { actionType: WorkflowActionType; text?: string; buttonTarget?: string; reaction?: string; messageId?: string | null; idempotencyKey: string }, bypassLimits = false): Promise<boolean> {
+  private async sendAction(
+    chatKey: string,
+    workflowId: string,
+    slotId: number,
+    action: {
+      actionType: WorkflowActionType;
+      text?: string;
+      buttonTarget?: string;
+      reaction?: string;
+      messageId?: string | null;
+      idempotencyKey: string;
+      target?: string;
+      fromChatKey?: string;
+    },
+    bypassLimits = false,
+  ): Promise<boolean> {
     const settings = this.settings();
     const link = this.link();
     if (settings.killSwitch) { this.releaseSlot(slotId); this.log("error", "skip.kill", "Action dropped because the emergency stop is engaged.", workflowId, chatKey); return false; }
@@ -2740,27 +2790,26 @@ export class AutomationEngine extends DurableObject<Env> {
       return;
     }
 
-    let payload: Record<string, unknown> = {};
+    let rawItemData: Record<string, unknown> = {};
     try {
-      payload = JSON.parse(item.payload) as Record<string, unknown>;
+      rawItemData = JSON.parse(item.payload) as Record<string, unknown>;
     } catch { /* empty payload */ }
+
+    const actionPayload = normalizeBatchActionPayload(rawItemData, item.action_type, item.id);
 
     this.ctx.storage.sql.exec("INSERT INTO sends (ts) VALUES (?)", now);
     const slotId = this.ctx.storage.sql.exec<{ id: number }>("SELECT last_insert_rowid() AS id").toArray()[0]?.id ?? 0;
     this.ctx.storage.sql.exec("UPDATE run_items SET status = 'running', attempts = attempts + 1 WHERE id = ?", item.id);
 
+    const targetChat = (item.action_type === "forward" && actionPayload.fromChatKey)
+      ? actionPayload.fromChatKey
+      : item.target;
+
     const ok = await this.sendAction(
-      item.target,
+      targetChat,
       activeRun.id,
       slotId,
-      {
-        actionType: item.action_type,
-        text: typeof payload.text === "string" ? payload.text : typeof payload.reply === "string" ? payload.reply : undefined,
-        buttonTarget: typeof payload.buttonTarget === "string" ? payload.buttonTarget : undefined,
-        reaction: typeof payload.reaction === "string" ? payload.reaction : undefined,
-        messageId: typeof payload.messageId === "string" ? payload.messageId : null,
-        idempotencyKey: item.id,
-      },
+      actionPayload,
       true,
     );
 
