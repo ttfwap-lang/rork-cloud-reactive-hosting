@@ -483,8 +483,8 @@ final class AgentRunner
         }
 
         $logFiles = glob(StateStore::path('agent-*.log', $this->tenant)) ?: [];
-        $planner = new ReplayPlanner();
-        $allDecisions = [];
+        $allEvents = [];
+        $eventsByLog = [];
 
         foreach ($logFiles as $file) {
             $base = basename($file, '.log');
@@ -494,6 +494,23 @@ final class AgentRunner
                 continue;
             }
 
+            $eventsByLog[$chatKey] = $events;
+            foreach ($events as $event) {
+                $allEvents[] = $event;
+            }
+        }
+
+        if (!empty($allEvents)) {
+            usort($allEvents, static fn (array $a, array $b): int =>
+                ((int) ($a['timestamp'] ?? ($a['time'] ?? 0))) <=> ((int) ($b['timestamp'] ?? ($b['time'] ?? 0)))
+            );
+            $this->state = AgentState::foldEvents($allEvents);
+        }
+
+        $planner = new ReplayPlanner();
+        $allDecisions = [];
+
+        foreach ($eventsByLog as $chatKey => $events) {
             $state = AgentState::foldEvents($events);
             $pendingIntents = $state->getPendingToolIntents();
             if (empty($pendingIntents)) {
@@ -517,7 +534,7 @@ final class AgentRunner
                 }
             }
 
-            $decisions = $planner->planAll($pendingIntents, $state->getAllTurnAttempts(), $chatHistories);
+            $decisions = $planner->planAll($pendingIntents, $this->state->getAllTurnAttempts(), $chatHistories);
 
             foreach ($decisions as $callId => $dec) {
                 $decision = $dec['decision'];

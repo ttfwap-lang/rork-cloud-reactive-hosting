@@ -17,12 +17,23 @@ final class EventForwarder
 {
     private const PATH = '/connector/event';
 
+    /** @var (callable(array, ?string): void)|null */
+    private static $interceptor = null;
+
+    public static function setInterceptor(?callable $interceptor): void
+    {
+        self::$interceptor = $interceptor;
+    }
+
     /**
      * Delivers to the engine belonging to one account. The tenant defaults to the
      * one this process was started for, so a child can only ever report as itself.
      */
     public static function post(array $payload, ?string $tenant = null): void
     {
+        if (self::$interceptor !== null) {
+            (self::$interceptor)($payload, $tenant);
+        }
         $controlPlane = rtrim(getenv('CONTROL_PLANE_URL') ?: '', '/');
         if ($controlPlane === '') {
             return;

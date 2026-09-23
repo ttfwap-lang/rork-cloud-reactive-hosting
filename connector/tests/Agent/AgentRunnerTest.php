@@ -35,6 +35,7 @@ final class AgentRunnerTest extends TestCase
 
     protected function tearDown(): void
     {
+        \ReplyFlow\EventForwarder::setInterceptor(null);
         if (is_dir($this->tempDir)) {
             $iterator = new \RecursiveIteratorIterator(
                 new \RecursiveDirectoryIterator($this->tempDir, \FilesystemIterator::SKIP_DOTS),
@@ -495,5 +496,106 @@ final class AgentRunnerTest extends TestCase
         $this->assertNotNull($toolResult);
         $this->assertSame(['ok' => true, 'settings' => ['killSwitch' => true]], $toolResult['result']['output'] ?? null);
     }
-}
 
+    public function testRecoverOrphansRestoresLeasedStateFromLogs(): void
+    {
+        // 1. Pre-existing log with active lease.acquired before child restart
+        AgentLog::append('@leased_bot', [
+            'kind' => 'lease.acquired',
+            'chatKey' => '@leased_bot',
+            'owner' => 'agent',
+            'timestamp' => time(),
+            'ttlSeconds' => 300,
+        ]);
+
+        // Fresh AgentRunner instance (simulating child restart)
+        $runner = new AgentRunner();
+        $this->assertFalse($runner->isLeased('@leased_bot'));
+
+        $proto = new class {
+            public object $messages;
+            public function __construct() {
+                $this->messages = new class {
+                    public function getHistory(string $peer, int $limit): array {
+                        return ['messages' => []];
+                    }
+                };
+            }
+        };
+
+        // Recover orphans restores state from folded logs
+        $runner->recoverOrphans($proto);
+
+        // Active lease is now reflected in local runner state
+        $this->assertTrue($runner->isLeased('@leased_bot'));
+
+        // Leased chat message after restart remains intercepted rather than forwarded normally
+        $msg = [
+            'chatKey' => '@leased_bot',
+            'sender' => '@leased_bot',
+            'text' => 'Game prompt',
+            'messageId' => '201',
+        ];
+        $handled = $runner->handleMessage($msg, $proto);
+        $this->assertTrue($handled);
+    }
+
+    public function testRedactedObservationPostingForAmbientLeasedChat(): void
+    {
+        $postedEvents = [];
+        \ReplyFlow\EventForwarder::setInterceptor(static function (array $payload) use (&$postedEvents): void {
+            if (($payload['type'] ?? '') === 'agent_log') {
+                $postedEvents[] = $payload['event'] ?? [];
+            }
+        });
+
+        $runner = new AgentRunner();
+        $proto = new class {};
+
+        // 1. Control chat message: instruction text remains present in agent_log payload
+        $msgControl = [
+            'chatKey' => '@agent_control',
+            'sender' => '@owner',
+            'text' => 'Sensitive user instruction',
+            'messageId' => '301',
+        ];
+        $runner->handleMessage($msgControl, $proto);
+
+        $this->assertNotEmpty($postedEvents);
+        $lastEvent = end($postedEvents);
+        $this->assertSame('instruction', $lastEvent['kind']);
+        $this->assertSame('Sensitive user instruction', $lastEvent['text'] ?? null);
+
+        // Verify sealed log also retains instruction text
+        $controlLogs = AgentLog::readAll('@agent_control');
+        $this->assertSame('Sensitive user instruction', $controlLogs[0]['text']);
+
+        // 2. Leased chat message: observation text must be absent from agent_log payload
+        $runner->acquireLease('@leased_bot');
+        $msgLeased = [
+            'chatKey' => '@leased_bot',
+            'sender' => '@leased_bot',
+            'text' => 'Ambient bot reply text',
+            'messageId' => '302',
+        ];
+        $runner->handleMessage($msgLeased, $proto);
+
+        $observationEvents = array_values(array_filter(
+            $postedEvents,
+            static fn (array $e): bool => ($e['kind'] ?? '') === 'observation'
+        ));
+        $this->assertCount(1, $observationEvents);
+        // Ambient observation text is absent from connector-to-Worker agent_log payload
+        $this->assertArrayNotHasKey('text', $observationEvents[0]);
+        $this->assertSame('@leased_bot', $observationEvents[0]['chatKey']);
+
+        // Verify sealed connector log STILL retains full observation text
+        $leasedLogs = AgentLog::readAll('@leased_bot');
+        $obsInLog = array_values(array_filter(
+            $leasedLogs,
+            static fn (array $e): bool => ($e['kind'] ?? '') === 'observation'
+        ));
+        $this->assertCount(1, $obsInLog);
+        $this->assertSame('Ambient bot reply text', $obsInLog[0]['text']);
+    }
+}
