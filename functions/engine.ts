@@ -2450,17 +2450,6 @@ export class AutomationEngine extends DurableObject<Env> {
             error.retryAfter = result.parameters?.retry_after;
             throw error;
           }
-        } else if (action.actionType === "forward") {
-          const fromChatId = action.text || chatKey;
-          const messageId = Number(action.messageId ?? 0);
-          const toChatId = action.buttonTarget || chatKey;
-          const response = await fetch(`https://api.telegram.org/bot${token}/forwardMessage`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ chat_id: toChatId, from_chat_id: fromChatId, message_id: messageId }) });
-          const result = await response.json() as { ok: boolean; description?: string; parameters?: { retry_after?: number } };
-          if (!result.ok) {
-            const error = new Error(result.description ?? "Telegram forward failed") as Error & { retryAfter?: number };
-            error.retryAfter = result.parameters?.retry_after;
-            throw error;
-          }
         } else {
           throw new Error(`${action.actionType} requires personal-account mode.`);
         }
