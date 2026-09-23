@@ -4,7 +4,7 @@ import {
   parseTelegramHtml,
   parseMtprotoHistory,
   distilConversation,
-} from "../../../functions/conversation-parser";
+} from "@/lib/conversation-parser";
 
 describe("parseTelegramJson", () => {
   it("parses Telegram Desktop JSON export with string and formatted text", () => {

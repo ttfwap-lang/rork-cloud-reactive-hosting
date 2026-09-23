@@ -18,7 +18,7 @@ import {
   parseMtprotoHistory,
   distilConversation,
   type DistilledSummary,
-} from "../../../functions/conversation-parser";
+} from "@/lib/conversation-parser";
 
 type DragState = { imageId: string; startX: number; startY: number; currentX: number; currentY: number };
 type IngestionMode = "screenshots" | "export" | "mtproto";
