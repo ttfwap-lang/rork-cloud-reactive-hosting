@@ -534,7 +534,10 @@ export const api = {
 };
 
 export function streamUrl(ticket: string): string {
-  return `${API_BASE.replace(/^http/, "ws")}/api/stream?ticket=${encodeURIComponent(ticket)}`;
+  const base = API_BASE
+    ? API_BASE.replace(/^http/, "ws")
+    : (typeof window !== "undefined" ? window.location.origin.replace(/^http/, "ws") : "");
+  return `${base}/api/stream?ticket=${encodeURIComponent(ticket)}`;
 }
 
 /** Unauthenticated landing-page counters. Failure is silent: the page still renders. */
