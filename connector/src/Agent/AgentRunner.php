@@ -485,6 +485,7 @@ final class AgentRunner
         $logFiles = glob(StateStore::path('agent-*.log', $this->tenant)) ?: [];
         $allEvents = [];
         $eventsByLog = [];
+        $seq = 0;
 
         foreach ($logFiles as $file) {
             $base = basename($file, '.log');
@@ -496,15 +497,19 @@ final class AgentRunner
 
             $eventsByLog[$chatKey] = $events;
             foreach ($events as $event) {
-                $allEvents[] = $event;
+                $allEvents[] = [
+                    'seq' => $seq++,
+                    'event' => $event,
+                ];
             }
         }
 
         if (!empty($allEvents)) {
-            usort($allEvents, static fn (array $a, array $b): int =>
-                ((int) ($a['timestamp'] ?? ($a['time'] ?? 0))) <=> ((int) ($b['timestamp'] ?? ($b['time'] ?? 0)))
+            usort($allEvents, static function (array $a, array $b): int =>
+                (((int) ($a['event']['timestamp'] ?? ($a['event']['time'] ?? 0))) <=> ((int) ($b['event']['timestamp'] ?? ($b['event']['time'] ?? 0))))
+                ?: ($a['seq'] <=> $b['seq'])
             );
-            $this->state = AgentState::foldEvents($allEvents);
+            $this->state = AgentState::foldEvents(array_column($allEvents, 'event'));
         }
 
         $planner = new ReplayPlanner();

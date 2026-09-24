@@ -598,4 +598,102 @@ final class AgentRunnerTest extends TestCase
         $this->assertCount(1, $obsInLog);
         $this->assertSame('Ambient bot reply text', $obsInLog[0]['text']);
     }
+
+    public function testRecoverOrphansPreservesSameSecondEventOrdering(): void
+    {
+        $now = time();
+
+        // 1. Same-second lease acquisition and release in the same log file
+        // Append order: lease.acquired then lease.released
+        AgentLog::append('@same_sec_bot', [
+            'kind' => 'lease.acquired',
+            'chatKey' => '@same_sec_bot',
+            'owner' => 'agent',
+            'timestamp' => $now,
+            'ttlSeconds' => 300,
+        ]);
+        AgentLog::append('@same_sec_bot', [
+            'kind' => 'lease.released',
+            'chatKey' => '@same_sec_bot',
+            'timestamp' => $now,
+        ]);
+
+        // 2. Same-second tool intent and result
+        // Append order: turn.start -> tool.intent -> tool.result -> turn.end
+        AgentLog::append('@same_sec_bot', [
+            'kind' => 'turn.start',
+            'chatKey' => '@same_sec_bot',
+            'turnId' => 'turn-samesec-1',
+            'timestamp' => $now,
+        ]);
+        AgentLog::append('@same_sec_bot', [
+            'kind' => 'tool.intent',
+            'chatKey' => '@same_sec_bot',
+            'turnId' => 'turn-samesec-1',
+            'callId' => 'call-samesec-1',
+            'tool' => 'send_text',
+            'arguments' => ['text' => 'hello'],
+            'timestamp' => $now,
+        ]);
+        AgentLog::append('@same_sec_bot', [
+            'kind' => 'tool.result',
+            'chatKey' => '@same_sec_bot',
+            'turnId' => 'turn-samesec-1',
+            'callId' => 'call-samesec-1',
+            'tool' => 'send_text',
+            'result' => ['output' => ['messageId' => '555']],
+            'timestamp' => $now,
+        ]);
+        AgentLog::append('@same_sec_bot', [
+            'kind' => 'turn.end',
+            'chatKey' => '@same_sec_bot',
+            'turnId' => 'turn-samesec-1',
+            'timestamp' => $now,
+        ]);
+
+        // 3. Another chat with active lease acquired at the exact same second
+        AgentLog::append('@active_bot', [
+            'kind' => 'lease.acquired',
+            'chatKey' => '@active_bot',
+            'owner' => 'agent',
+            'timestamp' => $now,
+            'ttlSeconds' => 300,
+        ]);
+
+        $runner = new AgentRunner();
+        $proto = new class {
+            public object $messages;
+            public function __construct() {
+                $this->messages = new class {
+                    public function getHistory(string $peer, int $limit): array {
+                        return ['messages' => []];
+                    }
+                };
+            }
+        };
+
+        $decisions = $runner->recoverOrphans($proto);
+
+        // No orphaned intent should be replayed or skipped since tool.result resolved it
+        $this->assertEmpty($decisions);
+
+        // Lease on @same_sec_bot was released after acquisition in the same second
+        $this->assertFalse($runner->isLeased('@same_sec_bot'));
+
+        // Lease on @active_bot remains active
+        $this->assertTrue($runner->isLeased('@active_bot'));
+
+        // State reflects no pending intents and no active turns for @same_sec_bot
+        $state = $runner->getState();
+        $this->assertEmpty($state->getPendingToolIntents('@same_sec_bot'));
+        $this->assertEmpty($state->getActiveTurns());
+
+        // Transcript preserves events in strict append order
+        $transcript = $runner->getTranscript('@same_sec_bot');
+        $this->assertCount(4, $transcript);
+        $this->assertSame('turn.start', $transcript[0]['kind']);
+        $this->assertSame('tool.intent', $transcript[1]['kind']);
+        $this->assertSame('tool.result', $transcript[2]['kind']);
+        $this->assertSame('turn.end', $transcript[3]['kind']);
+    }
 }
