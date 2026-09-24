@@ -81,7 +81,7 @@ type EngineContextValue = {
   simulate: (input: { chatKey?: string; sender?: string; text: string }) => Promise<void>;
   previewWorkflow: (step: Partial<WorkflowStep>, text: string) => Promise<{ matched: boolean; captures: string[]; actionType: WorkflowActionType; output: string; note: string }>;
   analyzeConversation: (input: { images?: string[]; ownerSide?: "left" | "right"; localeHint?: string; distilled?: DistilledSummary }) => Promise<ConversationAnalysis>;
-  pullTelegramHistory: (chatKey: string, limit?: number, maxPages?: number) => Promise<{ ok: boolean; count: number; messages: any[] }>;
+  pullTelegramHistory: (chatKey: string, limit?: number, maxPages?: number) => Promise<{ ok: boolean; count: number; messages: Array<Record<string, unknown>> }>;
   setAgentControlChat: (chat: string) => Promise<void>;
   releaseAgentLease: (chatKey?: string, all?: boolean) => Promise<void>;
 };

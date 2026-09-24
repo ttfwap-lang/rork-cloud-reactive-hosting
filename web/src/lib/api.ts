@@ -530,7 +530,7 @@ export const api = {
   startBatchRun: (input: { name?: string; items: BatchPlanItem[] }) =>
     call<{ ok: boolean; runId: string; totalItems: number }>("/batch/run", input),
   getBatchRuns: () => call<{ runs: BatchRunInfo[] }>("/batch/runs"),
-  getBatchRun: (id: string) => call<{ run: BatchRunInfo; items: any[] }>(`/batch/run?id=${encodeURIComponent(id)}`),
+  getBatchRun: (id: string) => call<{ run: BatchRunInfo; items: Array<Record<string, unknown>> }>(`/batch/run?id=${encodeURIComponent(id)}`),
 };
 
 export function streamUrl(ticket: string): string {

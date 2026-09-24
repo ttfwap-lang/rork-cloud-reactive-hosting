@@ -166,7 +166,11 @@ export default function ConversationImport() {
     try {
       const result = await previewWorkflow(buildStep(first), testInput.trim());
       setPreview(result);
-      result.matched ? toast.success("Preview matched without sending to Telegram") : toast.error("The test message did not match the first trigger");
+      if (result.matched) {
+        toast.success("Preview matched without sending to Telegram");
+      } else {
+        toast.error("The test message did not match the first trigger");
+      }
     } catch (error) {
       toast.error(error instanceof Error ? error.message : "The preview could not be run.");
     } finally { setBusy(false); }
@@ -537,7 +541,7 @@ export default function ConversationImport() {
                     <div className="flex items-center gap-2 rounded-xl bg-primary/[0.06] p-3 text-xs text-primary"><CheckCircle2 className="h-4 w-4" />No unresolved ambiguities reported.</div>
                   ) : analysis.ambiguities.map((item) => (
                     <label key={item.id} className="flex items-start gap-2 rounded-xl bg-secondary/35 p-3 text-xs leading-relaxed">
-                      <Checkbox checked={resolved.has(item.id)} onCheckedChange={(checked) => setResolved((current) => { const next = new Set(current); checked ? next.add(item.id) : next.delete(item.id); return next; })} className="mt-0.5" />
+                      <Checkbox checked={resolved.has(item.id)} onCheckedChange={(checked) => setResolved((current) => { const next = new Set(current); if (checked) { next.add(item.id); } else { next.delete(item.id); } return next; })} className="mt-0.5" />
                       <span><span className={item.severity === "blocking" ? "font-semibold text-destructive" : "font-semibold text-amber-300"}>{item.severity}</span><span className="ml-1 text-muted-foreground">{item.question}</span></span>
                     </label>
                   ))}
