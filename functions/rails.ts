@@ -124,3 +124,15 @@ export function evaluateRails(params: {
 
   return { allowed: true };
 }
+
+/**
+ * Validates agent patch_settings requests.
+ * Specifically enforces that alertChatId is rejected worker-side so the agent cannot silence alarms.
+ */
+export function validateAgentSettingsPatch(patch: Record<string, unknown>): { ok: true } | { ok: false; error: string } {
+  if (patch.alertChatId !== undefined) {
+    return { ok: false, error: "alertChatId cannot be modified by agent tools" };
+  }
+  return { ok: true };
+}
+

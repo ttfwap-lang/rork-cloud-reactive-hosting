@@ -7,6 +7,7 @@ import {
   isAllowlisted,
   isWithinQuietHours,
   targetsMatch,
+  validateAgentSettingsPatch,
   type QuietHoursConfig,
   type RailsConfig,
 } from "../../../functions/rails";
@@ -165,3 +166,19 @@ describe("evaluateRails", () => {
     expect(res.allowed).toBe(true);
   });
 });
+
+describe("validateAgentSettingsPatch", () => {
+  it("rejects alertChatId modification with error", () => {
+    const res = validateAgentSettingsPatch({ alertChatId: "@my_channel" });
+    expect(res.ok).toBe(false);
+    if (!res.ok) {
+      expect(res.error).toBe("alertChatId cannot be modified by agent tools");
+    }
+  });
+
+  it("accepts other safety settings modifications", () => {
+    const res = validateAgentSettingsPatch({ killSwitch: true, automationEnabled: false, perMinuteCap: 10 });
+    expect(res.ok).toBe(true);
+  });
+});
+
